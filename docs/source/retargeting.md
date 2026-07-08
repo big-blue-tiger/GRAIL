@@ -92,8 +92,8 @@ python -m grail.retargeting.process \
 
 # Stage 3 — BPS shape encoding (multi-object datasets only)
 python -m grail.retargeting.compute_bps \
-    --object_usd_dir data/motion_lib/benchmark_v3_0203/object_usd \
-    --output_dir     data/motion_lib/benchmark_v3_0203/bps
+    --object_usd_dir data/SBTO/pickCylinder/grasp_cylinder/usd\
+    --output_dir     data/SBTO/pickCylinder/grasp_cylinder/bps
 ```
 
 The shell wrappers under

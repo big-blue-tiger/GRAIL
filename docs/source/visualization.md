@@ -94,7 +94,7 @@ Env-var fallbacks: `QUAT_CONVENTION` (default `xyzw`).
 
 ```bash
 bash grail/visualization/scripts/visualize_single.sh \
-    data/pickup_table/robot/pickup_table__apple_0__000.pkl
+     data/SBTO/pickCylinder/grasp_cylinder2/robot/grasp_cylinder2.pkl
 ```
 
 Takes the full path to a `robot/<seq>.pkl` and writes

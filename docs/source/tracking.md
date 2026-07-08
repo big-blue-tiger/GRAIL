@@ -88,23 +88,74 @@ A single-GPU, 4-env, 3-iteration run against the `pnp_table` release config —
 enough to verify the install end-to-end. Completes in ~2 minutes on a single
 L40. Set `DATA_DIR` and `BPS_DIR` to a retargeted motion library prepared as
 described above.
-
+### REPLAY
+```bash
+python -u gear_sonic/train_agent_trl.py \
+    +exp=manager/universal_token/hoi/pnp_ground \
+    num_envs=1 headless=False \
+    ++replay=true \
+    ++manager_env.config.render_results=False \
+    ++manager_env.config.gpu_collision_stack_size_exp=28 \
+    ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/objects \
+    ++manager_env.config.object_usd_path=../../data/SBTO/pickCylinder/grasp_cylinder3/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/SBTO/pickCylinder/grasp_cylinder3/bps
+```
+### View
 ```bash
 conda activate sonic
 export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 WANDB_MODE=offline
-
 cd imports/SONIC
-python -u train_agent_trl.py \
-    +exp=manager/universal_token/hoi/pnp_table \
-    num_envs=4 headless=True \
-    ++algo.config.num_learning_iterations=3 \
+python -u gear_sonic/train_agent_trl.py \
+    +exp=manager/universal_token/hoi/pnp_ground \
+    num_envs=4 headless=False \
+    ++algo.config.num_learning_iterations=20000 \
     ++manager_env.config.gpu_collision_stack_size_exp=28 \
-    ++manager_env.commands.motion.motion_lib_cfg.motion_file=${DATA_DIR}/robot \
-    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=${DATA_DIR}/objects \
-    ++manager_env.config.object_usd_path=${DATA_DIR}/object_usd \
-    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=${BPS_DIR}
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/objects \
+    ++manager_env.config.object_usd_path=../../data/SBTO/pickCylinder/grasp_cylinder3/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/SBTO/pickCylinder/grasp_cylinder3/bps \
+        ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
+    ++manager_env.commands.motion.sample_from_n_initial_frames=100 \
+            ++resume=True \
+    ++checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739/model_step_008000.pt \
+    experiment_dir=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739 \
+```
+### train
+```bash
+conda activate sonic
+export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 WANDB_MODE=offline
+cd imports/SONIC
+python -u gear_sonic/train_agent_trl.py \
+    +exp=manager/universal_token/hoi/pnp_ground \
+    num_envs=1024 headless=True \
+    ++algo.config.num_learning_iterations=18000 \
+    ++manager_env.config.gpu_collision_stack_size_exp=28 \
+     ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/objects \
+    ++manager_env.config.object_usd_path=../../data/SBTO/pickCylinder/grasp_cylinder3/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/SBTO/pickCylinder/grasp_cylinder3/bps \
+    ++manager_env.commands.motion.sample_from_n_initial_frames=100 \
+    ++manager_env.rewards.object_tracking_reward.weight=45 \
+    ++manager_env.rewards.grasp_finger_direction.weight=0 \
+    ++manager_env.rewards.grasp_finger_direction_left.weight=0 \
+                ++resume=True \
+    ++checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739/model_step_008000.pt \
+    experiment_dir=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739 \
+
+
 ```
 
+```bash
+python -u gear_sonic/eval_agent_trl.py \
+    +checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739/model_step_009000.pt \
+    +num_envs=1 \
+    +headless=False \
+    ++run_eval_loop=True \
+    ++max_render_steps=3000
+```
 ## Running training
 
 ### Pick-up and advanced manipulation
@@ -121,7 +172,7 @@ conda activate sonic
 export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1
 
 cd imports/SONIC
-accelerate launch --num_processes=8 train_agent_trl.py \
+accelerate launch --num_processes=8 gear_sonic/train_agent_trl.py \
     +exp=${HYDRA_CONFIG} \
     num_envs=2048 headless=True \
     ++manager_env.commands.motion.motion_lib_cfg.motion_file=${DATA_DIR}/robot \
@@ -168,7 +219,7 @@ conda activate sonic
 export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1
 
 cd imports/SONIC
-python -u train_agent_trl.py \
+python -u gear_sonic/train_agent_trl.py \
     +exp=manager/universal_token/hoi/pnp_table \
     num_envs=2048 headless=True \
     ++resume=True \
@@ -195,7 +246,7 @@ conda activate sonic
 export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1
 
 cd imports/SONIC
-python -u train_agent_trl.py \
+python -u gear_sonic/train_agent_trl.py \
     +exp=manager/universal_token/scene/terrain_tracking \
     num_envs=4096 headless=True \
     ++manager_env.commands.motion.motion_lib_cfg.motion_file=${DATA_DIR}/robot \
@@ -238,7 +289,7 @@ conda activate sonic
 export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1
 
 cd imports/SONIC
-python -u train_agent_trl.py \
+python -u gear_sonic/train_agent_trl.py \
     +exp=manager/universal_token/scene/terrain_tracking \
     num_envs=4096 headless=True \
     ++resume=True \
@@ -256,7 +307,7 @@ If the dataset root does not provide `flat_placeholder.usd`, also pass
 ### Multi-node `accelerate` template
 
 Replace the single-node launcher with the multi-node form. Same
-`train_agent_trl.py` command and `${ARGS[@]}`, just different launcher
+`gear_sonic/train_agent_trl.py` command and `${ARGS[@]}`, just different launcher
 flags. Example: 8 nodes × 8 GPUs = 64 GPUs.
 
 ```bash
@@ -267,7 +318,7 @@ accelerate launch \
     --machine_rank=$MACHINE_RANK \
     --main_process_ip=$MASTER_ADDR \
     --main_process_port=$MASTER_PORT \
-    train_agent_trl.py "${ARGS[@]}" num_envs=2048
+    gear_sonic/train_agent_trl.py "${ARGS[@]}" num_envs=2048
 ```
 
 See the
