@@ -109,7 +109,7 @@ manager_env:
       debug_vis: false
       use_paired_motions: true
       start_from_first_frame: false
-      sample_before_contact: true
+      sample_before_contact: false
       sample_before_contact_margin: 10
       sample_before_contact_hand: right_hand
 

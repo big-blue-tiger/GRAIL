@@ -61,6 +61,10 @@ python -m grail.pipelines.gen_3d_assets \
     -o data/gen_chairs \
     --job_chunk_idx <i> \
     --num_job_chunks <N>
+
+python -m grail.pipelines.gen_3d_assets \
+    -i configs/gen_3d/g1_grasp_objects.yaml \
+    -o data/gen_g1_grasp
 ```
 
 ## Bundled object lists

@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import sys
 import traceback
 from pathlib import Path
 
+import torch
 import yaml
 from PIL import Image
 
@@ -25,8 +27,13 @@ from PIL import Image
 # Resolve Hunyuan3D-2.1 submodule paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-HUNYUAN_ROOT = PROJECT_ROOT / "imports" / "Hunyuan3D-2.1"
+HUNYUAN_ROOT = PROJECT_ROOT / ".." / "Hunyuan3D-2.1"
 
+# Set Hunyuan3D model path to project-local directory
+# This overrides the default ~/.cache/hy3dgen location
+#os.environ.setdefault("HY3DGEN_MODELS", str(HUNYUAN_ROOT / "model"))
+# Set HuggingFace cache to project-local directory for dinov2 and other models
+#os.environ.setdefault("HF_HOME", str(HUNYUAN_ROOT / "model" / "hf_cache"))
 sys.path.insert(0, str(HUNYUAN_ROOT / "hy3dshape"))
 sys.path.insert(0, str(HUNYUAN_ROOT / "hy3dpaint"))
 sys.path.insert(0, str(HUNYUAN_ROOT))
@@ -53,7 +60,7 @@ try:
 except (ImportError, Exception):
     pass
 
-from grail.adapters.openai_api import (
+from grail.adapters.qwen_api import (
     DEFAULT_REASONING_MODEL,
     chat_text,
     chat_with_image,
@@ -61,6 +68,14 @@ from grail.adapters.openai_api import (
 )
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
+
+def clear_gpu_memory() -> None:
+    """Force GPU memory cleanup between objects."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
 
 
 def slugify(name: str) -> str:
@@ -377,8 +392,8 @@ def main() -> None:
     args = parser.parse_args()
 
     # --- Validate environment ---
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is not set. Source .env first.")
+    if not os.getenv("DASHSCOPE_API_KEY") and not os.getenv("QWEN_API_KEY"):
+        raise RuntimeError("DASHSCOPE_API_KEY or QWEN_API_KEY is not set. Source .env first.")
 
     # --- Load object list ---
     objects = sorted(load_object_list(args.input))
@@ -442,27 +457,36 @@ def main() -> None:
             processed = resize_to_square(image_nobg)
             processed_path = obj_dir / "generated_512.png"
             processed.save(processed_path)
+            clear_gpu_memory()  # Clean after rembg
 
             # 3. Shape generation
             mesh = pipeline_shape(image=processed)[0]
             mesh_path = obj_dir / "mesh.glb"
+            print("  Exporting base mesh...")
             mesh.export(str(mesh_path))
+            print("  ✓ Base mesh exported")
+            clear_gpu_memory()  # Clean after shape generation
 
             # 4. Texture generation
+            print("  Starting texture generation...")
             pipeline_paint(
                 mesh_path=str(mesh_path),
                 image_path=str(processed_path),
                 output_mesh_path=str(textured_mesh_path),
-                save_glb=False,
+                save_glb=True,
             )
+            print("  ✓ Texture generation complete")
+            clear_gpu_memory()  # Clean after texture generation
 
             # 5. Scale to real-world dimensions
+            print("  Estimating real-world dimensions...")
             target_height: float | None = estimate_height_with_openai_vision(
                 obj_name,
                 str(raw_image_path),
             )
 
             if target_height is not None and target_height > 0:
+                print(f"  Scaling mesh to {target_height:.3f}m...")
                 vertices = load_vertices(textured_mesh_path)
                 current_height = compute_model_height(vertices)
                 if current_height > 0:
@@ -471,7 +495,7 @@ def main() -> None:
                     if not backup.exists():
                         shutil.copy(textured_mesh_path, backup)
                     scale_obj_in_place(textured_mesh_path, scale_factor)
-                    print(f"  Scaled to {target_height:.3f}m (factor {scale_factor:.4f})")
+                    print(f"  ✓ Scaled to {target_height:.3f}m (factor {scale_factor:.4f})")
 
             # 6. Clean up intermediate files
             keep_files = {
@@ -485,8 +509,14 @@ def main() -> None:
                 if f.is_file() and f.name not in keep_files:
                     f.unlink()
 
+            # 7. Force GPU memory cleanup after each object
+            print("  Clearing GPU memory...")
+            clear_gpu_memory()
+
         except Exception as e:
             print(f"  Error: {obj_name}: {e}\n{traceback.format_exc()}")
+            # Clean up GPU memory even on error
+            clear_gpu_memory()
 
     print(f"\nAll {len(objects)} objects processed → {root.resolve()}")
 
