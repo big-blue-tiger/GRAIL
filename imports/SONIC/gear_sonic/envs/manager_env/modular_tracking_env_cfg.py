@@ -1496,6 +1496,28 @@ class MySceneCfg(InteractiveSceneCfg):
                 update_latest_camera_pose=True,
             )
 
+        # Show the physical envelope of the head camera during motion debug visualization.
+        # This is a visual-only child of head_link: no rigid body, mass, or collision schema.
+        motion_debug_vis = (commands or {}).get("motion", {}).get("debug_vis", False)
+        self.ego_camera_model = None
+        if motion_debug_vis and str(config.get("robot", {}).get("type", "g1")).startswith("g1"):
+            self.ego_camera_model = AssetBaseCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/head_link/ego_camera_model",
+                spawn=sim_utils.CuboidCfg(
+                    # 25 mm deep, 90 mm wide, 25 mm tall: similar to a compact VLA camera.
+                    size=(0.025, 0.090, 0.025),
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=(0.04, 0.04, 0.04), metallic=0.2, roughness=0.35
+                    ),
+                ),
+                # Keep this synchronized with scripts/render_ego_motion.py.
+                init_state=AssetBaseCfg.InitialStateCfg(
+                    # head_link mesh spans z=0.325..0.531; this is near human eye level.
+                    pos=(0.09, 0.0, 0.44),
+                    rot=(0.965926, 0.0, 0.258819, 0.0),
+                ),
+            )
+
 
 @configclass
 class ModularTrackingEnvCfg(ManagerBasedRLEnvCfg):

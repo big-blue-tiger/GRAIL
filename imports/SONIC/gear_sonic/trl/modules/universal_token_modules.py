@@ -1056,6 +1056,21 @@ class UniversalTokenModule(nn.Module):
                     )
         all_tokens = self.assemble_all_tokens(encoded_tokens, encoder_masks, batch_size, seq_len)
 
+        # Cache the continuous latent before FSQ for diagnostics/data export.  In
+        # pre-quantization residual mode ``encoded_latents`` already contains
+        # z + lambda * delta_z; in the normal path it contains the unmodified z.
+        # Assemble it with the same encoder masks/order as the quantized tokens
+        # so external recorders see exactly the decoder-token layout (2 x 32 for
+        # the released object-aware controller), without changing inference.
+        all_pre_quantization_latents = self.assemble_all_tokens(
+            encoded_latents, encoder_masks, batch_size, seq_len
+        )
+        self._last_pre_quantization_latent_flat = (
+            all_pre_quantization_latents.detach().view(
+                *all_pre_quantization_latents.shape[:-2], -1
+            )
+        )
+
         # POST-QUANTIZATION MODE: add residual after FSQ tokens (default)
         if latent_residual is not None and latent_residual_mode == "post_quantization":
             all_tokens = all_tokens + residual_reshaped

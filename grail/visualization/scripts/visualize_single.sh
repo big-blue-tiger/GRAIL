@@ -50,7 +50,7 @@ SHARD_DIR="/tmp/vis_single_${MOTION_KEY}"
 
 # Activate sonic conda environment (needed for IsaacSim/IsaacLab)
 eval "$(conda shell.bash hook)"
-conda activate sonic
+conda activate grail
 
 echo "Rendering single motion"
 echo "  Robot pkl:       ${ROBOT_PKL}"

@@ -63,8 +63,13 @@ class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
         self.render_frame_skip = self.env.wrapper.config.get("render_frame_skip", 2)
         self.start_idx = self.env.wrapper.start_idx
 
+        motion = self.env.command_manager.get_term("motion")
+        motion_keys = getattr(motion.motion_lib, "curr_motion_keys", [])
+
         for i in range(self.max_render_envs):
-            file_name = f"{self.save_dir}/{self.start_idx+i:06d}.mp4"
+            motion_idx = self.start_idx + i
+            stem = motion_keys[i] if i < len(motion_keys) else f"{motion_idx:06d}"
+            file_name = os.path.join(self.save_dir, f"{stem}.mp4")
             fps = 1 / (self.env.step_dt * self.render_frame_skip)
             writer = imageio.get_writer(
                 file_name,
@@ -85,32 +90,33 @@ class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
             self.frame_id += 1
             return "record_post_step", torch.ones(self.env.num_envs, 1, device=self.env.device)
 
-        # Set camera position based on robot root position
-        root_pos = self.env.command_manager.get_term("motion").robot_body_pos_w[:, 0]
-        camera_offset = self.env.wrapper.config.get("eval_camera_offset", [2, 2, 1])
-        fix_camera = self.env.wrapper.config.get("fix_camera_after_first_frame", False)
-        cam = self.env.scene["eval_camera"]
+        camera_name = self.env.wrapper.config.get("render_camera", "eval_camera")
+        cam = self.env.scene[camera_name]
 
-        if fix_camera and self._fixed_eye is not None:
-            # Reuse the camera position from the first frame
-            eye, target = self._fixed_eye, self._fixed_target
-        elif self.group_camera:
-            center = root_pos.mean(dim=0, keepdim=True).expand_as(root_pos)
-            eye = center + torch.tensor(camera_offset, device=self.env.device)
-            target = center
-            if fix_camera:
-                self._fixed_eye = eye.clone()
-                self._fixed_target = center.clone()
-        else:
-            eye = root_pos + torch.tensor(camera_offset, device=self.env.device)
-            target = root_pos
-            if fix_camera:
-                self._fixed_eye = eye.clone()
-                self._fixed_target = root_pos.clone()
+        if camera_name == "eval_camera":
+            # The legacy third-person camera follows the robot root.
+            root_pos = self.env.command_manager.get_term("motion").robot_body_pos_w[:, 0]
+            camera_offset = self.env.wrapper.config.get("eval_camera_offset", [2, 2, 1])
+            fix_camera = self.env.wrapper.config.get("fix_camera_after_first_frame", False)
+            if fix_camera and self._fixed_eye is not None:
+                eye, target = self._fixed_eye, self._fixed_target
+            elif self.group_camera:
+                center = root_pos.mean(dim=0, keepdim=True).expand_as(root_pos)
+                eye = center + torch.tensor(camera_offset, device=self.env.device)
+                target = center
+                if fix_camera:
+                    self._fixed_eye = eye.clone()
+                    self._fixed_target = center.clone()
+            else:
+                eye = root_pos + torch.tensor(camera_offset, device=self.env.device)
+                target = root_pos
+                if fix_camera:
+                    self._fixed_eye = eye.clone()
+                    self._fixed_target = root_pos.clone()
 
-        # Write world poses to Fabric AND sync to USD so both renderer paths see it
-        cam._view._sync_usd_on_fabric_write = True  # noqa: SLF001
-        cam.set_world_poses_from_view(eye, target)
+            # Write world poses to Fabric AND sync to USD so both renderer paths see it.
+            cam._view._sync_usd_on_fabric_write = True  # noqa: SLF001
+            cam.set_world_poses_from_view(eye, target)
 
         # Two render calls: 1st flushes pose to render pipeline, 2nd captures at new pose
         if hasattr(self.env, "sim"):
@@ -390,4 +396,243 @@ class TrajectoryRecorderCfg(manager_term_cfg.RecorderTermCfg):
     """Configuration for trajectory recording alongside video."""
 
     class_type = TrajectoryRecorderTerm
+    save_path: str = None
+
+
+class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
+    """Save per-frame object-aware observations and latent adaptor outputs.
+
+    The output is one ``<motion_key>.object_aware.pkl`` per environment.  It
+    records the policy observation terms requested by GRAIL Object-Aware
+    Tracking, the raw 64+2 meta-action, the actually executed hand primitive,
+    and the continuous pre-FSQ ``z + lambda * delta_z`` latent.
+    """
+
+    cfg: ObjectAwareStateRecorderCfg
+
+    _OBJECT_REFERENCE_TERMS = (
+        "object_pos_b",
+        "object_ori_b_6d",
+        "target_object_pos",
+        "hand_object_transform_6d",
+        "finger_tips_force",
+        "object_bps",
+        "object_pos_delta_multi_future",
+        "object_ori_delta_multi_future_6d",
+    )
+    _PROPRIOCEPTION_TERMS = (
+        "base_lin_vel",
+        "base_ang_vel",
+        "joint_pos",
+        "joint_vel",
+        "actions",
+        "last_meta_action",
+    )
+
+    def __init__(self, cfg: ObjectAwareStateRecorderCfg, env: envs.ManagerBasedEnv):
+        super().__init__(cfg, env)
+        self.cfg = cfg
+        self.env = env
+        self.save_dir = self.cfg.save_path
+        os.makedirs(self.save_dir, exist_ok=True)
+        self._initialized = False
+        self._closed = False
+        self.frame_id = 0
+        self._frame_data: dict[int, dict[str, list]] = {}
+        logger.info(f"=== ObjectAwareStateRecorder: saving to {self.save_dir} ===")
+
+    def _initialize(self) -> None:
+        self.num_record_envs = self.env.num_envs
+        self.start_idx = getattr(self.env.wrapper, "start_idx", 0)
+        self.render_frame_skip = self.env.wrapper.config.get("render_frame_skip", 1)
+        manager = self.env.observation_manager
+        names = manager._group_obs_term_names["policy"]  # noqa: SLF001
+        dims = manager._group_obs_term_dim["policy"]  # noqa: SLF001
+        self._policy_slices = {}
+        offset = 0
+        for name, shape in zip(names, dims):
+            width = int(np.prod(shape))
+            self._policy_slices[name] = (offset, offset + width, tuple(shape))
+            offset += width
+        self._policy_obs_dim = offset
+        self._motion_cmd = self.env.command_manager.get_term("motion")
+        if "object" not in self.env.scene.rigid_objects:
+            raise RuntimeError("ObjectAwareStateRecorder requires an object rigid body.")
+        for i in range(self.num_record_envs):
+            self._frame_data[i] = {
+                "frame_idx": [],
+                "motion_step": [],
+                "policy_obs_flat": [],
+                "latent_residual_raw": [],
+                "latent_residual_scaled": [],
+                "hand_primitive_policy_raw": [],
+                "hand_primitive_policy_binary": [],
+                "hand_primitive_executed": [],
+                "hand_primitive_executed_binary": [],
+                "combined_latent_pre_fsq": [],
+                "robot_root_pos_w": [],
+                "robot_root_quat_w": [],
+                "object_root_pos_w": [],
+                "object_root_quat_w": [],
+            }
+            for name in self._PROPRIOCEPTION_TERMS + self._OBJECT_REFERENCE_TERMS:
+                if name in self._policy_slices:
+                    self._frame_data[i][name] = []
+        self._initialized = True
+
+    @staticmethod
+    def _last_step(tensor: torch.Tensor) -> torch.Tensor:
+        """Drop a model sequence axis while preserving ordinary 2-D batches."""
+        return tensor[:, -1] if tensor.ndim == 3 else tensor
+
+    def record_post_step(self) -> tuple[str | None, torch.Tensor | dict | None]:
+        if not self._initialized:
+            self._initialize()
+        if self.frame_id % self.render_frame_skip != 0:
+            self.frame_id += 1
+            return "object_aware_record", torch.ones(
+                self.env.num_envs, 1, device=self.env.device
+            )
+
+        actor_obs = getattr(self.env, "_object_aware_actor_obs", None)
+        residual = getattr(self.env, "_object_aware_latent_residual_raw", None)
+        residual_scaled = getattr(self.env, "_object_aware_latent_residual_scaled", None)
+        hand_policy = getattr(self.env, "_object_aware_hand_primitive_policy_raw", None)
+        hand_executed = getattr(self.env, "_object_aware_hand_primitive_executed", None)
+        combined = getattr(self.env, "_object_aware_combined_latent", None)
+        required = (actor_obs, residual, residual_scaled, hand_policy, hand_executed, combined)
+        if any(value is None for value in required):
+            raise RuntimeError(
+                "Object-aware state recording requires residual-mode inference and all "
+                "diagnostic tensors, but at least one tensor was unavailable."
+            )
+
+        actor_obs = self._last_step(actor_obs)
+        residual = self._last_step(residual)
+        residual_scaled = self._last_step(residual_scaled)
+        hand_policy = self._last_step(hand_policy)
+        hand_executed = self._last_step(hand_executed)
+        combined = self._last_step(combined)
+        # The recorder runs post-step, while observations/actions are pre-step.
+        # Use the timestamp cached beside the policy tensors to keep alignment.
+        motion_steps = getattr(self.env, "_object_aware_motion_step", None)
+        if motion_steps is None:
+            raise RuntimeError("Object-aware pre-step motion timestamp was not cached.")
+
+        if actor_obs.shape[-1] != self._policy_obs_dim:
+            raise RuntimeError(
+                f"Policy observation width mismatch: tensor={actor_obs.shape[-1]}, "
+                f"terms={self._policy_obs_dim}."
+            )
+
+        robot_root_pos_w = getattr(self.env, "_object_aware_robot_root_pos_w", None)
+        robot_root_quat_w = getattr(self.env, "_object_aware_robot_root_quat_w", None)
+        if robot_root_pos_w is None or robot_root_quat_w is None:
+            raise RuntimeError("Object-aware pre-step robot root pose was not cached.")
+        object_root_pos_w = getattr(self.env, "_object_aware_object_root_pos_w", None)
+        object_root_quat_w = getattr(self.env, "_object_aware_object_root_quat_w", None)
+        if object_root_pos_w is None or object_root_quat_w is None:
+            raise RuntimeError("Object-aware pre-step object root pose was not cached.")
+
+        for i in range(self.num_record_envs):
+            data = self._frame_data[i]
+            data["frame_idx"].append(self.frame_id)
+            data["motion_step"].append(int(motion_steps[i].item()))
+            data["policy_obs_flat"].append(actor_obs[i].detach().cpu().numpy().copy())
+            data["latent_residual_raw"].append(residual[i].detach().cpu().numpy().copy())
+            data["latent_residual_scaled"].append(
+                residual_scaled[i].detach().cpu().numpy().copy()
+            )
+            data["hand_primitive_policy_raw"].append(
+                hand_policy[i].detach().cpu().numpy().copy()
+            )
+            data["hand_primitive_policy_binary"].append(
+                (hand_policy[i] >= 0).to(torch.int8).detach().cpu().numpy().copy()
+            )
+            data["hand_primitive_executed"].append(
+                hand_executed[i].detach().cpu().numpy().copy()
+            )
+            data["hand_primitive_executed_binary"].append(
+                (hand_executed[i] >= 0).to(torch.int8).detach().cpu().numpy().copy()
+            )
+            data["combined_latent_pre_fsq"].append(
+                combined[i].detach().cpu().numpy().copy()
+            )
+            for name, value in (
+                ("robot_root_pos_w", robot_root_pos_w),
+                ("robot_root_quat_w", robot_root_quat_w),
+            ):
+                data[name].append(value[i].detach().cpu().numpy().copy())
+            for name, value in (
+                ("object_root_pos_w", object_root_pos_w),
+                ("object_root_quat_w", object_root_quat_w),
+            ):
+                data[name].append(value[i].detach().cpu().numpy().copy())
+            for name, (start, end, shape) in self._policy_slices.items():
+                if name in data:
+                    value = actor_obs[i, start:end].reshape(shape)
+                    data[name].append(value.detach().cpu().numpy().copy())
+
+        self.frame_id += 1
+        return "object_aware_record", torch.ones(
+            self.env.num_envs, 1, device=self.env.device
+        )
+
+    def close_writers(self) -> None:
+        if self._closed or not self._initialized:
+            return
+        self._closed = True
+        motion_keys = getattr(self._motion_cmd.motion_lib, "curr_motion_keys", [])
+        scale = float(self.env.wrapper.config.get("latent_residual_scale", 1.0))
+        override = bool(self.env.wrapper.config.get("use_motion_hand_actions", False))
+        for i, data in self._frame_data.items():
+            if not data["frame_idx"]:
+                continue
+            stem = motion_keys[i] if i < len(motion_keys) else f"{self.start_idx + i:06d}"
+            payload = {
+                "schema_version": 3,
+                "motion_key": stem,
+                "fps": 1.0 / (self.env.step_dt * self.render_frame_skip),
+                "latent_residual_scale": scale,
+                "latent_residual_mode": self.env.wrapper.config.get(
+                    "latent_residual_mode", "post_quantization"
+                ),
+                "hand_action_overridden_by_motion": override,
+                "hand_binary_convention": {"open": 0, "closed": 1, "threshold": 0.0},
+                "pose_timing": "pre_step_aligned_with_policy_input",
+                "pose_quaternion_format": "wxyz",
+                "policy_observation_term_order": list(self._policy_slices),
+                "policy_observation_term_slices": {
+                    name: {"start": start, "end": end, "shape": shape}
+                    for name, (start, end, shape) in self._policy_slices.items()
+                },
+            }
+            array_data = {key: np.asarray(value) for key, value in data.items()}
+            payload.update(array_data)
+            payload["proprioception"] = {
+                name: array_data[name]
+                for name in self._PROPRIOCEPTION_TERMS
+                if name in array_data
+            }
+            payload["object_reference"] = {
+                name: array_data[name]
+                for name in self._OBJECT_REFERENCE_TERMS
+                if name in array_data
+            }
+            path = os.path.join(self.save_dir, f"{stem}.object_aware.pkl")
+            with open(path, "wb") as file:
+                pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(
+                f"Saved object-aware state: {path} ({len(data['frame_idx'])} frames)"
+            )
+
+    def __del__(self):
+        self.close_writers()
+
+
+@configclass
+class ObjectAwareStateRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    """Configuration for Object-Aware Tracking tensor recording."""
+
+    class_type = ObjectAwareStateRecorderTerm
     save_path: str = None

@@ -824,6 +824,34 @@ class ManagerEnvWrapper:
                     )
                 obs_dict = obs_dict.copy() if isinstance(obs_dict, dict) else obs_dict
             meta_actions = actions["actions"]
+            # Preserve the exact policy input/output used for this control step.
+            # The object-aware recorder consumes these tensors after the step;
+            # detach keeps diagnostics out of the training graph.
+            self.env._object_aware_actor_obs = obs_dict.get("actor_obs", None)  # noqa: SLF001
+            if self.env._object_aware_actor_obs is not None:  # noqa: SLF001
+                self.env._object_aware_actor_obs = (  # noqa: SLF001
+                    self.env._object_aware_actor_obs.detach()
+                )
+            motion_cmd_for_recording = self.env.command_manager.get_term("motion")
+            self.env._object_aware_motion_step = (  # noqa: SLF001
+                motion_cmd_for_recording.motion_start_time_steps
+                + motion_cmd_for_recording.time_steps
+            ).detach().clone()
+            robot_for_recording = self.env.scene["robot"]
+            self.env._object_aware_robot_root_pos_w = (  # noqa: SLF001
+                robot_for_recording.data.root_pos_w.detach().clone()
+            )
+            self.env._object_aware_robot_root_quat_w = (  # noqa: SLF001
+                robot_for_recording.data.root_quat_w.detach().clone()
+            )
+            if "object" in self.env.scene.rigid_objects:
+                object_for_recording = self.env.scene["object"]
+                self.env._object_aware_object_root_pos_w = (  # noqa: SLF001
+                    object_for_recording.data.root_pos_w.detach().clone()
+                )
+                self.env._object_aware_object_root_quat_w = (  # noqa: SLF001
+                    object_for_recording.data.root_quat_w.detach().clone()
+                )
             # Determine action mode: "direct_latent", "residual", or "mixed"
             # Priority: 1) explicit action_mode in actions dict, 2) config flag
             # During training: trainer sets action_mode explicitly
@@ -849,6 +877,9 @@ class ManagerEnvWrapper:
             tokenizer_action_dim = self.config.get("tokenizer_action_dim")
             tokenizer_meta_actions = meta_actions[:, :tokenizer_action_dim]
             hand_actions_raw = meta_actions[:, tokenizer_action_dim:]
+            self.env._object_aware_hand_primitive_policy_raw = (  # noqa: SLF001
+                hand_actions_raw.detach()
+            )
 
             # Override hand actions with motion data if configured
             if self.config.get("use_motion_hand_actions", False):
@@ -865,6 +896,12 @@ class ManagerEnvWrapper:
                 # Use motion data directly: -1.0 = open, +1.0 = closed
                 # Threshold at 0 in _convert_primitive_to_finger_actions
                 hand_actions_raw = torch.stack([left_action, right_action], dim=-1)
+
+            # Keep both values: pnp_table may replace the policy's two hand
+            # outputs with the reference motion primitives at this point.
+            self.env._object_aware_hand_primitive_executed = (  # noqa: SLF001
+                hand_actions_raw.detach()
+            )
 
             # Convert primitive actions to finger joint targets if enabled
             if self._use_finger_primitive and self._finger_primitive_map:
@@ -884,11 +921,25 @@ class ManagerEnvWrapper:
                 # Teacher/residual mode: policy outputs residual that's added to ATM encoded tokens
                 # Apply scaling to residual before passing to ATM
                 scaled_residual = tokenizer_meta_actions * self._latent_residual_scale
+                self.env._object_aware_latent_residual_raw = (  # noqa: SLF001
+                    tokenizer_meta_actions.detach()
+                )
+                self.env._object_aware_latent_residual_scaled = (  # noqa: SLF001
+                    scaled_residual.detach()
+                )
                 # Add residual in latent/token space (after encoding, before decoding)
                 body_actions = self.action_transform_module(
                     atm_obs_dict,
                     latent_residual=scaled_residual,
                     latent_residual_mode=self._latent_residual_mode,
+                )
+
+                atm_module = self.action_transform_module.actor_module
+                combined_latent = getattr(
+                    atm_module, "_last_pre_quantization_latent_flat", None
+                )
+                self.env._object_aware_combined_latent = (  # noqa: SLF001
+                    combined_latent.detach() if combined_latent is not None else None
                 )
 
             elif action_mode == "mixed":
@@ -1679,11 +1730,13 @@ class ManagerEnvWrapper:
                 motion_lib_cfg = getattr(self.motion_command.cfg, "motion_lib_cfg", None)
                 motion_file = motion_lib_cfg.get("motion_file", "") if motion_lib_cfg else ""
 
-                if motion_file and "/robot" in motion_file:
-                    if os.path.isdir(motion_file):
-                        meta_dir = motion_file.replace("/robot", "/meta")
-                    else:
-                        meta_dir = os.path.dirname(motion_file).replace("/robot", "/meta")
+                motion_dir = (
+                    motion_file if os.path.isdir(motion_file) else os.path.dirname(motion_file)
+                )
+                if motion_dir and os.path.basename(os.path.normpath(motion_dir)) == "robot":
+                    meta_dir = os.path.join(
+                        os.path.dirname(os.path.normpath(motion_dir)), "meta"
+                    )
                 else:
                     meta_dir = "data/motion_lib_grab/meta"
 

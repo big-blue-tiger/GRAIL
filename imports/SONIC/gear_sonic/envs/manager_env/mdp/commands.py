@@ -2957,10 +2957,9 @@ class TrackingCommand(CommandTerm):
         motion_file = (
             self.cfg.motion_lib_cfg.get("motion_file", "") if self.cfg.motion_lib_cfg else ""
         )
-        if motion_file and os.path.isdir(motion_file):
-            meta_dir = motion_file.replace("/robot", "/meta")
-        elif motion_file and "/robot" in motion_file:
-            meta_dir = os.path.dirname(motion_file).replace("/robot", "/meta")
+        motion_dir = motion_file if os.path.isdir(motion_file) else os.path.dirname(motion_file)
+        if motion_dir and os.path.basename(os.path.normpath(motion_dir)) == "robot":
+            meta_dir = os.path.join(os.path.dirname(os.path.normpath(motion_dir)), "meta")
         else:
             meta_dir = "data/motion_lib_grab/meta"
         meta_file = os.path.join(meta_dir, f"{motion_key}.pkl")

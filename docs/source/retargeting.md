@@ -89,11 +89,12 @@ python -m grail.retargeting.process \
 
 # Add --treat_hands_equally to preserve both arms and derive left/right
 # hand actions symmetrically from each hand's contacts.
-
+# Stage 2.5 change the mesh to usd
+python -m grail.retargeting.convert_mesh2usd ../sbto/sbto/models/mesh/hardcover_book/model.obj ../sbto/sbto/models/mesh/hardcover_book/model.usd
 # Stage 3 — BPS shape encoding (multi-object datasets only)
 python -m grail.retargeting.compute_bps \
-    --object_usd_dir data/SBTO/pickCylinder/grasp_cylinder/usd\
-    --output_dir     data/SBTO/pickCylinder/grasp_cylinder/bps
+    --object_usd_dir ../sbto/sbto/models/mesh/hardcover_book\
+    --output_dir     ../sbto/sbto/models/mesh/hardcover_book/bps
 ```
 
 The shell wrappers under

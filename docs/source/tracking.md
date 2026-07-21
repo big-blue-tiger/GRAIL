@@ -91,16 +91,29 @@ described above.
 ### REPLAY
 ```bash
 python -u gear_sonic/train_agent_trl.py \
-    +exp=manager/universal_token/hoi/pnp_ground \
-    num_envs=1 headless=False \
-    ++replay=true \
+    +exp=manager/universal_token/hoi/pnp_table \
+    num_envs=15 headless=False \
+    ++replay=True \
     ++manager_env.config.render_results=False \
     ++manager_env.config.gpu_collision_stack_size_exp=28 \
     ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
-    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/robot \
-    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/objects \
-    ++manager_env.config.object_usd_path=../../data/SBTO/pickCylinder/grasp_cylinder3/object_usd \
-    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/SBTO/pickCylinder/grasp_cylinder3/bps
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/raw_grail_chaged_obj/pickup_table/robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/raw_grail_chaged_obj/pickup_table/objects \
+    ++manager_env.config.object_usd_path=../../data/raw_grail_chaged_obj/pickup_table/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/raw_grail_chaged_obj/pickup_table/bps 
+
+python -u gear_sonic/train_agent_trl.py \
+    +exp=manager/universal_token/hoi/pnp_table \
+    num_envs=15 headless=False \
+    ++replay=True \
+    ++manager_env.config.render_results=False \
+    ++manager_env.config.gpu_collision_stack_size_exp=28 \
+    ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../../sbto/datas/sbto_to_grail/pickup_table/objects \
+    ++manager_env.config.object_usd_path=../../../sbto/datas/sbto_to_grail/pickup_table/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../../sbto/datas/sbto_to_grail/pickup_table/bps
+
 ```
 ### View
 ```bash
@@ -108,53 +121,88 @@ conda activate sonic
 export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 WANDB_MODE=offline
 cd imports/SONIC
 python -u gear_sonic/train_agent_trl.py \
-    +exp=manager/universal_token/hoi/pnp_ground \
-    num_envs=4 headless=False \
-    ++algo.config.num_learning_iterations=20000 \
-    ++manager_env.config.gpu_collision_stack_size_exp=28 \
-    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/robot \
-    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/objects \
-    ++manager_env.config.object_usd_path=../../data/SBTO/pickCylinder/grasp_cylinder3/object_usd \
-    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/SBTO/pickCylinder/grasp_cylinder3/bps \
-        ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
-    ++manager_env.commands.motion.sample_from_n_initial_frames=100 \
-            ++resume=True \
-    ++checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739/model_step_008000.pt \
-    experiment_dir=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739 \
+    +exp=manager/universal_token/hoi/pnp_table \
+    num_envs=3 headless=False \
+      ++algo.config.init_noise_std=0.4 \
+      ++algo.config.entropy_coef=0.03 \
+    ++algo.config.num_learning_iterations=90000 \
+    ++manager_env.config.gpu_collision_stack_size_exp=26 \
+     ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../../sbto/datas/sbto_to_grail/pickup_table/objects \
+    ++manager_env.config.object_usd_path=../../../sbto/datas/sbto_to_grail/pickup_table/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../../sbto/datas/sbto_to_grail/pickup_table/bps \
+      ++resume=True \
+    ++checkpoint=models/pnp_table_warmstart/last.pt 
 ```
+bash grail/visualization/scripts/visualize_single.sh data/hf_dataset/data/pickup_table/robot/pickup_table__beer_19__003.pkl
 ### train
 ```bash
 conda activate sonic
 export HYDRA_FULL_ERROR=1 PYTHONUNBUFFERED=1 WANDB_MODE=offline
 cd imports/SONIC
-python -u gear_sonic/train_agent_trl.py \
-    +exp=manager/universal_token/hoi/pnp_ground \
-    num_envs=1024 headless=True \
-    ++algo.config.num_learning_iterations=18000 \
-    ++manager_env.config.gpu_collision_stack_size_exp=28 \
+CUDA_VISIBLE_DEVICES=0 python -u gear_sonic/train_agent_trl.py \
+    +exp=manager/universal_token/hoi/pnp_table \
+    num_envs=4096 headless=True \
+      ++algo.config.init_noise_std=0.4 \
+      ++algo.config.entropy_coef=0.03 \
+    ++algo.config.num_learning_iterations=90000 \
+    ++manager_env.config.gpu_collision_stack_size_exp=30 \
      ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
-    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/robot \
-    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/SBTO/pickCylinder/grasp_cylinder3/objects \
-    ++manager_env.config.object_usd_path=../../data/SBTO/pickCylinder/grasp_cylinder3/object_usd \
-    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/SBTO/pickCylinder/grasp_cylinder3/bps \
-    ++manager_env.commands.motion.sample_from_n_initial_frames=100 \
-    ++manager_env.rewards.object_tracking_reward.weight=45 \
-    ++manager_env.rewards.grasp_finger_direction.weight=0 \
-    ++manager_env.rewards.grasp_finger_direction_left.weight=0 \
-                ++resume=True \
-    ++checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739/model_step_008000.pt \
-    experiment_dir=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739 \
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/raw_grail_chaged_obj/pickup_table/robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/raw_grail_chaged_obj/pickup_table/objects \
+    ++manager_env.config.object_usd_path=../../data/raw_grail_chaged_obj/pickup_table/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/raw_grail_chaged_obj/pickup_table/bps 
 
 
+CUDA_VISIBLE_DEVICES=0 python -u gear_sonic/train_agent_trl.py \
+    +exp=manager/universal_token/hoi/pnp_table \
+    num_envs=4096 headless=True \
+    ++algo.config.num_learning_iterations=90000 \
+    ++manager_env.config.gpu_collision_stack_size_exp=30 \
+     ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../../sbto/datas/sbto_to_grail/pickup_table/objects \
+    ++manager_env.config.object_usd_path=../../../sbto/datas/sbto_to_grail/pickup_table/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../../sbto/datas/sbto_to_grail/pickup_table/bps \
+      ++resume=True \
+    ++checkpoint=models/pnp_table_warmstart/last.pt
 ```
 
 ```bash
 python -u gear_sonic/eval_agent_trl.py \
-    +checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_ground_pnp_ground-20260705_172739/model_step_009000.pt \
-    +num_envs=1 \
+    +checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-20260715_185040/model_step_003500.pt\
+    +num_envs=12 \
     +headless=False \
+    ++manager_env.config.gpu_collision_stack_size_exp=28 \
     ++run_eval_loop=True \
-    ++max_render_steps=3000
+    ++manager_env.commands.motion.debug_vis=True \
+    ++max_render_steps=30000
+
+
+    python -u gear_sonic/eval_agent_trl.py \
+  +checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-sbto_data_717/last.pt \
+  +num_envs=12 \
+  +headless=False \
+  ++run_eval_loop=True \
+  ++manager_env.commands.motion.debug_vis=True \
+  ++max_render_steps=30000 \
+  ++manager_env.config.gpu_collision_stack_size_exp=28
+```
+
+### render ego video
+```bash
+python -u gear_sonic/scripts/render_ego_motion.py \
+  --gpu 0 \
+  --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-sbto_data_717/last.pt \
+  --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot/pickup_table_120.pkl \
+  --output-dir outputs/ego_view/single
+
+python -u gear_sonic/scripts/render_ego_motion.py \
+  --gpu 0 \
+  --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-sbto_data_717/last.pt \
+  --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+  --output-dir outputs/ego_view/all
 ```
 ## Running training
 

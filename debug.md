@@ -9,8 +9,8 @@ rsync -aP --checksum \
 rsync -aP --checksum \
   --no-owner --no-group --omit-dir-times \
   -e "ssh -p 9991 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
-  /home/tide/robot/Hunyuan3D-2.1/ \
-  ygc@202.120.37.249:/home/ygc/data0/Hunyuan3D-2.1/
+  /home/tide/robot/sbto/ \
+  ygc@202.120.37.249:/home/ygc/data0/sbto/
 ```
 
 # api

@@ -147,6 +147,7 @@ Initialize with:
    recon_4dhoi
    retargeting
    tracking
+   object_aware_tracking_architecture
 
 .. toctree::
    :maxdepth: 2
