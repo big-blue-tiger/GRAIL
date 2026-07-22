@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Run a SONIC checkpoint and save ego videos plus object-aware policy tensors.
+"""Run a SONIC checkpoint and save successful ego videos and policy tensors.
 
-Alongside every ``<motion_key>.mp4``, this launcher writes an
-``<motion_key>.object_aware.pkl`` containing per-frame proprioception, object
+Each rollout starts with an independently sampled robot-root XY offset in
+``[-0.05, 0.05]`` meters. Alongside every successful
+``<motion_key>_x<dx>_y<dy>.mp4``, this launcher writes a matching
+``.object_aware.pkl`` containing per-frame proprioception, object
 reference observations, the 64-D latent residual, the two raw/executed hand
 primitives, the pre-FSQ ``z + lambda * delta_z`` latent, and world-frame
-robot/object root poses.
+robot/object root poses. Episodes that terminate before motion timeout are discarded.
 """
 
 from __future__ import annotations
@@ -23,10 +25,19 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
+        "--batch-size",
+        default=64,
+        type=int,
+        help="Number of motions/rendering environments per subprocess (default: 16)",
+    )
+    parser.add_argument(
         "--dataset-root", type=Path, help="Directory containing robot/objects/object_usd/bps"
     )
     parser.add_argument("--gpu", default="0")
+    parser.add_argument("--seed", type=int, help="Base seed; defaults to a random seed")
     args, extra = parser.parse_known_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
 
     input_path = args.input.expanduser().resolve()
     checkpoint = args.checkpoint.expanduser().resolve()
@@ -61,14 +72,14 @@ def main() -> None:
     camera_rot = "[0.965926,0.0,0.258819,0.0]"
     camera_focal_length = 9
     camera_horizontal_aperture = 20.955
-    cmd = [
+    common_cmd = [
         sys.executable,
         "-u",
         "gear_sonic/eval_agent_trl.py",
         f"+checkpoint={checkpoint}",
-        f"+num_envs={len(motion_keys)}",
         "+headless=True",
         "++run_once=True",
+        "++warmup_rollout_steps=8",
         # The recorder reads ego_camera directly; do not create the extra eval_camera.
         "++manager_env.config.render_results=False",
         "++manager_env.config.enable_cameras=True",
@@ -88,28 +99,51 @@ def main() -> None:
         "gear_sonic.envs.manager_env.mdp.recorders.RenderEnvsRecorderCfg",
         f"++manager_env.recorders.render_envs.video_save_path={output_dir}",
         "++manager_env.recorders.render_envs.video_quality=5",
+        "++manager_env.recorders.render_envs.save_only_timeouts=True",
+        "++manager_env.recorders.render_envs.append_initial_xy_offset=True",
         "++manager_env.recorders.trajectory._target_="
         "gear_sonic.envs.manager_env.mdp.recorders.ObjectAwareStateRecorderCfg",
         f"++manager_env.recorders.trajectory.save_path={output_dir}",
+        "++manager_env.recorders.trajectory.save_only_timeouts=True",
+        "++manager_env.recorders.trajectory.append_initial_xy_offset=True",
+        "++manager_env.commands.motion.randomize_initial_pose_during_evaluation=True",
+        "++manager_env.commands.motion.pose_range.x=[-0.06,0.06]",
+        "++manager_env.commands.motion.pose_range.y=[-0.06,0.06]",
         f"++manager_env.commands.motion.motion_lib_cfg.motion_file={robot_dir}",
         f"++manager_env.commands.motion.motion_lib_cfg.object_motion_file={required['objects']}",
         f"++manager_env.config.object_usd_path={required['object_usd']}",
         f"++manager_env.commands.motion.motion_lib_cfg.bps_dir={required['bps']}",
     ]
-    if input_path.is_file():
+    batches = [
+        motion_keys[start : start + args.batch_size]
+        for start in range(0, len(motion_keys), args.batch_size)
+    ]
+    base_seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(4), "little")
+    print(
+        f"Rendering {len(motion_keys)} motion(s) to {output_dir} "
+        f"in {len(batches)} batch(es), up to {args.batch_size} environment(s) each"
+    )
+    for batch_index, batch_keys in enumerate(batches, start=1):
+        cmd = common_cmd.copy()
+        batch_seed = (base_seed + batch_index - 1) % (2**32)
+        cmd.append(f"++seed={batch_seed}")
+        cmd.append(f"+num_envs={len(batch_keys)}")
+        keys_override = ",".join(batch_keys)
         cmd.append(
             "++manager_env.commands.motion.motion_lib_cfg.filter_motion_keys="
-            f"[{motion_keys[0]}]"
+            f"[{keys_override}]"
         )
-    cmd.extend(extra)
-
-    print(f"Rendering {len(motion_keys)} motion(s) to {output_dir}")
-    subprocess.run(
-        cmd,
-        check=True,
-        cwd=Path(__file__).resolve().parents[2],
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu},
-    )
+        cmd.extend(extra)
+        print(
+            f"Batch {batch_index}/{len(batches)}: "
+            f"{', '.join(batch_keys)} (seed={batch_seed})"
+        )
+        subprocess.run(
+            cmd,
+            check=True,
+            cwd=Path(__file__).resolve().parents[2],
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu},
+        )
 
 
 if __name__ == "__main__":

@@ -1510,7 +1510,7 @@ class MySceneCfg(InteractiveSceneCfg):
                         diffuse_color=(0.04, 0.04, 0.04), metallic=0.2, roughness=0.35
                     ),
                 ),
-                # Keep this synchronized with scripts/render_ego_motion.py.
+                # Keep this synchronized with scripts/get_rl_motion_data.py.
                 init_state=AssetBaseCfg.InitialStateCfg(
                     # head_link mesh spans z=0.325..0.531; this is near human eye level.
                     pos=(0.09, 0.0, 0.44),

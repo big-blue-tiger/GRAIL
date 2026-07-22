@@ -1,0 +1,33 @@
+name: PushBox
+
+# image_shape: [3, 518, 518]
+# mask_image_shape: [4, 518, 518]
+dataset_paths:
+ - ${dataset_path}
+
+shape_meta: &shape_meta
+  # obs:
+  #   right_state:
+  #     shape: [13]
+  #     type: low_dim
+  #     horizon: ${n_obs_steps}
+  obs:
+    n_obs_steps: ${n_obs_steps}
+  action:
+    shape: [36]
+    horizon: ${eval:'${n_action_steps}+${n_obs_steps}-1'}
+
+env_runner:
+  _target_: sugar_il.env_runner.generator_runner.GeneratorRunner
+
+dataset:
+  _target_: sugar_il.dataset.generator_dataset.GeneratorDataset
+  zarr_paths: ${task.dataset_paths}
+  horizon: ${eval:'${n_action_steps}+${n_obs_steps}-1'}
+  n_obs_steps: ${n_obs_steps}
+  pad_before: 0 # ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: 0 # ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.05
+  use_last_action: ${use_last_action}
+  use_target: ${use_target}

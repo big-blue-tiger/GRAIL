@@ -126,7 +126,7 @@ python -u gear_sonic/train_agent_trl.py \
       ++algo.config.init_noise_std=0.4 \
       ++algo.config.entropy_coef=0.03 \
     ++algo.config.num_learning_iterations=90000 \
-    ++manager_env.config.gpu_collision_stack_size_exp=26 \
+    ++manager_env.config.gpu_collision_stack_size_exp=27 \
      ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
     ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../../sbto/datas/sbto_to_grail/pickup_table/robot \
     ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../../sbto/datas/sbto_to_grail/pickup_table/objects \
@@ -171,12 +171,12 @@ CUDA_VISIBLE_DEVICES=0 python -u gear_sonic/train_agent_trl.py \
 
 ```bash
 python -u gear_sonic/eval_agent_trl.py \
-    +checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-20260715_185040/model_step_003500.pt\
+    +checkpoint=logs_rl/pnp_table_pnp_table-721/last.pt \
     +num_envs=12 \
     +headless=False \
     ++manager_env.config.gpu_collision_stack_size_exp=28 \
     ++run_eval_loop=True \
-    ++manager_env.commands.motion.debug_vis=True \
+    ++manager_env.commands.motion.debug_vis=False \
     ++max_render_steps=30000
 
 
@@ -192,17 +192,39 @@ python -u gear_sonic/eval_agent_trl.py \
 
 ### render ego video
 ```bash
-python -u gear_sonic/scripts/render_ego_motion.py \
+python -u gear_sonic/scripts/get_rl_motion_data.py \
   --gpu 0 \
   --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-sbto_data_717/last.pt \
   --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot/pickup_table_120.pkl \
   --output-dir outputs/ego_view/single
 
-python -u gear_sonic/scripts/render_ego_motion.py \
-  --gpu 0 \
-  --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-sbto_data_717/last.pt \
+python -u gear_sonic/scripts/get_rl_motion_data.py \
+  --gpu 1 \
+  --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-20260721_142019/last.pt \
   --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
-  --output-dir outputs/ego_view/all
+  --output-dir outputs/ego_view/all \
+  --batch-size 64
+
+python -u gear_sonic/scripts/get_rl_motion_data.py \
+  --gpu 1 \
+  --checkpoint logs_rl/pnp_table_pnp_table-721/last.pt \
+  --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+  --output-dir outputs/ego_view/all \
+  --batch-size 128
+  
+while true; do
+    python -u gear_sonic/scripts/get_rl_motion_data.py \
+        --gpu 1 \
+        --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-20260721_142019/last.pt \
+        --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+        --output-dir outputs/ego_view/all \
+        --batch-size 64
+
+    code=$?
+    echo "程序结束，退出码：${code}；5 秒后重新运行"
+    sleep 5
+done
+  
 ```
 ## Running training
 

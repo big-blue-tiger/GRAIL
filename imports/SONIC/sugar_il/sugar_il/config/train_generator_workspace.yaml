@@ -1,0 +1,134 @@
+defaults:
+  - _self_
+  - task: null
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+name: train_generator
+_target_: sugar_il.workspace.train_generator_workspace.TrainGeneratorWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+n_action_steps: 16
+n_obs_steps: 1
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_cond: True
+use_last_action: True
+use_target: True
+num_epochs: 1000
+dataset_path: null
+log_path: data/outputs/${now:%Y.%m.%d}/${now:%H.%M}_${name}_${task_name}
+
+policy:
+  _target_: sugar_il.policy.generator.Generator
+
+  shape_meta: ${shape_meta}
+  
+  noise_scheduler:
+    _target_: diffusers.DDIMScheduler
+    num_train_timesteps: 50
+    beta_start: 0.0001
+    beta_end: 0.02
+    # beta_schedule is important
+    # this is the best we found
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: True
+    set_alpha_to_one: True
+    steps_offset: 0
+    prediction_type: epsilon # or sample
+
+  obs_encoder:
+    _target_: sugar_il.model.encoder.generator_state_encoder.GeneratorStateObsEncoder
+    shape_meta: ${shape_meta}
+    feature_dim: 256
+    last_action_dropout: 0.1
+
+
+  num_inference_steps: 16
+  n_layer: 12
+  n_head: 8
+  p_drop_attn: 0.1
+  use_attn_mask: True
+  hand_loss_weight: 1.0
+  start_ckpt_path: null
+
+
+dataloader:
+  batch_size: 256
+  num_workers: 8
+  shuffle: True
+  pin_memory: True
+  persistent_workers: True
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 8
+  shuffle: False
+  pin_memory: True
+  persistent_workers: True
+
+optimizer:
+  lr: 5e-4
+  weight_decay: 1e-4
+  betas: [0.95, 0.999]
+  
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: False
+  # optimization
+  lr_scheduler: cosine
+  lr_warmup_steps: 2000
+  num_epochs: ${num_epochs}
+  gradient_accumulate_every: 1
+  # EMA destroys performance when used with BatchNorm
+  # replace BatchNorm with GroupNorm.
+  use_ema: False
+  # training loop control
+  # in epochs
+  rollout_every: 10
+  checkpoint_every: 1
+  val_every: 10000
+  save_loss_curve: True
+  loss_curve_every: 1
+  sample_every: 10
+  gen_attn_map: True
+  # steps per epoch
+  max_train_steps: null
+  max_val_steps: null
+  # misc
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: train_generator
+  # resume: False
+  # mode: online
+  name: ${now:%Y.%m.%d-%H.%M}_${name}_${task_name}
+  # tags: ["${name}", "${task_name}", "${exp_name}"]
+  # id: null
+  # group: null
+
+checkpoint:
+  topk:
+    monitor_key: train_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-train_loss={train_loss:.3f}.ckpt'
+  save_last_ckpt: False
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: ${log_path}

@@ -3394,9 +3394,14 @@ class TrackingCommand(CommandTerm):
 
         self.running_ref_root_height[env_ids] = self.anchor_pos_w[env_ids, 2]
 
-        # Skip reset randomizations during evaluation — they cause visible stumbling
-        # at the start of rendered episodes and are only needed for training robustness.
-        if not self.is_evaluating:
+        if not hasattr(self, "initial_root_pose_offset"):
+            self.initial_root_pose_offset = torch.zeros(
+                (self.num_envs, 3), device=self.device
+            )
+        self.initial_root_pose_offset[env_ids] = 0.0
+
+        # Evaluation randomization is opt-in so ordinary evaluation remains deterministic.
+        if not self.is_evaluating or self.cfg.randomize_initial_pose_during_evaluation:
             range_list = [
                 self.cfg.pose_range.get(key, (0.0, 0.0))
                 for key in ["x", "y", "z", "roll", "pitch", "yaw"]
@@ -3406,6 +3411,7 @@ class TrackingCommand(CommandTerm):
                 ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
             )
             root_pos[env_ids] += rand_samples[:, 0:3]
+            self.initial_root_pose_offset[env_ids] = rand_samples[:, 0:3]
             if self.cfg.init_z_offset != 0.0:
                 root_pos[env_ids, 2] += self.cfg.init_z_offset
             orientations_delta = quat_from_euler_xyz(
@@ -4629,6 +4635,7 @@ class TrackingCommandCfg(CommandTermCfg):
     terrain_aware_sampling: bool = False
     flat_to_terrain_ratio: int = 4  # R flat envs per 1 terrain env
     init_z_offset: float = 0.0  # z offset added to root_pos at reset (compensate collision mesh)
+    randomize_initial_pose_during_evaluation: bool = False
 
     pose_range: dict[str, tuple[float, float]] = {}  # noqa: RUF012
     velocity_range: dict[str, tuple[float, float]] = {}  # noqa: RUF012

@@ -20,6 +20,22 @@ if TYPE_CHECKING:
     from isaaclab import envs
 
 
+def _xy_offset_suffix(offset: torch.Tensor) -> str:
+    """Format a sampled root XY offset for an output filename."""
+    x, y = (float(value) for value in offset[:2].detach().cpu())
+    x = 0.0 if abs(x) < 0.005 else x
+    y = 0.0 if abs(y) < 0.005 else y
+    return f"_x{x:+.2f}_y{y:+.2f}"
+
+
+def _termination_reasons(env, env_id: int) -> tuple[str, ...]:
+    """Return every termination term that fired for one environment this step."""
+    manager = env.termination_manager
+    return tuple(
+        name for name in manager.active_terms if bool(manager.get_term(name)[env_id].item())
+    )
+
+
 @configclass
 class RecordersCfg(recorder_manager.RecorderManagerBaseCfg):
     """Recorders terms for the MDP."""
@@ -51,6 +67,12 @@ class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
         self.first_render = True
         self._fixed_eye = None
         self._fixed_target = None
+        self._completed = torch.zeros(self.env.num_envs, dtype=torch.bool)
+        self._successful = torch.zeros(self.env.num_envs, dtype=torch.bool)
+        self._termination_reasons: list[tuple[str, ...]] = [
+            () for _ in range(self.env.num_envs)
+        ]
+        self._video_paths: list[str] = []
 
     def _initialize_writers(self):
         """Initialize video writers for each environment."""
@@ -65,10 +87,13 @@ class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
 
         motion = self.env.command_manager.get_term("motion")
         motion_keys = getattr(motion.motion_lib, "curr_motion_keys", [])
+        offsets = getattr(motion, "initial_root_pose_offset", None)
 
         for i in range(self.max_render_envs):
             motion_idx = self.start_idx + i
             stem = motion_keys[i] if i < len(motion_keys) else f"{motion_idx:06d}"
+            if self.cfg.append_initial_xy_offset and offsets is not None:
+                stem += _xy_offset_suffix(offsets[i])
             file_name = os.path.join(self.save_dir, f"{stem}.mp4")
             fps = 1 / (self.env.step_dt * self.render_frame_skip)
             writer = imageio.get_writer(
@@ -79,9 +104,25 @@ class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
                 pixelformat="yuv420p",
             )
             self.video_writers.append(writer)
+            self._video_paths.append(file_name)
+
+    def record_pre_reset(self, env_ids) -> tuple[str | None, torch.Tensor | dict | None]:
+        """Remember whether the first recorded episode ended by timeout."""
+        if getattr(self.env, "_suppress_recording", False):
+            return None, None
+        if not self.video_writers:
+            return None, None
+        for env_id in env_ids:
+            if not self._completed[env_id]:
+                self._completed[env_id] = True
+                self._successful[env_id] = bool(self.env.reset_time_outs[env_id].item())
+                self._termination_reasons[env_id] = _termination_reasons(self.env, env_id)
+        return None, None
 
     def record_post_step(self) -> tuple[str | None, torch.Tensor | dict | None]:
         """Record video frames after each step with frame skipping and text overlay support."""
+        if getattr(self.env, "_suppress_recording", False):
+            return None, None
         if len(self.video_writers) == 0:
             self._initialize_writers()
 
@@ -144,6 +185,8 @@ class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
                 else range(self.max_render_envs)
             )
             for i in loop:
+                if self.cfg.save_only_timeouts and self._completed[i]:
+                    continue
                 frame = rgb_viewer[i].cpu().numpy()
 
                 # Add text overlay if render info is provided
@@ -174,6 +217,15 @@ class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):
                     logger.info(f"Closed video writer {i}")
                 except Exception as e:  # noqa: BLE001
                     logger.info(f"Error closing video writer {i}: {e}")
+            if self.cfg.save_only_timeouts:
+                for i, path in enumerate(self._video_paths):
+                    if not self._successful[i] and os.path.exists(path):
+                        os.remove(path)
+                        reasons = ", ".join(self._termination_reasons[i]) or "unknown"
+                        logger.info(
+                            f"Discarded early-terminated video (env={i}, reasons={reasons}): "
+                            f"{path}"
+                        )
             self.video_writers.clear()
             self._writers_closed = True
             self.frame_id = 0
@@ -194,6 +246,8 @@ class RenderEnvsRecorderCfg(manager_term_cfg.RecorderTermCfg):
     class_type = RenderEnvsRecorderTerm
     video_save_path: str = None
     video_quality: int = 5
+    save_only_timeouts: bool = False
+    append_initial_xy_offset: bool = False
 
 
 class TrajectoryRecorderTerm(recorder_manager.RecorderTerm):
@@ -439,6 +493,11 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
         self._closed = False
         self.frame_id = 0
         self._frame_data: dict[int, dict[str, list]] = {}
+        self._completed = torch.zeros(self.env.num_envs, dtype=torch.bool)
+        self._successful = torch.zeros(self.env.num_envs, dtype=torch.bool)
+        self._termination_reasons: list[tuple[str, ...]] = [
+            () for _ in range(self.env.num_envs)
+        ]
         logger.info(f"=== ObjectAwareStateRecorder: saving to {self.save_dir} ===")
 
     def _initialize(self) -> None:
@@ -456,6 +515,10 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
             offset += width
         self._policy_obs_dim = offset
         self._motion_cmd = self.env.command_manager.get_term("motion")
+        offsets = getattr(self._motion_cmd, "initial_root_pose_offset", None)
+        self._initial_root_pose_offsets = (
+            offsets.detach().cpu().clone() if offsets is not None else None
+        )
         if "object" not in self.env.scene.rigid_objects:
             raise RuntimeError("ObjectAwareStateRecorder requires an object rigid body.")
         for i in range(self.num_record_envs):
@@ -480,12 +543,27 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
                     self._frame_data[i][name] = []
         self._initialized = True
 
+    def record_pre_reset(self, env_ids) -> tuple[str | None, torch.Tensor | dict | None]:
+        """Remember whether the first recorded episode ended by timeout."""
+        if getattr(self.env, "_suppress_recording", False):
+            return None, None
+        if not self._initialized:
+            return None, None
+        for env_id in env_ids:
+            if not self._completed[env_id] and self._frame_data[env_id]["frame_idx"]:
+                self._completed[env_id] = True
+                self._successful[env_id] = bool(self.env.reset_time_outs[env_id].item())
+                self._termination_reasons[env_id] = _termination_reasons(self.env, env_id)
+        return None, None
+
     @staticmethod
     def _last_step(tensor: torch.Tensor) -> torch.Tensor:
         """Drop a model sequence axis while preserving ordinary 2-D batches."""
         return tensor[:, -1] if tensor.ndim == 3 else tensor
 
     def record_post_step(self) -> tuple[str | None, torch.Tensor | dict | None]:
+        if getattr(self.env, "_suppress_recording", False):
+            return None, None
         if not self._initialized:
             self._initialize()
         if self.frame_id % self.render_frame_skip != 0:
@@ -535,6 +613,8 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
             raise RuntimeError("Object-aware pre-step object root pose was not cached.")
 
         for i in range(self.num_record_envs):
+            if self.cfg.save_only_timeouts and self._completed[i]:
+                continue
             data = self._frame_data[i]
             data["frame_idx"].append(self.frame_id)
             data["motion_step"].append(int(motion_steps[i].item()))
@@ -588,10 +668,28 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
         for i, data in self._frame_data.items():
             if not data["frame_idx"]:
                 continue
-            stem = motion_keys[i] if i < len(motion_keys) else f"{self.start_idx + i:06d}"
+            motion_key = (
+                motion_keys[i] if i < len(motion_keys) else f"{self.start_idx + i:06d}"
+            )
+            output_stem = motion_key
+            initial_offset = None
+            if self._initial_root_pose_offsets is not None:
+                initial_offset = self._initial_root_pose_offsets[i]
+                if self.cfg.append_initial_xy_offset:
+                    output_stem += _xy_offset_suffix(initial_offset)
+            path = os.path.join(self.save_dir, f"{output_stem}.object_aware.pkl")
+            if self.cfg.save_only_timeouts and not self._successful[i]:
+                if os.path.exists(path):
+                    os.remove(path)
+                reasons = ", ".join(self._termination_reasons[i]) or "unknown"
+                logger.info(
+                    f"Discarded early-terminated object-aware data "
+                    f"(env={i}, motion={motion_key}, reasons={reasons})"
+                )
+                continue
             payload = {
                 "schema_version": 3,
-                "motion_key": stem,
+                "motion_key": motion_key,
                 "fps": 1.0 / (self.env.step_dt * self.render_frame_skip),
                 "latent_residual_scale": scale,
                 "latent_residual_mode": self.env.wrapper.config.get(
@@ -607,6 +705,8 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
                     for name, (start, end, shape) in self._policy_slices.items()
                 },
             }
+            if initial_offset is not None:
+                payload["initial_root_pose_offset_xyz"] = initial_offset.numpy().copy()
             array_data = {key: np.asarray(value) for key, value in data.items()}
             payload.update(array_data)
             payload["proprioception"] = {
@@ -619,7 +719,6 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
                 for name in self._OBJECT_REFERENCE_TERMS
                 if name in array_data
             }
-            path = os.path.join(self.save_dir, f"{stem}.object_aware.pkl")
             with open(path, "wb") as file:
                 pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
             logger.info(
@@ -636,3 +735,5 @@ class ObjectAwareStateRecorderCfg(manager_term_cfg.RecorderTermCfg):
 
     class_type = ObjectAwareStateRecorderTerm
     save_path: str = None
+    save_only_timeouts: bool = False
+    append_initial_xy_offset: bool = False

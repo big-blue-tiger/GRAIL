@@ -1,0 +1,23 @@
+[project]
+name = "sugar_il"
+version = "0.1.0"
+dependencies = [
+    "torch>=2.4",
+    "accelerate>=1.3",
+    "diffusers>=0.32,<0.36",
+    "numpy>=1.26,<2",
+    "dill",
+    "hydra-core>=1.3",
+    "tensorboard",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
