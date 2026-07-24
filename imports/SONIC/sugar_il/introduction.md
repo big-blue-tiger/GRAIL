@@ -91,16 +91,16 @@ Isaac Lab 当前世界状态
 
 扩散模型需要一个去噪器 `ε_θ(x_t,t,c)`。U-Net 是常见选择；DiT 用 Transformer 替代 U-Net。经典图像 DiT 通常把 latent image 切成 patch token，把时间与类别条件映射为调制向量，再用 adaptive LayerNorm 调制各 block：
 
-\[
+$$
 (\gamma,\beta,\alpha)=f(t,c),\qquad
 \operatorname{adaLN}(x)=\gamma\odot\operatorname{LN}(x)+\beta,
-\]
+$$
 
-\[
+$$
 x\leftarrow x+\alpha_{\rm attn}\odot \operatorname{Attn}(\operatorname{adaLN}(x)),
 \quad
 x\leftarrow x+\alpha_{\rm ffn}\odot \operatorname{FFN}(\operatorname{adaLN}(x)).
-\]
+$$
 
 本项目保留了“Transformer 充当扩散去噪器”这一高层定义，但条件注入方式改为 cross-attention。代码中不存在 `γ/β/α` 的生成层，也没有 adaptive norm。因此，本项目的“调制机制”应准确理解为：条件 token 改变 cross-attention 的 key/value 及注意力权重，进而以加性残差改变动作表示；不是 AdaLN 的逐通道仿射调制。
 
@@ -110,15 +110,15 @@ x\leftarrow x+\alpha_{\rm ffn}\odot \operatorname{FFN}(\operatorname{adaLN}(x)).
 
 对 batch 中每个整数扩散步 `t∈[0,49]`，先生成 256 维固定正余弦编码。令 `i=0,…,127`：
 
-\[
+$$
 \omega_i=\exp\left(-\log(10000)\frac{i}{128}\right),
-\]
+$$
 
-\[
+$$
 e_{\rm sin}(t)=
 [\cos(t\omega_0),\ldots,\cos(t\omega_{127}),
  \sin(t\omega_0),\ldots,\sin(t\omega_{127})].
-\]
+$$
 
 代码对应关系：
 
@@ -136,10 +136,10 @@ e_{\rm sin}(t)=
 
 输入 `sample=x_t∈R^{B×16×64}`。每一帧是一个 token：
 
-\[
+$$
 X^{(0)}=x_tW_{in}+b_{in}+P_a,
 \quad X^{(0)}\in\mathbb{R}^{B\times16\times256}.
-\]
+$$
 
 `input_emb` 完成 `64→256`，可学习的 `pos_emb` 形状是 `[1,16,256]`。它表达序列中“未来第几帧”，而扩散时间 `t` 表达“当前噪声强度”；二者不是同一种时间。
 
@@ -151,41 +151,41 @@ X^{(0)}=x_tW_{in}+b_{in}+P_a,
 
 每层是 pre-norm 结构。对输入 `X_l∈R^{B×16×256}`：
 
-\[
+$$
 \tilde X=\operatorname{RMSNorm}_1(X_l),
 \qquad
 X'=X_l+\operatorname{MHA}_{self}(\tilde X,\tilde X,\tilde X),
-\]
+$$
 
-\[
+$$
 \hat X=\operatorname{RMSNorm}_2(X'),
 \qquad
 X''=X'+\operatorname{MHA}_{cross}(\hat X,C,C),
-\]
+$$
 
-\[
+$$
 X_{l+1}=X''+\operatorname{FFN}(\operatorname{RMSNorm}_3(X'')).
-\]
+$$
 
 RMSNorm 不减均值。对单个 256 维 token：
 
-\[
+$$
 \operatorname{RMSNorm}(x)=g\odot
 \frac{x}{\sqrt{\frac1D\sum_{j=1}^{D}x_j^2+10^{-6}}}.
-\]
+$$
 
 `g` 是可学习缩放参数，但与条件无关，所以不是 adaptive normalization。pre-norm 与三条恒等残差路径让梯度可以绕过 attention/FFN 子层，有助于深层训练稳定。
 
 8 头 attention 中每头维数 `d_h=256/8=32`。单头计算为：
 
-\[
+$$
 Q=XW_Q,\quad K=YW_K,\quad V=YW_V,
-\]
+$$
 
-\[
+$$
 A=\operatorname{softmax}(QK^\top/\sqrt{32}),
 \qquad \operatorname{head}=AV.
-\]
+$$
 
 self-attention 取 `Y=X`，其注意力矩阵是 `[B,8,16,16]`，让不同未来帧协调；cross-attention 取 `Y=C`，矩阵是 `[B,8,16,5]`，让每个未来帧选择不同条件。代码只在 `gen_attn_map=True` 时返回 cross-attention 权重；self-attention 始终传 `need_weights=False`。
 
@@ -195,10 +195,10 @@ FFN 为 `Linear(256,1024) → GELU(tanh approximation) → Dropout → Linear(10
 
 四个观测 token 在每一个 `RDTBlock` 都作为同一组 key/value 被复用。第 `h` 个头、动作位置 `i` 对条件 token `j` 的权重为：
 
-\[
+$$
 a_{hij}=\operatorname{softmax}_j
 \left(\frac{q_{hi}^{\top}k_{hj}}{\sqrt{32}}\right).
-\]
+$$
 
 输出 `Σ_j a_{hij}v_{hj}` 经 output projection 后加到动作表示。条件会同时改变 `K,V`，查询也随上一层状态改变，因此融合是动态的、逐层的、逐动作位置的。配置项 `use_attn_mask: True` 被 `Generator.__init__(**kwargs)` 接收后忽略，当前实际没有 attention mask。
 
@@ -206,10 +206,10 @@ a_{hij}=\operatorname{softmax}_j
 
 12 层后执行：
 
-\[
-\hat\epsilon_\theta=operatorname{Linear}_{256\to64}
+$$
+\hat\epsilon_\theta=\operatorname{Linear}_{256\to64}
 (\operatorname{RMSNorm}(X_{12})),
-\]
+$$
 
 形状 `[B,16,64]`。输出头没有 zero initialization；所有默认 Linear 使用 PyTorch 默认初始化，只有动作/条件位置参数显式用 `N(0,0.02²)` 初始化。这也不同于常见 DiT 的 adaLN-Zero/零初始化输出设计。
 
@@ -224,10 +224,10 @@ a_{hij}=\operatorname{softmax}_j
 
 `DDIMScheduler.add_noise` 实现标准闭式前向过程：
 
-\[
+$$
 x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon,
 \qquad \bar\alpha_t=\prod_{s=1}^{t}(1-\beta_s).
-\]
+$$
 
 配置使用 50 个训练步、`squaredcos_cap_v2` beta schedule、`β_start=10^{-4}`、`β_end=0.02`。对该 diffusers schedule，具体 beta 序列由 scheduler 计算，不能简单视为线性插值。
 
@@ -235,11 +235,11 @@ x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon,
 
 配置 `prediction_type: epsilon`，所以监督目标就是采入的 `ε`：
 
-\[
+$$
 \mathcal L_{latent}
 =\mathbb E_{x_0,t,\epsilon}
 \left[\|\epsilon-\epsilon_\theta(x_t,t,c)\|_2^2\right].
-\]
+$$
 
 `F.mse_loss` 默认对 batch、16 帧和 64 通道全部取平均。代码也支持 `prediction_type: sample`，此时目标改成 `x_0`；不支持 `v_prediction`。
 
@@ -247,9 +247,9 @@ x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon,
 
 `Generator.conditional_sample` 从 `[B,16,64]` 标准高斯开始，调用 `set_timesteps(16)`，即从 50 个训练噪声级中选择 16 个推理步。每步先预测噪声，再由 `DDIMScheduler.step` 计算 `prev_sample`。概念上先估计：
 
-\[
-\hat x_0=rac{x_t-\sqrt{1-\bar\alpha_t}\hat\epsilon}{\sqrt{\bar\alpha_t}},
-\]
+$$
+\hat x_0=\frac{x_t-\sqrt{1-\bar\alpha_t}\hat\epsilon}{\sqrt{\bar\alpha_t}},
+$$
 
 再更新到较小噪声的 `x_{t-1}`。scheduler 默认 `eta=0` 时 DDIM 更新在给定初始噪声后是确定性的；但每次调用仍重新采样初始高斯，所以整体输出仍随机。`clip_sample=True` 会让 scheduler 在更新内部裁剪预测的 `x_0`，与训练数据被 limits normalizer 映射到约 `[-1,1]` 相配。
 
@@ -257,18 +257,18 @@ x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon,
 
 `HandPrimitiveHead` 使用 16 个 learned query `Q_h∈R^{1×16×256}`。扩展到 batch 后，2 层标准 `TransformerDecoderLayer(norm_first=True)` 让 query 之间 self-attend，并 cross-attend 到 4 个观测 token，最后输出 `[B,16,2]` logits：
 
-\[
+$$
 \mathcal L_{hand}=
 -\frac1{32B}\sum_{b,i,k}
 [y_{bik}\log\sigma(z_{bik})+(1-y_{bik})\log(1-\sigma(z_{bik}))].
-\]
+$$
 
 总损失：
 
-\[
+$$
 \mathcal L=\mathcal L_{latent}+\lambda_{hand}\mathcal L_{hand},
 \qquad \lambda_{hand}=1.
-\]
+$$
 
 两个手通道使用独立 sigmoid，不是二选一 softmax。推理阈值为 0.5。该分支只看观测条件，不看采样出来的 latent，也不看扩散时间步，所以连续动作和手动作仅通过共享 encoder、联合反向传播间接耦合。
 
@@ -296,21 +296,21 @@ x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon,
 
 `GeneratorStateObsEncoder.forward` 先强制每个观测形状为 `[B,1,D_i]`，去掉长度为 1 的时间轴，再构造：
 
-\[
+$$
 c_{bps}=MLP_{10}(bps),
-\]
+$$
 
-\[
+$$
 c_{current}=MLP_{18}([p_o^b,r_o^{b,6d},h_o]),
-\]
+$$
 
-\[
+$$
 c_{target}=MLP_{18}([p_g^b,r_g^{b,6d},h_g]),
-\]
+$$
 
-\[
+$$
 c_{last}=MLP_{66}([a_{t-1}^{latent},a_{t-1}^{hand}]).
-\]
+$$
 
 每个 MLP 都是 `Linear(input,256) → LayerNorm → GELU → Dropout → Linear(256,256) → LayerNorm`。stack 后为 `[B,4,256]`。训练时以样本为单位用概率 0.1 把整个上一动作 token 置零；其他三个 token 不做 classifier-free condition dropout，代码也未实现 CFG。
 
@@ -346,10 +346,10 @@ README 强调旧文件中预先计算的 body-frame `object_pos_b`、`object_ori
 
 机器人世界位姿为 `(p_r^w,q_r^w)`，物体世界位姿为 `(p_o^w,q_o^w)`：
 
-\[
+$$
 p_o^b=(R_r^w)^T(p_o^w-p_r^w),
 \qquad q_o^b=(q_r^w)^{-1}\otimes q_o^w.
-\]
+$$
 
 `quaternion_to_matrix_wxyz` 先归一化四元数，再显式构造旋转矩阵；`quaternion_inverse_wxyz` 对单位四元数取共轭；`quaternion_multiply_wxyz` 实现 Hamilton product。`rotation_6d_columns` 取旋转矩阵前两列所在的 `[... ,3,2]` 子块后按 row-major reshape 为 6 维。它的具体顺序是行内交错的 `[r00,r01,r10,r11,r20,r21]`，消费端必须保持同一约定。
 
@@ -371,10 +371,10 @@ t in range(1, T - horizon + 1)
 
 `get_normalizer` 遍历训练集的所有窗口，收集除二值 `last_hand_primitive` 外的每个观测字段，以及所有 action latent。默认 `mode='limits'`，每个通道独立拟合：
 
-\[
+$$
 s_j=\frac{2}{x_j^{max}-x_j^{min}},\qquad
 o_j=-1-s_jx_j^{min},\qquad \tilde x_j=s_jx_j+o_j.
-\]
+$$
 
 近常量通道用 `range_eps=10^{-4}` 特判，使其落在输出区间中点附近。统计量和 scale/offset 被存为 `requires_grad=False` 的 `ParameterDict`，因此会随 policy checkpoint 的 `state_dict` 保存并随模型迁移设备。
 
@@ -412,10 +412,10 @@ o_j=-1-s_jx_j^{min},\qquad \tilde x_j=s_jx_j+o_j.
 
 `model/diffusion/ema_model.py:EMAModel` 用 warmup decay：
 
-\[
+$$
 d_s=\operatorname{clip}\left(1-(1+s/\gamma)^{-p},d_{min},d_{max}\right),
 \quad \theta_{ema}\leftarrow d_s\theta_{ema}+(1-d_s)\theta.
-\]
+$$
 
 BatchNorm 参数直接复制，其他可训练参数做 EMA。默认配置 `use_ema=False`，而主 YAML 没有提供 `cfg.ema` 节点；直接打开该开关会在实例化 `cfg.ema` 时失败，需先补配置。当前网络没有 BatchNorm，注释中的 BatchNorm 警告属于通用模板背景。
 
