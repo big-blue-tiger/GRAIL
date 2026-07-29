@@ -4,19 +4,68 @@
 Each rollout starts with an independently sampled robot-root XY offset in
 ``[-0.05, 0.05]`` meters. Alongside every successful
 ``<motion_key>_x<dx>_y<dy>.mp4``, this launcher writes a matching
-``.object_aware.pkl`` containing per-frame proprioception, object
-reference observations, the 64-D latent residual, the two raw/executed hand
-primitives, the pre-FSQ ``z + lambda * delta_z`` latent, and world-frame
-robot/object root poses. Episodes that terminate before motion timeout are discarded.
+``.object_aware.pkl`` containing the generator observation terms, the executed
+binary hand primitive, the 64-D latent residual, the pre-FSQ
+``z + lambda * delta_z`` latent, and world-frame robot/object root poses.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+
+def _delete_failed_reference_data(
+    manifest_path: Path,
+    batch_keys: list[str],
+    robot_dir: Path,
+    paired_dirs: dict[str, Path],
+) -> None:
+    """Delete the four explicitly paired reference files for failed motions."""
+    allowed_keys = set(batch_keys)
+    suffixes = {
+        "robot": ".pkl",
+        "objects": ".pkl",
+        "object_usd": ".usd",
+        "bps": ".npy",
+    }
+    failed: dict[str, list[str]] = {}
+    with manifest_path.open(encoding="utf-8") as file:
+        for line in file:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            motion_key = record["motion_key"]
+            if motion_key not in allowed_keys:
+                raise RuntimeError(
+                    f"Refusing to delete unexpected motion key from failure manifest: "
+                    f"{motion_key!r}"
+                )
+            failed[motion_key] = record.get("termination_reasons", [])
+
+    roots = {"robot": robot_dir, **paired_dirs}
+    for motion_key, reasons in failed.items():
+        deleted = []
+        missing = []
+        for name, suffix in suffixes.items():
+            path = roots[name] / f"{motion_key}{suffix}"
+            if path.is_file():
+                path.unlink()
+                deleted.append(str(path))
+            else:
+                missing.append(str(path))
+        reason_text = ", ".join(reasons) or "unknown"
+        print(
+            f"Deleted failed reference set for {motion_key} "
+            f"(termination={reason_text}): {', '.join(deleted)}"
+        )
+        if missing:
+            print(f"Reference files already missing for {motion_key}: {', '.join(missing)}")
 
 
 def main() -> None:
@@ -26,7 +75,7 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
         "--batch-size",
-        default=64,
+        default=8,
         type=int,
         help="Number of motions/rendering environments per subprocess (default: 16)",
     )
@@ -35,6 +84,14 @@ def main() -> None:
     )
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--seed", type=int, help="Base seed; defaults to a random seed")
+    parser.add_argument(
+        "--delete-failed-reference-data",
+        action="store_true",
+        help=(
+            "Permanently delete matching robot/objects/object_usd/bps files when "
+            "a rollout terminates before timeout"
+        ),
+    )
     args, extra = parser.parse_known_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
@@ -65,13 +122,10 @@ def main() -> None:
         parser.error("missing paired dataset paths: " + ", ".join(missing))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # G1's head_link origin is below its visible head mesh; z=0.44 is near eye level.
-    # Isaac Lab's "world" camera convention uses +X forward and +Z up.
-    # A +30 degree rotation about +Y points +X forward and 30 degrees down.
-    camera_pos = "[0.09,0.0,0.44]"
-    camera_rot = "[0.965926,0.0,0.258819,0.0]"
-    camera_focal_length = 9
-    camera_horizontal_aperture = 20.955
+    # Match grail/visualization/scripts/visualize.sh:
+    # eye = env_origin + [1.5, -1.5, 1.0], target = env_origin + [0, 0, 0.8].
+    camera_offset = "[1.5,-1.5,1.0]"
+    camera_target = "[0.0,0.0,0.8]"
     common_cmd = [
         sys.executable,
         "-u",
@@ -79,21 +133,21 @@ def main() -> None:
         f"+checkpoint={checkpoint}",
         "+headless=True",
         "++run_once=True",
-        "++warmup_rollout_steps=8",
-        # The recorder reads ego_camera directly; do not create the extra eval_camera.
-        "++manager_env.config.render_results=False",
-        "++manager_env.config.enable_cameras=True",
+        "++manager_env.config.render_results=True",
+        "++manager_env.commands.motion.start_from_first_frame=true",
+        "++manager_env.config.enable_cameras=False",
         "++manager_env.config.gpu_collision_stack_size_exp=28",
-        "++manager_env.config.render_camera=ego_camera",
+        "++manager_env.config.render_camera=eval_camera",
+        "++manager_env.config.eval_camera_use_env_origin=True",
+        f"++manager_env.config.eval_camera_offset={camera_offset}",
+        f"++manager_env.config.eval_camera_target_offset={camera_target}",
+        "++manager_env.config.eval_camera_focal_length=5.0",
+        "++manager_env.config.eval_camera_focus_distance=100.0",
+        "++manager_env.config.eval_camera_horizontal_aperture=10.0",
+        "++manager_env.config.eval_camera_clipping_range=[0.1,500.0]",
         "++manager_env.config.render_width=640",
         "++manager_env.config.render_height=480",
         "++manager_env.config.render_frame_skip=1",
-        f"++manager_env.config.cameras.camera_focal_length={camera_focal_length}",
-        f"++manager_env.config.cameras.camera_horizontal_aperture={camera_horizontal_aperture}",
-        "++manager_env.config.cameras.camera_attached_link=head_link",
-        f"++manager_env.config.cameras.camera_pos_offset={camera_pos}",
-        f"++manager_env.config.cameras.camera_rot_offset={camera_rot}",
-        "++manager_env.config.cameras.camera_resolution=[480,640]",
         f"++manager_env.config.save_rendering_dir={output_dir}",
         "++manager_env.recorders.render_envs._target_="
         "gear_sonic.envs.manager_env.mdp.recorders.RenderEnvsRecorderCfg",
@@ -107,8 +161,10 @@ def main() -> None:
         "++manager_env.recorders.trajectory.save_only_timeouts=True",
         "++manager_env.recorders.trajectory.append_initial_xy_offset=True",
         "++manager_env.commands.motion.randomize_initial_pose_during_evaluation=True",
-        "++manager_env.commands.motion.pose_range.x=[-0.06,0.06]",
-        "++manager_env.commands.motion.pose_range.y=[-0.06,0.06]",
+        "++manager_env.commands.motion.start_from_first_frame=true",
+        "++manager_env.commands.motion.init_z_offset=0.05",
+        "++manager_env.commands.motion.pose_range.x=[-0.0,0.0]",
+        "++manager_env.commands.motion.pose_range.y=[-0.0,0.0]",
         f"++manager_env.commands.motion.motion_lib_cfg.motion_file={robot_dir}",
         f"++manager_env.commands.motion.motion_lib_cfg.object_motion_file={required['objects']}",
         f"++manager_env.config.object_usd_path={required['object_usd']}",
@@ -125,6 +181,20 @@ def main() -> None:
     )
     for batch_index, batch_keys in enumerate(batches, start=1):
         cmd = common_cmd.copy()
+        failure_manifest = None
+        if args.delete_failed_reference_data:
+            manifest_file = tempfile.NamedTemporaryFile(
+                prefix=f".failed_batch_{batch_index}_",
+                suffix=".jsonl",
+                dir=output_dir,
+                delete=False,
+            )
+            manifest_file.close()
+            failure_manifest = Path(manifest_file.name)
+            cmd.append(
+                "++manager_env.recorders.trajectory.failure_manifest_path="
+                f"{failure_manifest}"
+            )
         batch_seed = (base_seed + batch_index - 1) % (2**32)
         cmd.append(f"++seed={batch_seed}")
         cmd.append(f"+num_envs={len(batch_keys)}")
@@ -138,12 +208,23 @@ def main() -> None:
             f"Batch {batch_index}/{len(batches)}: "
             f"{', '.join(batch_keys)} (seed={batch_seed})"
         )
-        subprocess.run(
-            cmd,
-            check=True,
-            cwd=Path(__file__).resolve().parents[2],
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu},
-        )
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                cwd=Path(__file__).resolve().parents[2],
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu},
+            )
+            if failure_manifest is not None:
+                _delete_failed_reference_data(
+                    failure_manifest,
+                    batch_keys,
+                    robot_dir,
+                    required,
+                )
+        finally:
+            if failure_manifest is not None:
+                failure_manifest.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

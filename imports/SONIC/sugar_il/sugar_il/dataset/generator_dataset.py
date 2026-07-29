@@ -20,7 +20,13 @@ REQUIRED_ARRAYS = {
     "object_root_pos_w": (3,),
     "object_root_quat_w": (4,),
     "object_bps": (10,),
+    "table_geometry": (4,),
     "hand_object_transform_6d": (9,),
+    "hand_object_contact_force_magnitude": (8,),
+    "base_lin_vel": (3,),
+    "base_ang_vel": (3,),
+    "joint_pos": (43,),
+    "joint_vel": (43,),
     "combined_latent_pre_fsq": (64,),
     "hand_primitive_executed_binary": (2,),
 }
@@ -44,7 +50,7 @@ def _resolve_paths(paths: str | Path | Sequence[str | Path]) -> list[Path]:
     return sorted(path.resolve() for path in resolved)
 
 
-def _load_episode(path: Path, horizon: int) -> dict:
+def _load_episode(path: Path, required_frames: int) -> dict:
     # Pickle can execute code. Inputs are expected to be trusted files produced by SONIC.
     with path.open("rb") as file:
         episode = pickle.load(file)
@@ -54,6 +60,19 @@ def _load_episode(path: Path, horizon: int) -> dict:
         raise ValueError(f"{path}: poses are not pre-step aligned")
     if episode.get("pose_quaternion_format") != "wxyz":
         raise ValueError(f"{path}: expected wxyz quaternions")
+    if (
+        "hand_object_contact_force_magnitude" not in episode
+        and "finger_tips_force" in episode
+    ):
+        legacy_force = np.asarray(episode["finger_tips_force"])
+        if legacy_force.ndim != 2 or legacy_force.shape[1] != 24:
+            raise ValueError(
+                f"{path}: legacy finger_tips_force has shape {legacy_force.shape}, "
+                "expected [T,24]"
+            )
+        episode["hand_object_contact_force_magnitude"] = np.linalg.norm(
+            legacy_force.reshape(len(legacy_force), 8, 3), axis=-1
+        )
 
     lengths = set()
     for key, trailing_shape in REQUIRED_ARRAYS.items():
@@ -69,8 +88,10 @@ def _load_episode(path: Path, horizon: int) -> dict:
     if len(lengths) != 1:
         raise ValueError(f"{path}: per-frame arrays have inconsistent lengths")
     length = lengths.pop()
-    if length < horizon + 1:
-        raise ValueError(f"{path}: needs at least {horizon + 1} frames, got {length}")
+    if length < required_frames + 1:
+        raise ValueError(
+            f"{path}: needs at least {required_frames + 1} frames, got {length}"
+        )
     hands = episode["hand_primitive_executed_binary"]
     if not np.isin(hands, (0, 1)).all():
         raise ValueError(f"{path}: executed hand primitives are not binary")
@@ -78,30 +99,39 @@ def _load_episode(path: Path, horizon: int) -> dict:
         norms = np.linalg.norm(episode[key], axis=-1)
         if np.max(np.abs(norms - 1.0)) > 1e-3:
             raise ValueError(f"{path}: {key} is not normalized")
-    if np.max(np.abs(episode["object_bps"] - episode["object_bps"][0])) > 1e-5:
-        raise ValueError(f"{path}: object_bps changes within one trajectory")
+    for key in ("object_bps", "table_geometry"):
+        if np.max(np.abs(episode[key] - episode[key][0])) > 1e-5:
+            raise ValueError(f"{path}: {key} changes within one trajectory")
     episode["_path"] = path
     return episode
 
 
 class GeneratorDataset(BaseLowdimDataset):
-    """Strict, non-interpolating windows from SONIC schema-v3 recordings."""
+    """Contiguous 40-frame windows from SONIC schema-v3 recordings."""
 
     def __init__(
         self,
         pickle_paths: str | Path | Sequence[str | Path],
-        horizon: int = 16,
+        horizon: int = 40,
         val_ratio: float = 0.05,
         seed: int = 42,
         _episodes: list[dict] | None = None,
         _is_validation: bool = False,
     ):
-        if horizon != 16:
-            raise ValueError("Object-aware DiT uses a fixed 16-frame horizon")
+        if horizon != 40:
+            raise ValueError("Object-aware flow matching uses a fixed 40-frame horizon")
         self.horizon = horizon
         self.seed = seed
         self.val_ratio = val_ratio
-        all_episodes = _episodes if _episodes is not None else [_load_episode(path, horizon) for path in _resolve_paths(pickle_paths)]
+        action_span = horizon
+        all_episodes = (
+            _episodes
+            if _episodes is not None
+            else [
+                _load_episode(path, action_span)
+                for path in _resolve_paths(pickle_paths)
+            ]
+        )
         if _episodes is None:
             order = np.arange(len(all_episodes))
             np.random.default_rng(seed).shuffle(order)
@@ -116,40 +146,58 @@ class GeneratorDataset(BaseLowdimDataset):
         self.indices = [
             (episode_id, t)
             for episode_id, episode in enumerate(self.episodes)
-            for t in range(1, len(episode["combined_latent_pre_fsq"]) - horizon + 1)
+            for t in range(1, len(episode["combined_latent_pre_fsq"]) - action_span + 1)
         ]
 
     def get_validation_dataset(self):
-        return GeneratorDataset([], self.horizon, self.val_ratio, self.seed, self._val_episodes, True)
+        return GeneratorDataset(
+            [],
+            self.horizon,
+            self.val_ratio,
+            self.seed,
+            self._val_episodes,
+            True,
+        )
 
     @staticmethod
-    def _pose(episode: dict, t: int, goal: bool = False):
+    def _pose(episode: dict, t: int):
         robot_pos = torch.from_numpy(episode["robot_root_pos_w"][t]).float()
         robot_quat = torch.from_numpy(episode["robot_root_quat_w"][t]).float()
-        object_index = -1 if goal else t
-        object_pos = torch.from_numpy(episode["object_root_pos_w"][object_index]).float()
-        object_quat = torch.from_numpy(episode["object_root_quat_w"][object_index]).float()
+        object_pos = torch.from_numpy(episode["object_root_pos_w"][t]).float()
+        object_quat = torch.from_numpy(episode["object_root_quat_w"][t]).float()
         return world_pose_to_body(robot_pos, robot_quat, object_pos, object_quat)
 
     def __getitem__(self, index: int) -> Dict[str, Dict[str, torch.Tensor]]:
         episode_id, t = self.indices[index]
         episode = self.episodes[episode_id]
         object_pos, object_ori = self._pose(episode, t)
-        target_pos, target_ori = self._pose(episode, t, goal=True)
         obs = {
             "object_bps": torch.from_numpy(episode["object_bps"][t]).float().unsqueeze(0),
+            "table_geometry": torch.from_numpy(
+                episode["table_geometry"][t]
+            ).float().unsqueeze(0),
             "object_pos_b": object_pos.unsqueeze(0),
             "object_ori_b_6d": object_ori.unsqueeze(0),
             "hand_object_transform_6d": torch.from_numpy(episode["hand_object_transform_6d"][t]).float().unsqueeze(0),
-            "target_object_pos_b": target_pos.unsqueeze(0),
-            "target_object_ori_b_6d": target_ori.unsqueeze(0),
-            "target_hand_object_transform_6d": torch.from_numpy(episode["hand_object_transform_6d"][-1]).float().unsqueeze(0),
-            "last_latent": torch.from_numpy(episode["combined_latent_pre_fsq"][t - 1]).float().unsqueeze(0),
-            "last_hand_primitive": torch.from_numpy(episode["hand_primitive_executed_binary"][t - 1]).float().unsqueeze(0),
+            "hand_object_contact_force_magnitude": torch.from_numpy(
+                episode["hand_object_contact_force_magnitude"][t]
+            ).float().unsqueeze(0),
+            **{
+                key: torch.from_numpy(episode[key][t]).float().unsqueeze(0)
+                for key in ("base_lin_vel", "base_ang_vel", "joint_pos", "joint_vel")
+            },
         }
         action = {
-            "latent": torch.from_numpy(episode["combined_latent_pre_fsq"][t : t + self.horizon]).float(),
-            "hand_primitive": torch.from_numpy(episode["hand_primitive_executed_binary"][t : t + self.horizon]).float(),
+            "latent": torch.from_numpy(
+                episode["combined_latent_pre_fsq"][
+                    t : t + self.horizon
+                ]
+            ).float(),
+            "hand_primitive": torch.from_numpy(
+                episode["hand_primitive_executed_binary"][
+                    t : t + self.horizon
+                ]
+            ).float(),
         }
         return {"obs": obs, "action": action}
 
@@ -161,8 +209,7 @@ class GeneratorDataset(BaseLowdimDataset):
         for i in range(len(self)):
             sample = self[i]
             for key, value in sample["obs"].items():
-                if key != "last_hand_primitive":
-                    fields.setdefault(key, []).append(value.numpy())
+                fields.setdefault(key, []).append(value.numpy())
             latents.append(sample["action"]["latent"].numpy())
         data = {key: np.concatenate(values, axis=0) for key, values in fields.items()}
         data["latent"] = np.concatenate(latents, axis=0)

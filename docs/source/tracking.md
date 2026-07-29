@@ -171,7 +171,7 @@ CUDA_VISIBLE_DEVICES=0 python -u gear_sonic/train_agent_trl.py \
 
 ```bash
 python -u gear_sonic/eval_agent_trl.py \
-    +checkpoint=logs_rl/pnp_table_pnp_table-721/last.pt \
+    +checkpoint=logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-sbto_data_717/last.pt \
     +num_envs=12 \
     +headless=False \
     ++manager_env.config.gpu_collision_stack_size_exp=28 \
@@ -206,7 +206,7 @@ python -u gear_sonic/scripts/get_rl_motion_data.py \
   --batch-size 64
 
 python -u gear_sonic/scripts/get_rl_motion_data.py \
-  --gpu 1 \
+  --gpu 0 \
   --checkpoint logs_rl/pnp_table_pnp_table-721/last.pt \
   --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
   --output-dir outputs/ego_view/all \
@@ -214,11 +214,13 @@ python -u gear_sonic/scripts/get_rl_motion_data.py \
   
 while true; do
     python -u gear_sonic/scripts/get_rl_motion_data.py \
-        --gpu 1 \
-        --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-20260721_142019/last.pt \
+        --gpu 0 \
+        --checkpoint logs_rl/pnp_table_pnp_table-721/last.pt \
         --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
         --output-dir outputs/ego_view/all \
-        --batch-size 64
+         --delete-failed-reference-data \
+        --batch-size 64 \
+        
 
     code=$?
     echo "程序结束，退出码：${code}；5 秒后重新运行"

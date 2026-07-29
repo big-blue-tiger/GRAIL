@@ -73,6 +73,8 @@ bash grail/visualization/scripts/visualize.sh \
 # Public-release dir — defaults match (xyzw)
 bash grail/visualization/scripts/visualize.sh \
     data/pickup_table
+bash grail/visualization/scripts/visualize.sh \
+    ../sbto/datas/sbto_to_grail/pickup_table
 ```
 
 Positional arguments (all but the first are optional):
@@ -94,7 +96,7 @@ Env-var fallbacks: `QUAT_CONVENTION` (default `xyzw`).
 
 ```bash
 bash grail/visualization/scripts/visualize_single.sh \
-     data/SBTO/pickCylinder/grasp_cylinder2/robot/grasp_cylinder2.pkl
+     ../sbto/datas/sbto_to_grail/pickup_table/robot/pickup_table__apple_0__002.pkl
 ```
 
 Takes the full path to a `robot/<seq>.pkl` and writes

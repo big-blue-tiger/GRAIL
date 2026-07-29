@@ -3412,8 +3412,6 @@ class TrackingCommand(CommandTerm):
             )
             root_pos[env_ids] += rand_samples[:, 0:3]
             self.initial_root_pose_offset[env_ids] = rand_samples[:, 0:3]
-            if self.cfg.init_z_offset != 0.0:
-                root_pos[env_ids, 2] += self.cfg.init_z_offset
             orientations_delta = quat_from_euler_xyz(
                 rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
             )
@@ -3428,6 +3426,12 @@ class TrackingCommand(CommandTerm):
             )
             root_lin_vel[env_ids] += rand_samples[:, :3]
             root_ang_vel[env_ids] += rand_samples[:, 3:]
+
+        # Apply the configured vertical clearance on every reset, including
+        # deterministic evaluation resets where pose randomization is disabled.
+        # This lifts the complete articulation relative to the reference pose.
+        if self.cfg.init_z_offset != 0.0:
+            root_pos[env_ids, 2] += self.cfg.init_z_offset
 
         # Handle DOF mismatch between motion library and robot
         motion_lib_joint_pos = self.joint_pos.clone()  # Shape: [num_envs, motion_lib_num_dof]
@@ -3495,7 +3499,25 @@ class TrackingCommand(CommandTerm):
         )
 
         ####### Resetting Humaonid States #######
-        self.robot.write_joint_state_to_sim(joint_pos[env_ids], joint_vel[env_ids], env_ids=env_ids)
+        reset_joint_pos = joint_pos[env_ids]
+        reset_joint_vel = joint_vel[env_ids]
+        self.robot.write_joint_state_to_sim(
+            reset_joint_pos, reset_joint_vel, env_ids=env_ids
+        )
+
+        # ``Articulation.reset()`` resets actuator state, while
+        # ``ActionManager.reset()`` clears its action history. Neither operation
+        # synchronizes the articulation's command-target buffers with a joint
+        # state written directly through ``write_joint_state_to_sim()``. Without
+        # this synchronization, targets from the preceding episode can be
+        # written back to PhysX before the first new policy action is processed.
+        #
+        # Hold the freshly reset reference state until that first action arrives.
+        self.robot.set_joint_position_target(reset_joint_pos, env_ids=env_ids)
+        self.robot.set_joint_velocity_target(reset_joint_vel, env_ids=env_ids)
+        self.robot.set_joint_effort_target(
+            torch.zeros_like(reset_joint_pos), env_ids=env_ids
+        )
         self.robot.write_root_state_to_sim(
             torch.cat(
                 [

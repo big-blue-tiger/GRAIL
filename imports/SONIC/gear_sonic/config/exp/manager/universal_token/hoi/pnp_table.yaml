@@ -127,6 +127,9 @@ manager_env:
       start_from_first_frame: false
       sample_before_contact: true
       sample_from_n_initial_frames: 30
+      # Lift the complete robot 5 cm above the sampled motion reference pose
+      # on every reset to avoid an initial foot/terrain penetration impulse.
+      init_z_offset: 0.05
 
       pose_range:
         x: [0, 0]

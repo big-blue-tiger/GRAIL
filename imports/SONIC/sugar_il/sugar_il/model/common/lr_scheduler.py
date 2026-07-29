@@ -1,46 +1,41 @@
-from diffusers.optimization import (
-    Union, SchedulerType, Optional,
-    Optimizer, TYPE_TO_SCHEDULER_FUNCTION
-)
+from __future__ import annotations
+
+import math
+
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LambdaLR
+
 
 def get_scheduler(
-    name: Union[str, SchedulerType],
+    name: str,
     optimizer: Optimizer,
-    num_warmup_steps: Optional[int] = None,
-    num_training_steps: Optional[int] = None,
-    **kwargs
+    num_warmup_steps: int = 0,
+    num_training_steps: int | None = None,
+    last_epoch: int = -1,
 ):
-    """
-    Added kwargs vs diffuser's original implementation
+    """Create the small set of learning-rate schedules used by Sugar-IL."""
 
-    Unified API to get any scheduler from its name.
+    name = name.lower()
+    warmup_steps = max(0, int(num_warmup_steps))
 
-    Args:
-        name (`str` or `SchedulerType`):
-            The name of the scheduler to use.
-        optimizer (`torch.optim.Optimizer`):
-            The optimizer that will be used during training.
-        num_warmup_steps (`int`, *optional*):
-            The number of warmup steps to do. This is not required by all schedulers (hence the argument being
-            optional), the function will raise an error if it's unset and the scheduler type requires it.
-        num_training_steps (`int``, *optional*):
-            The number of training steps to do. This is not required by all schedulers (hence the argument being
-            optional), the function will raise an error if it's unset and the scheduler type requires it.
-    """
-    name = SchedulerType(name)
-    schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
-    if name == SchedulerType.CONSTANT:
-        return schedule_func(optimizer, **kwargs)
+    if name == "constant":
+        lr_lambda = lambda _: 1.0
+    elif name == "constant_with_warmup":
+        lr_lambda = lambda step: min(1.0, step / max(1, warmup_steps))
+    elif name == "cosine":
+        if num_training_steps is None:
+            raise ValueError("cosine requires num_training_steps")
+        training_steps = int(num_training_steps)
+        if training_steps <= warmup_steps:
+            raise ValueError("num_training_steps must exceed num_warmup_steps")
 
-    # All other schedulers require `num_warmup_steps`
-    if num_warmup_steps is None:
-        raise ValueError(f"{name} requires `num_warmup_steps`, please provide that argument.")
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / (training_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
-    if name == SchedulerType.CONSTANT_WITH_WARMUP:
-        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **kwargs)
+    else:
+        raise ValueError(f"Unsupported lr_scheduler: {name}")
 
-    # All other schedulers require `num_training_steps`
-    if num_training_steps is None:
-        raise ValueError(f"{name} requires `num_training_steps`, please provide that argument.")
-
-    return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, **kwargs)
+    return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)

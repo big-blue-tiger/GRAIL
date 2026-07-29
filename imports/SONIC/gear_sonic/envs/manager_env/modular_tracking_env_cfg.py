@@ -414,10 +414,12 @@ class MySceneCfg(InteractiveSceneCfg):
                 ),
                 data_types=["rgb"],
                 spawn=sim_utils.PinholeCameraCfg(
-                    focal_length=5.0,
-                    focus_distance=50.0,
-                    horizontal_aperture=5,
-                    clipping_range=(0.1, 20.0),
+                    focal_length=config.get("eval_camera_focal_length", 5.0),
+                    focus_distance=config.get("eval_camera_focus_distance", 50.0),
+                    horizontal_aperture=config.get("eval_camera_horizontal_aperture", 5.0),
+                    clipping_range=tuple(
+                        config.get("eval_camera_clipping_range", (0.1, 20.0))
+                    ),
                 ),
                 width=config.get("render_width", 1920),
                 height=config.get("render_height", 1080),

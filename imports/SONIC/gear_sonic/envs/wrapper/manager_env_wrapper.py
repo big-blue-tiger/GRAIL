@@ -877,9 +877,6 @@ class ManagerEnvWrapper:
             tokenizer_action_dim = self.config.get("tokenizer_action_dim")
             tokenizer_meta_actions = meta_actions[:, :tokenizer_action_dim]
             hand_actions_raw = meta_actions[:, tokenizer_action_dim:]
-            self.env._object_aware_hand_primitive_policy_raw = (  # noqa: SLF001
-                hand_actions_raw.detach()
-            )
 
             # Override hand actions with motion data if configured
             if self.config.get("use_motion_hand_actions", False):
@@ -921,12 +918,6 @@ class ManagerEnvWrapper:
                 # Teacher/residual mode: policy outputs residual that's added to ATM encoded tokens
                 # Apply scaling to residual before passing to ATM
                 scaled_residual = tokenizer_meta_actions * self._latent_residual_scale
-                self.env._object_aware_latent_residual_raw = (  # noqa: SLF001
-                    tokenizer_meta_actions.detach()
-                )
-                self.env._object_aware_latent_residual_scaled = (  # noqa: SLF001
-                    scaled_residual.detach()
-                )
                 # Add residual in latent/token space (after encoding, before decoding)
                 body_actions = self.action_transform_module(
                     atm_obs_dict,
@@ -941,7 +932,6 @@ class ManagerEnvWrapper:
                 self.env._object_aware_combined_latent = (  # noqa: SLF001
                     combined_latent.detach() if combined_latent is not None else None
                 )
-
             elif action_mode == "mixed":
                 # Mixed rollout: some envs use teacher (residual), some use student (direct_latent)
                 # is_teacher_env is a boolean mask: True = teacher/residual, False = student/direct_latent

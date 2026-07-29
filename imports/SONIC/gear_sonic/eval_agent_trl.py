@@ -592,32 +592,6 @@ def main(override_config: omegaconf.OmegaConf):
         for obs_key in obs_dict:
             obs_dict[obs_key] = obs_dict[obs_key].to(device)
 
-        warmup_steps = int(config.get("warmup_rollout_steps", 0))
-        if warmup_steps > 0:
-            raw_env = env.env
-            raw_env._suppress_recording = True  # noqa: SLF001
-            try:
-                with torch.no_grad():
-                    for _ in range(warmup_steps):
-                        policy_model = model.policy
-                        policy_model.init_rollout()
-                        actions = policy_model.rollout(obs_dict=obs_dict)
-                        actor_state = {
-                            "actions": policy_model.action_mean.detach(),
-                            "obs_dict": actions["obs_dict"],
-                        }
-                        obs_dict = env.step(actor_state)[0]
-                        for obs_key in obs_dict:
-                            obs_dict[obs_key] = obs_dict[obs_key].to(device)
-                obs_dict = env.reset_all()
-                for obs_key in obs_dict:
-                    obs_dict[obs_key] = obs_dict[obs_key].to(device)
-            finally:
-                raw_env._suppress_recording = False  # noqa: SLF001
-            logger.info(
-                f"Advanced {warmup_steps} unrecorded simulation steps, then reset before rollout."
-            )
-
         eval_step_callbacks = {
             name: cb
             for name, cb in callbacks.items()

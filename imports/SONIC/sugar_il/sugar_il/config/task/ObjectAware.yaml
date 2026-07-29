@@ -9,7 +9,7 @@ shape_meta: &shape_meta
   action:
     latent_dim: 64
     hand_dim: 2
-    horizon: 16
+    horizon: 40
 
 env_runner:
   _target_: sugar_il.env_runner.generator_runner.GeneratorRunner
@@ -17,6 +17,6 @@ env_runner:
 dataset:
   _target_: sugar_il.dataset.generator_dataset.GeneratorDataset
   pickle_paths: ${task.dataset_paths}
-  horizon: 16
+  horizon: 40
   seed: ${training.seed}
   val_ratio: 0.05

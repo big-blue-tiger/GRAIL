@@ -18,16 +18,15 @@ def _token_mlp(input_dim: int, feature_dim: int, dropout: float) -> nn.Sequentia
 
 
 class GeneratorStateObsEncoder(ModuleAttrMixin):
-    """Encode the four object-aware observation groups as four tokens."""
+    """Encode scene geometry, current object state, and proprioception as three tokens."""
 
-    def __init__(self, shape_meta: dict | None = None, feature_dim: int = 256, dropout: float = 0.1, last_action_dropout: float = 0.1, **_: object):
+    def __init__(self, shape_meta: dict | None = None, feature_dim: int = 256, dropout: float = 0.1, proprioception_dropout: float = 0.1, **_: object):
         super().__init__()
         self.feature_dim = feature_dim
-        self.last_action_dropout = last_action_dropout
-        self.bps_net = _token_mlp(10, feature_dim, dropout)
-        self.object_net = _token_mlp(18, feature_dim, dropout)
-        self.target_net = _token_mlp(18, feature_dim, dropout)
-        self.last_action_net = _token_mlp(66, feature_dim, dropout)
+        self.proprioception_dropout = proprioception_dropout
+        self.scene_geometry_net = _token_mlp(14, feature_dim, dropout)
+        self.object_net = _token_mlp(26, feature_dim, dropout)
+        self.proprioception_net = _token_mlp(92, feature_dim, dropout)
 
     @staticmethod
     def _require_single_step(value: torch.Tensor, name: str) -> torch.Tensor:
@@ -37,15 +36,24 @@ class GeneratorStateObsEncoder(ModuleAttrMixin):
 
     def forward(self, obs_dict: dict[str, torch.Tensor], training: bool = True) -> torch.Tensor:
         get = lambda key: self._require_single_step(obs_dict[key], key)
-        bps = self.bps_net(get("object_bps"))
-        current = self.object_net(torch.cat((get("object_pos_b"), get("object_ori_b_6d"), get("hand_object_transform_6d")), dim=-1))
-        target = self.target_net(torch.cat((get("target_object_pos_b"), get("target_object_ori_b_6d"), get("target_hand_object_transform_6d")), dim=-1))
-        last_action = self.last_action_net(torch.cat((get("last_latent"), get("last_hand_primitive")), dim=-1))
-        if training and self.last_action_dropout > 0:
-            keep = torch.rand(last_action.shape[0], 1, device=last_action.device) >= self.last_action_dropout
-            last_action = last_action * keep.to(last_action.dtype)
-        return torch.stack((bps, current, target, last_action), dim=1)
+        scene_geometry = self.scene_geometry_net(
+            torch.cat((get("object_bps"), get("table_geometry")), dim=-1)
+        )
+        current = self.object_net(torch.cat((
+            get("object_pos_b"),
+            get("object_ori_b_6d"),
+            get("hand_object_transform_6d"),
+            get("hand_object_contact_force_magnitude"),
+        ), dim=-1))
+        proprioception = self.proprioception_net(torch.cat(
+            tuple(get(key) for key in ("base_lin_vel", "base_ang_vel", "joint_pos", "joint_vel")),
+            dim=-1,
+        ))
+        if training and self.proprioception_dropout > 0:
+            keep = torch.rand(proprioception.shape[0], 1, device=proprioception.device) >= self.proprioception_dropout
+            proprioception = proprioception * keep.to(proprioception.dtype)
+        return torch.stack((scene_geometry, current, proprioception), dim=1)
 
     @torch.no_grad()
     def output_shape(self):
-        return (1, 4, self.feature_dim), [1, 1, 1, 1]
+        return (1, 3, self.feature_dim), [1, 1, 1]

@@ -27,7 +27,7 @@ from sugar_il.dataset.base_dataset import BaseLowdimDataset
 from sugar_il.env_runner.generator_runner import GeneratorRunner
 from sugar_il.common.checkpoint_util import TopKCheckpointManager
 from sugar_il.common.json_logger import JsonLogger
-from sugar_il.model.diffusion.ema_model import EMAModel
+from sugar_il.model.flowmatching.ema_model import EMAModel
 from sugar_il.model.common.lr_scheduler import get_scheduler
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
@@ -63,6 +63,14 @@ def save_loss_curve(output_dir, train_history, val_history):
     figure.savefig(os.path.join(output_dir, "loss_curve.png"), dpi=160)
     plt.close(figure)
 
+
+def save_attention_maps(output_dir, split, epoch, attention_maps):
+    directory = os.path.join(output_dir, f"{split}_sample_attn_maps")
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, f"{epoch}.pkl"), "wb") as file:
+        pickle.dump(attention_maps, file)
+
+
 class TrainGeneratorWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
@@ -87,16 +95,16 @@ class TrainGeneratorWorkspace(BaseWorkspace):
         if not cfg.training.resume:             # False
             self.exclude_keys = ['optimizer']
 
-        if cfg.policy.start_ckpt_path is not None:
-            print(f"Starting from checkpoint {cfg.policy.start_ckpt_path}")
-            self.load_checkpoint(path=cfg.policy.start_ckpt_path)
+        if cfg.start_ckpt_path is not None:
+            print(f"Starting from checkpoint {cfg.start_ckpt_path}")
+            self.load_checkpoint(path=cfg.start_ckpt_path)
 
         self.global_step = 0
         self.epoch = 0
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
-        
+
         # Set GPU device before initializing accelerator
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
@@ -115,6 +123,11 @@ class TrainGeneratorWorkspace(BaseWorkspace):
             print(f"Using mixed precision: {accelerator.mixed_precision}")
             print(f"Using device: {accelerator.device}")
             print(f"Local rank: {local_rank}")
+            print(
+                "Flow matching: "
+                f"steps={self.model.num_inference_steps}, "
+                f"time_buckets={self.model.num_timestep_buckets}"
+            )
             if torch.cuda.is_available():
                 print(f"CUDA Device: {torch.cuda.get_device_name(local_rank)}")
                 print(f"CUDA Capability: {torch.cuda.get_device_capability(local_rank)}")
@@ -163,8 +176,7 @@ class TrainGeneratorWorkspace(BaseWorkspace):
             num_training_steps=(
                 len(train_dataloader) * cfg.training.num_epochs) \
                     // cfg.training.gradient_accumulate_every,
-            # pytorch assumes stepping LRScheduler every epoch
-            # however huggingface diffusers steps it every batch
+            # This workspace advances the learning-rate schedule every optimizer step.
             last_epoch=self.global_step-1
         )
 
@@ -220,7 +232,7 @@ class TrainGeneratorWorkspace(BaseWorkspace):
 
                 train_losses = list()
                 previous_train_loss = None
-                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
+                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}",
                         leave=False, mininterval=cfg.training.tqdm_interval_sec,
                         disable=not accelerator.is_main_process) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
@@ -244,14 +256,14 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
-                        
+
                         # update ema
                         if cfg.training.use_ema:
                             ema.step(accelerator.unwrap_model(self.model))
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
-                        latent_loss_cpu = loss_dict['latent_loss'].item()
+                        flow_loss_cpu = loss_dict['flow_loss'].item()
                         hand_loss_cpu = loss_dict['hand_loss'].item()
                         train_losses.append(raw_loss_cpu)
                         loss_delta = (
@@ -263,14 +275,14 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                             loss=f"{raw_loss_cpu:.6f}",
                             avg=f"{np.mean(train_losses):.6f}",
                             delta=f"{loss_delta:+.2e}",
-                            latent=f"{latent_loss_cpu:.6f}",
+                            flow=f"{flow_loss_cpu:.6f}",
                             hand=f"{hand_loss_cpu:.6f}",
                             lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
                             refresh=False,
                         )
                         step_log = {
                             'train_loss': raw_loss_cpu,
-                            'train_latent_loss': latent_loss_cpu,
+                            'train_flow_loss': flow_loss_cpu,
                             'train_hand_loss': hand_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
@@ -296,7 +308,7 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                     print(
                         f"Epoch {self.epoch} loss summary: "
                         f"avg={train_loss:.6f}, last={train_losses[-1]:.6f}, "
-                        f"latent={step_log['train_latent_loss']:.6f}, "
+                        f"flow={step_log['train_flow_loss']:.6f}, "
                         f"hand={step_log['train_hand_loss']:.6f}"
                     )
 
@@ -316,8 +328,8 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0:
                     with torch.no_grad():
                         val_losses = list()
-                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
-                                leave=False, mininterval=cfg.training.tqdm_interval_sec, 
+                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
+                                leave=False, mininterval=cfg.training.tqdm_interval_sec,
                                 disable=not accelerator.is_main_process) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
@@ -326,12 +338,12 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
-                        
+
                         if len(val_losses) > 0:
                             # Collect validation losses from all processes
                             val_losses = torch.stack(val_losses)
                             val_losses = accelerator.gather(val_losses)
-                            
+
                             # Calculate mean loss on main process
                             if accelerator.is_main_process:
                                 val_loss = torch.mean(val_losses).item()
@@ -370,38 +382,40 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                         fp = (predicted_positive & ~actual_positive).sum().float()
                         fn = (~predicted_positive & actual_positive).sum().float()
                         step_log[f'{category}_{name}_f1'] = (2 * tp / (2 * tp + fp + fn).clamp_min(1)).item()
-                # run diffusion sampling on a training batch
+                # Run flow-matching sampling on a training batch.
                 if (self.epoch % cfg.training.sample_every) == 0 and accelerator.is_main_process:
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         gt_action = batch['action']
-                        if cfg.training.gen_attn_map:
-                            train_sample_attn_maps_dir = os.path.join(self.output_dir, 'train_sample_attn_maps')
-                            os.makedirs(train_sample_attn_maps_dir, exist_ok=True)
-                            output_path = os.path.join(train_sample_attn_maps_dir, f'{self.epoch}.pkl')
-                        else:
-                            output_path = None
                         pred_action = policy.predict_action(batch['obs'], gen_attn_map=cfg.training.gen_attn_map)
+                        if cfg.training.gen_attn_map:
+                            save_attention_maps(
+                                self.output_dir,
+                                "train",
+                                self.epoch,
+                                pred_action["attention_maps"],
+                            )
                         log_action_metrics(step_log, 'train', pred_action, gt_action)
 
                         if len(val_dataloader) > 0:
                             val_sampling_batch = next(iter(val_dataloader))
                             batch = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
                             gt_action = batch['action']
-                            if cfg.training.gen_attn_map:
-                                val_sample_attn_maps_dir = os.path.join(self.output_dir, 'val_sample_attn_maps')
-                                os.makedirs(val_sample_attn_maps_dir, exist_ok=True)
-                                output_path = os.path.join(val_sample_attn_maps_dir, f'{self.epoch}.pkl')
-                            else:
-                                output_path = None
                             pred_action = policy.predict_action(batch['obs'], gen_attn_map=cfg.training.gen_attn_map)
+                            if cfg.training.gen_attn_map:
+                                save_attention_maps(
+                                    self.output_dir,
+                                    "val",
+                                    self.epoch,
+                                    pred_action["attention_maps"],
+                                )
                             log_action_metrics(step_log, 'val', pred_action, gt_action)
 
                         del batch
                         del gt_action
                         del pred_action
-                
+
                 # checkpoint
                 if (self.epoch % cfg.training.checkpoint_every) == 0 and accelerator.is_main_process:
                     # unwrap the model to save ckpt
@@ -419,7 +433,7 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                     for key, value in step_log.items():
                         new_key = key.replace('/', '_')
                         metric_dict[new_key] = value
-                    
+
                     # We can't copy the last checkpoint here
                     # since save_checkpoint uses threads.
                     # therefore at this point the file might have been empty!
@@ -454,7 +468,7 @@ class TrainGeneratorWorkspace(BaseWorkspace):
 
 @hydra.main(
     version_base=None,
-    config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
+    config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")),
     config_name=pathlib.Path(__file__).stem)
 def main(cfg):
     workspace = TrainGeneratorWorkspace(cfg)
