@@ -92,15 +92,15 @@ described above.
 ```bash
 python -u gear_sonic/train_agent_trl.py \
     +exp=manager/universal_token/hoi/pnp_table \
-    num_envs=15 headless=False \
+    num_envs=1 headless=False \
     ++replay=True \
     ++manager_env.config.render_results=False \
     ++manager_env.config.gpu_collision_stack_size_exp=28 \
     ++manager_env.commands.motion.motion_lib_cfg.target_fps=50 \
-    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/raw_grail_chaged_obj/pickup_table/robot \
-    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/raw_grail_chaged_obj/pickup_table/objects \
-    ++manager_env.config.object_usd_path=../../data/raw_grail_chaged_obj/pickup_table/object_usd \
-    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/raw_grail_chaged_obj/pickup_table/bps 
+    ++manager_env.commands.motion.motion_lib_cfg.motion_file=../../data/hf_dataset/data/pickup_table/update_robot \
+    ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=../../data/hf_dataset/data/pickup_table/objects \
+    ++manager_env.config.object_usd_path=../../data/hf_dataset/data/pickup_table/object_usd \
+    ++manager_env.commands.motion.motion_lib_cfg.bps_dir=../../data/hf_dataset/data/pickup_table/bps 
 
 python -u gear_sonic/train_agent_trl.py \
     +exp=manager/universal_token/hoi/pnp_table \
@@ -196,32 +196,31 @@ python -u gear_sonic/scripts/get_rl_motion_data.py \
   --gpu 0 \
   --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-sbto_data_717/last.pt \
   --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot/pickup_table_120.pkl \
-  --output-dir outputs/ego_view/single
+  --output-dir outputs/grail/single
 
 python -u gear_sonic/scripts/get_rl_motion_data.py \
   --gpu 1 \
   --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-20260721_142019/last.pt \
   --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
-  --output-dir outputs/ego_view/all \
+  --output-dir outputs/grail/all \
   --batch-size 64
 
 python -u gear_sonic/scripts/get_rl_motion_data.py \
   --gpu 0 \
   --checkpoint logs_rl/pnp_table_pnp_table-721/last.pt \
   --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
-  --output-dir outputs/ego_view/all \
+  --output-dir outputs/grail/all \
   --batch-size 128
-  
+  --delete-failed-reference-data \
+   --batch-size 128 \
+
+
 while true; do
     python -u gear_sonic/scripts/get_rl_motion_data.py \
-        --gpu 0 \
+        --gpu 1 \
         --checkpoint logs_rl/pnp_table_pnp_table-721/last.pt \
         --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
-        --output-dir outputs/ego_view/all \
-         --delete-failed-reference-data \
-        --batch-size 64 \
-        
-
+        --output-dir outputs/grail/append 
     code=$?
     echo "程序结束，退出码：${code}；5 秒后重新运行"
     sleep 5

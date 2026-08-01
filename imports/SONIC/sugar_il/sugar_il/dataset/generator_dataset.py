@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import glob
 import pickle
+import warnings
 from pathlib import Path
 from typing import Dict, Iterable, Sequence
 
@@ -50,7 +51,7 @@ def _resolve_paths(paths: str | Path | Sequence[str | Path]) -> list[Path]:
     return sorted(path.resolve() for path in resolved)
 
 
-def _load_episode(path: Path, required_frames: int) -> dict:
+def _load_episode(path: Path, required_frames: int) -> dict | None:
     # Pickle can execute code. Inputs are expected to be trusted files produced by SONIC.
     with path.open("rb") as file:
         episode = pickle.load(file)
@@ -89,9 +90,11 @@ def _load_episode(path: Path, required_frames: int) -> dict:
         raise ValueError(f"{path}: per-frame arrays have inconsistent lengths")
     length = lengths.pop()
     if length < required_frames + 1:
-        raise ValueError(
-            f"{path}: needs at least {required_frames + 1} frames, got {length}"
+        warnings.warn(
+            f"Skipping {path}: needs at least {required_frames + 1} frames, got {length}",
+            stacklevel=2,
         )
+        return None
     hands = episode["hand_primitive_executed_binary"]
     if not np.isin(hands, (0, 1)).all():
         raise ValueError(f"{path}: executed hand primitives are not binary")
@@ -128,8 +131,9 @@ class GeneratorDataset(BaseLowdimDataset):
             _episodes
             if _episodes is not None
             else [
-                _load_episode(path, action_span)
+                episode
                 for path in _resolve_paths(pickle_paths)
+                if (episode := _load_episode(path, action_span)) is not None
             ]
         )
         if _episodes is None:

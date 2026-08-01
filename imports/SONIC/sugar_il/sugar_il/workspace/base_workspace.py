@@ -18,6 +18,7 @@ class BaseWorkspace:
         self.cfg = cfg
         self._output_dir = output_dir
         self._saving_thread = None
+        self._saving_error = None
 
     @property
     def output_dir(self):
@@ -45,7 +46,8 @@ class BaseWorkspace:
         if include_keys is None:
             include_keys = tuple(self.include_keys) + ('_output_dir',)
 
-        path.parent.mkdir(parents=False, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.wait_for_checkpoint()
         payload = {
             'cfg': self.cfg,
             'state_dicts': dict(),
@@ -62,13 +64,34 @@ class BaseWorkspace:
                         payload['state_dicts'][key] = value.state_dict()
             elif key in include_keys:
                 payload['pickles'][key] = dill.dumps(value)
+
+        def save():
+            try:
+                tmp_path = path.with_suffix(path.suffix + ".tmp")
+                with tmp_path.open("wb") as file:
+                    torch.save(payload, file, pickle_module=dill)
+                os.replace(tmp_path, path)
+            except BaseException as exc:
+                self._saving_error = exc
+
         if use_thread:
-            self._saving_thread = threading.Thread(
-                target=lambda : torch.save(payload, path.open('wb'), pickle_module=dill))
+            self._saving_error = None
+            self._saving_thread = threading.Thread(target=save)
             self._saving_thread.start()
         else:
-            torch.save(payload, path.open('wb'), pickle_module=dill)
+            save()
+            self.wait_for_checkpoint()
         return str(path.absolute())
+
+    def wait_for_checkpoint(self):
+        thread = self._saving_thread
+        if thread is not None:
+            thread.join()
+            self._saving_thread = None
+        if self._saving_error is not None:
+            error = self._saving_error
+            self._saving_error = None
+            raise RuntimeError("checkpoint save failed") from error
     
     def get_checkpoint_path(self, tag='latest'):
         return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
@@ -94,7 +117,9 @@ class BaseWorkspace:
             path = self.get_checkpoint_path(tag=tag)
         else:
             path = pathlib.Path(path)
-        payload = torch.load(path.open('rb'), pickle_module=dill, **kwargs)
+        payload = torch.load(
+            path.open('rb'), pickle_module=dill, weights_only=False, **kwargs
+        )
         self.load_payload(payload, 
             exclude_keys=exclude_keys, 
             include_keys=include_keys)
@@ -105,7 +130,9 @@ class BaseWorkspace:
             exclude_keys=None, 
             include_keys=None,
             **kwargs):
-        payload = torch.load(open(path, 'rb'), pickle_module=dill)
+        payload = torch.load(
+            open(path, "rb"), pickle_module=dill, weights_only=False
+        )
         instance = cls(payload['cfg'])
         instance.load_payload(
             payload=payload, 
@@ -128,7 +155,9 @@ class BaseWorkspace:
     
     @classmethod
     def create_from_snapshot(cls, path):
-        return torch.load(open(path, 'rb'), pickle_module=dill)
+        return torch.load(
+            open(path, "rb"), pickle_module=dill, weights_only=False
+        )
 
 
 def _copy_to_cpu(x):

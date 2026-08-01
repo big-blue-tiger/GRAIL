@@ -19,6 +19,7 @@ import tqdm
 import numpy as np
 import pickle
 import csv
+import dill
 
 from sugar_il.common.pytorch_util import dict_apply
 from sugar_il.workspace.base_workspace import BaseWorkspace
@@ -72,7 +73,15 @@ def save_attention_maps(output_dir, split, epoch, attention_maps):
 
 
 class TrainGeneratorWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    include_keys = [
+        "global_step",
+        "epoch",
+        "train_loss_history",
+        "val_loss_history",
+        "scheduler_total_steps",
+        "rng_state",
+        "ema_optimization_step",
+    ]
 
     def __init__(self, cfg: OmegaConf):
         super().__init__(cfg)
@@ -91,16 +100,78 @@ class TrainGeneratorWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
 
-        # do not save optimizer if resume=False
-        if not cfg.training.resume:             # False
-            self.exclude_keys = ['optimizer']
-
-        if cfg.start_ckpt_path is not None:
-            print(f"Starting from checkpoint {cfg.start_ckpt_path}")
-            self.load_checkpoint(path=cfg.start_ckpt_path)
-
         self.global_step = 0
         self.epoch = 0
+        self.train_loss_history = []
+        self.val_loss_history = []
+        self.scheduler_total_steps = None
+        self.rng_state = None
+        self.ema_optimization_step = 0
+        self._resume_payload = None
+
+        if cfg.start_ckpt_path is not None:
+            if not cfg.training.resume:
+                raise ValueError("start_ckpt_path requires training.resume=true")
+            print(f"Starting from checkpoint {cfg.start_ckpt_path}")
+            payload = torch.load(
+                cfg.start_ckpt_path,
+                pickle_module=dill,
+                map_location="cpu",
+                weights_only=False,
+            )
+            self._validate_resume_config(payload["cfg"])
+            self._resume_payload = payload
+            self.load_payload(
+                payload,
+                exclude_keys=("optimizer", "lr_scheduler"),
+                include_keys=self.include_keys,
+            )
+
+    def _validate_resume_config(self, saved_cfg):
+        """Reject silent changes to optimization/model semantics during resume."""
+        paths = (
+            "shape_meta",
+            "policy",
+            "optimizer",
+            "dataloader.batch_size",
+            "training.gradient_accumulate_every",
+            "training.lr_scheduler",
+            "training.lr_warmup_steps",
+            "training.scheduler_num_epochs",
+            "training.use_ema",
+        )
+        mismatches = []
+        for path in paths:
+            current = OmegaConf.select(self.cfg, path)
+            saved = OmegaConf.select(saved_cfg, path)
+            if OmegaConf.is_config(current):
+                current = OmegaConf.to_container(current, resolve=False)
+            if OmegaConf.is_config(saved):
+                saved = OmegaConf.to_container(saved, resolve=False)
+            if current != saved:
+                mismatches.append(path)
+        if mismatches:
+            raise ValueError(
+                "Resume would change training semantics: " + ", ".join(mismatches)
+            )
+
+    @staticmethod
+    def _capture_rng_state():
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+
+    def _restore_rng_state(self):
+        if self.rng_state is None:
+            return
+        random.setstate(self.rng_state["python"])
+        np.random.set_state(self.rng_state["numpy"])
+        torch.set_rng_state(self.rng_state["torch"])
+        if self.rng_state["cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(self.rng_state["cuda"])
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -143,8 +214,6 @@ class TrainGeneratorWorkspace(BaseWorkspace):
 
         self.optimizer = self.model.get_optimizer(**cfg.optimizer)
 
-        if cfg.training.use_ema:
-            self.ema_model = copy.deepcopy(self.model)
         # configure dataset
         dataset: BaseLowdimDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
@@ -168,24 +237,47 @@ class TrainGeneratorWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model.set_normalizer(normalizer)
 
+        if self.scheduler_total_steps is None:
+            scheduler_epochs = (
+                cfg.training.scheduler_num_epochs
+                if cfg.training.scheduler_num_epochs is not None
+                else cfg.training.num_epochs
+            )
+            self.scheduler_total_steps = (
+                (
+                    len(train_dataloader)
+                    + cfg.training.gradient_accumulate_every
+                    - 1
+                )
+                // cfg.training.gradient_accumulate_every
+            ) * scheduler_epochs
+
         # configure lr scheduler
-        lr_scheduler = get_scheduler(
+        self.lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
             num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=(
-                len(train_dataloader) * cfg.training.num_epochs) \
-                    // cfg.training.gradient_accumulate_every,
-            # This workspace advances the learning-rate schedule every optimizer step.
-            last_epoch=self.global_step-1
+            num_training_steps=self.scheduler_total_steps,
+            last_epoch=-1,
         )
+        if self._resume_payload is not None:
+            states = self._resume_payload["state_dicts"]
+            required = {"optimizer", "lr_scheduler"}
+            missing = required.difference(states)
+            if missing:
+                raise KeyError(
+                    "Full resume checkpoint is missing: " + ", ".join(sorted(missing))
+                )
+            self.optimizer.load_state_dict(states["optimizer"])
+            self.lr_scheduler.load_state_dict(states["lr_scheduler"])
 
         # configure ema
-        ema: EMAModel = None
+        self.ema: EMAModel = None
         if cfg.training.use_ema:
-            ema = hydra.utils.instantiate(
+            self.ema = hydra.utils.instantiate(
                 cfg.ema,
                 model=self.ema_model)
+            self.ema.optimization_step = self.ema_optimization_step
 
         # configure env
         env_runner: GeneratorRunner
@@ -201,27 +293,17 @@ class TrainGeneratorWorkspace(BaseWorkspace):
         )
 
         # accelerator
-        train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler = accelerator.prepare(
-            train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler
+        train_dataloader, val_dataloader, self.model, self.optimizer, self.lr_scheduler = accelerator.prepare(
+            train_dataloader, val_dataloader, self.model, self.optimizer, self.lr_scheduler
         )
         device = self.model.device
         if self.ema_model is not None:
             self.ema_model.to(device)
+        if self._resume_payload is not None:
+            self._restore_rng_state()
 
         # save batch for sampling
         train_sampling_batch = None
-        train_loss_history = []
-        val_loss_history = []
-
-        if cfg.training.debug:
-            cfg.training.num_epochs = 2
-            cfg.training.max_train_steps = 3
-            cfg.training.max_val_steps = 3
-            cfg.training.rollout_every = 1
-            cfg.training.checkpoint_every = 1
-            cfg.training.val_every = 1
-            cfg.training.sample_every = 1
-
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
@@ -232,6 +314,11 @@ class TrainGeneratorWorkspace(BaseWorkspace):
 
                 train_losses = list()
                 previous_train_loss = None
+                num_train_batches = len(train_dataloader)
+                if cfg.training.max_train_steps is not None:
+                    num_train_batches = min(
+                        num_train_batches, cfg.training.max_train_steps
+                    )
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}",
                         leave=False, mininterval=cfg.training.tqdm_interval_sec,
                         disable=not accelerator.is_main_process) as tepoch:
@@ -247,19 +334,36 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                         # compute loss
                         loss_dict = self.model.compute_loss(batch, training=True)
                         raw_loss = loss_dict['loss']
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
+                        is_last_batch = batch_idx == (num_train_batches - 1)
+                        remainder = (
+                            num_train_batches
+                            % cfg.training.gradient_accumulate_every
+                        )
+                        accumulation_size = (
+                            remainder
+                            if is_last_batch and remainder
+                            else cfg.training.gradient_accumulate_every
+                        )
+                        loss = raw_loss / accumulation_size
                         accelerator.backward(loss)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
                         # step optimizer
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                        should_step = (
+                            (batch_idx + 1) % cfg.training.gradient_accumulate_every == 0
+                            or is_last_batch
+                        )
+                        if should_step:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), max_norm=0.5
+                            )
                             self.optimizer.step()
                             self.optimizer.zero_grad()
-                            lr_scheduler.step()
+                            self.lr_scheduler.step()
 
-                        # update ema
-                        if cfg.training.use_ema:
-                            ema.step(accelerator.unwrap_model(self.model))
+                        # EMA tracks optimizer updates, not micro-batches.
+                        if cfg.training.use_ema and should_step:
+                            self.ema.step(accelerator.unwrap_model(self.model))
+                            self.ema_optimization_step = self.ema.optimization_step
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
@@ -277,7 +381,7 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                             delta=f"{loss_delta:+.2e}",
                             flow=f"{flow_loss_cpu:.6f}",
                             hand=f"{hand_loss_cpu:.6f}",
-                            lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                            lr=f"{self.lr_scheduler.get_last_lr()[0]:.2e}",
                             refresh=False,
                         )
                         step_log = {
@@ -286,10 +390,9 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                             'train_hand_loss': hand_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0]
+                            'lr': self.lr_scheduler.get_last_lr()[0]
                         }
 
-                        is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
                             accelerator.log(step_log, step=self.global_step)
@@ -354,13 +457,15 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                                 )
 
                 if accelerator.is_main_process:
-                    train_loss_history.append((self.epoch, float(train_loss)))
+                    self.train_loss_history.append((self.epoch, float(train_loss)))
                     if 'val_loss' in step_log:
-                        val_loss_history.append((self.epoch, float(step_log['val_loss'])))
+                        self.val_loss_history.append((self.epoch, float(step_log['val_loss'])))
                     if cfg.training.save_loss_curve \
                             and (self.epoch % cfg.training.loss_curve_every) == 0:
                         save_loss_curve(
-                            self.output_dir, train_loss_history, val_loss_history
+                            self.output_dir,
+                            self.train_loss_history,
+                            self.val_loss_history,
                         )
 
                 # def log_action_mse(step_log, category, pred_action, gt_action):
@@ -416,8 +521,17 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                         del gt_action
                         del pred_action
 
-                # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0 and accelerator.is_main_process:
+                completed_epoch = self.epoch
+                accelerator.log(step_log, step=self.global_step)
+                json_logger.log(step_log)
+                self.global_step += 1
+                self.epoch += 1
+                self.rng_state = self._capture_rng_state()
+
+                # Save the next epoch/global_step so resume never repeats work.
+                if (
+                    completed_epoch % cfg.training.checkpoint_every
+                ) == 0 and accelerator.is_main_process:
                     # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
@@ -434,9 +548,6 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                         new_key = key.replace('/', '_')
                         metric_dict[new_key] = value
 
-                    # We can't copy the last checkpoint here
-                    # since save_checkpoint uses threads.
-                    # therefore at this point the file might have been empty!
                     topk_ckpt_path = None
                     if cfg.checkpoint.topk.monitor_key in metric_dict:
                         topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
@@ -448,22 +559,17 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                     self.model = model_ddp
 
                 # Save model at specific epochs without affecting best model saving
-                if (self.epoch % 100 == 0) and accelerator.is_main_process:
+                if (completed_epoch % 100 == 0) and accelerator.is_main_process:
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
                     save_dir = os.path.join(self.output_dir, 'epoch_checkpoints')
                     os.makedirs(save_dir, exist_ok=True)
-                    self.save_checkpoint(path=os.path.join(save_dir, f'epoch={self.epoch}.ckpt'))
+                    self.save_checkpoint(
+                        path=os.path.join(save_dir, f"epoch={completed_epoch}.ckpt")
+                    )
                     self.model = model_ddp
 
-                # ========= eval end for this epoch ==========
-                # end of epoch
-                # log of last step is combined with validation and rollout
-                accelerator.log(step_log, step=self.global_step)
-                json_logger.log(step_log)
-                self.global_step += 1
-                self.epoch += 1
-
+        self.wait_for_checkpoint()
         accelerator.end_training()
 
 @hydra.main(

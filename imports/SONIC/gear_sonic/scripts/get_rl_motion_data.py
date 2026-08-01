@@ -75,7 +75,7 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
         "--batch-size",
-        default=8,
+        default=16,
         type=int,
         help="Number of motions/rendering environments per subprocess (default: 16)",
     )
@@ -163,8 +163,8 @@ def main() -> None:
         "++manager_env.commands.motion.randomize_initial_pose_during_evaluation=True",
         "++manager_env.commands.motion.start_from_first_frame=true",
         "++manager_env.commands.motion.init_z_offset=0.05",
-        "++manager_env.commands.motion.pose_range.x=[-0.0,0.0]",
-        "++manager_env.commands.motion.pose_range.y=[-0.0,0.0]",
+        "++manager_env.commands.motion.pose_range.x=[-0.1,0.1]",
+        "++manager_env.commands.motion.pose_range.y=[-0.1,0.1]",
         f"++manager_env.commands.motion.motion_lib_cfg.motion_file={robot_dir}",
         f"++manager_env.commands.motion.motion_lib_cfg.object_motion_file={required['objects']}",
         f"++manager_env.config.object_usd_path={required['object_usd']}",

@@ -7,6 +7,16 @@ import hydra
 import torch
 
 from sugar_il.common.geometry import world_pose_to_body
+
+
+def load_generator_policy_state(policy, payload: dict):
+    """Load EMA weights when present, with compatibility for older checkpoints."""
+    state_dicts = payload["state_dicts"]
+    state_key = "ema_model" if "ema_model" in state_dicts else "model"
+    policy.load_state_dict(state_dicts[state_key])
+    return state_key
+
+
 class GeneratorWrapper:
     """Inference adapter with the same world-to-body transform as the dataset."""
 
@@ -23,7 +33,7 @@ class GeneratorWrapper:
         with Path(checkpoint_path).open("rb") as file:
             payload = torch.load(file, pickle_module=dill, map_location="cpu", weights_only=False)
         policy = hydra.utils.instantiate(payload["cfg"].policy)
-        policy.load_state_dict(payload["state_dicts"]["model"])
+        load_generator_policy_state(policy, payload)
         return cls(policy, device)
 
     @staticmethod

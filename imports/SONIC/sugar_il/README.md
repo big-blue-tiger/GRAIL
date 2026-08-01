@@ -33,7 +33,7 @@ the Isaac Lab loop executes the first 20 predicted frames before replanning.
 ```bash
 python sugar_il/workspace/train_generator_workspace.py \
   task=ObjectAware \
-  dataset_path='../outputs/ego_view/**/*.object_aware.pkl' \
+  dataset_path='../outputs/**/**/*.object_aware.pkl' \
   num_epochs=500 \
   training.val_every=1 \
   checkpoint.topk.monitor_key=val_loss \
@@ -42,30 +42,67 @@ python sugar_il/workspace/train_generator_workspace.py \
 
 ## Inference
 
-`GeneratorWrapper.observation_from_world()` accepts current robot/object world
-poses. It uses the same `world_pose_to_body()` implementation as training.
-`predict_from_world()` returns 40 consecutive frames. It includes 64-D latents,
-hand primitives, probabilities, logits, and concatenated 66-D actions.
+`GeneratorWrapper.observation_from_world()` receives the current robot/object
+world poses and uses the same `world_pose_to_body()` conversion as training.
+Each inference call predicts 40 consecutive frames (64-D latent + 2-D hand
+primitive); the simulator executes the first 20 frames and then replans.
+
+The reference `--motion-file` is used for the object frame-zero pose, table
+metadata, object USD, and BPS. Reference robot actions are not replayed. The
+default path is:
+
+```text
+/home/tide/robot/sbto/datas/sbto_to_grail/pickup_table/robot/pickup_table__apple_18__004.pkl
+```
 
 ```bash
- python -u sugar_il/workspace/run_generator_isaaclab.py \
-  --generator-checkpoint data/outputs/train_generator_ObjectAwareSONIC/checkpoints/epoch-0421-val_loss-0.012.ckpt \
-  --seed 24 \
-  --device cuda:0 \
-  --robot-position -0.31984177  0.60989204  0.78332764 \
-  --object-initial-position 0.06525806 0.13028011 0.78545775 \
-  --table-position 0.         0.         0.64405456
+python -u sugar_il/sugar_il/workspace/run_generator_isaaclab.py \
+  --generator-checkpoint sugar_il/data/outputs/train_generator_ObjectAwareSONIC/checkpoints/epoch-0421-val_loss-0.012.ckpt \
+  --mode single --seed 24 --device cuda:0 --no-render-video --headless
+```
 
---robot-position X Y Z
---robot-quaternion-wxyz W X Y Z
+Single-episode validation uses the reference object/table pose and the fixed
+robot initial pose declared near the top of `run_generator_isaaclab.py`:
 
---object-initial-position X Y Z
---object-initial-quaternion-wxyz W X Y Z
+```bash
+python -u sugar_il/sugar_il/workspace/run_generator_isaaclab.py \
+  --generator-checkpoint sugar_il/data/outputs/dagger_automation/2026.07.30-15.57.39-31304/round_09/checkpoints/epoch-0382-val_loss-0.014.ckpt \
+  --mode single --render-video --headless
+```
 
---table-position X Y Z
---table-quaternion-wxyz W X Y Z
+Batch success-rate test (random table height / object / robot pose per episode):
 
-  the robot pose is [-0.41984177  0.69989204  0.78332764], [ 0.70745337 -0.02033162 -0.00723898 -0.70643055]
- the object pose is [0.02525806 0.03028011 0.88545775], [0.7192729  0.68741876 0.07175218 0.07037108]
- the table pose is [0.         0.         0.74405456], [0. 0. 0. 1.]
+```bash
+python -u sugar_il/sugar_il/workspace/run_generator_isaaclab.py \
+  --generator-checkpoint sugar_il/data/outputs/dagger_automation/2026.07.30-15.57.39-31304/round_09/checkpoints/epoch-0382-val_loss-0.014.ckpt \
+  --mode batch --episodes 20 --render-video --headless
+```
+
+Batch ranges are defined in `RandomizationRanges` near the top of
+`run_generator_isaaclab.py`, or overridden with `--table-height-range`,
+`--object-x-offset-range`, `--object-y-offset-range`, and robot offset range
+arguments. An object lift of `0.10` m by default (configured with
+`--lift-height`) counts as a successful grasp. Results are written to
+`output/generator_eval/results.json`;
+videos, when enabled, are written below `output/generator_eval/videos/`.
+
+
+## DAGGER GATA GEN
+```bash
+cd /home/tide/robot/GRAIL/imports/SONIC
+
+python -u sugar_il/sugar_il/workspace/get_generator_data_for_dagger.py \
+  --gpu 0 \
+  --checkpoint logs_rl/pnp_table_pnp_table-721/last.pt \
+  --generator-checkpoint sugar_il/data/outputs/dagger_automation/2026.07.30-00.36.52-978188/round_10/checkpoints/latest.ckpt \
+  --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+  --no-video-rendering \
+  --output-dir outputs/dagger
+  --batch-size 128
+```
+
+#### use bash
+```bash
+cd /home/tide/robot/GRAIL/imports/SONIC/sugar_il
+DAGGER_ROUNDS=10 GPU=0 ./run_dagger.sh
 ```

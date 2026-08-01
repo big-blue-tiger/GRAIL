@@ -6,13 +6,18 @@ import torch.nn as nn
 from sugar_il.model.common.module_attr_mixin import ModuleAttrMixin
 
 
-def _token_mlp(input_dim: int, feature_dim: int, dropout: float) -> nn.Sequential:
+def _token_mlp(
+    input_dim: int,
+    hidden_dim: int,
+    feature_dim: int,
+    dropout: float,
+) -> nn.Sequential:
     return nn.Sequential(
-        nn.Linear(input_dim, 256),
-        nn.LayerNorm(256),
+        nn.Linear(input_dim, hidden_dim),
+        nn.LayerNorm(hidden_dim),
         nn.GELU(),
         nn.Dropout(dropout),
-        nn.Linear(256, feature_dim),
+        nn.Linear(hidden_dim, feature_dim),
         nn.LayerNorm(feature_dim),
     )
 
@@ -20,13 +25,28 @@ def _token_mlp(input_dim: int, feature_dim: int, dropout: float) -> nn.Sequentia
 class GeneratorStateObsEncoder(ModuleAttrMixin):
     """Encode scene geometry, current object state, and proprioception as three tokens."""
 
-    def __init__(self, shape_meta: dict | None = None, feature_dim: int = 256, dropout: float = 0.1, proprioception_dropout: float = 0.1, **_: object):
+    def __init__(
+        self,
+        shape_meta: dict | None = None,
+        feature_dim: int = 256,
+        token_hidden_dim: int = 256,
+        dropout: float = 0.1,
+        proprioception_dropout: float = 0.1,
+        **_: object,
+    ):
         super().__init__()
+        if feature_dim <= 0 or token_hidden_dim <= 0:
+            raise ValueError("feature_dim and token_hidden_dim must be positive")
         self.feature_dim = feature_dim
+        self.token_hidden_dim = token_hidden_dim
         self.proprioception_dropout = proprioception_dropout
-        self.scene_geometry_net = _token_mlp(14, feature_dim, dropout)
-        self.object_net = _token_mlp(26, feature_dim, dropout)
-        self.proprioception_net = _token_mlp(92, feature_dim, dropout)
+        self.scene_geometry_net = _token_mlp(
+            14, token_hidden_dim, feature_dim, dropout
+        )
+        self.object_net = _token_mlp(26, token_hidden_dim, feature_dim, dropout)
+        self.proprioception_net = _token_mlp(
+            92, token_hidden_dim, feature_dim, dropout
+        )
 
     @staticmethod
     def _require_single_step(value: torch.Tensor, name: str) -> torch.Tensor:
