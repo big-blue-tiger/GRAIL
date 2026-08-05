@@ -494,9 +494,14 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
         self._frame_data: dict[int, dict[str, list]] = {}
         self._completed = torch.zeros(self.env.num_envs, dtype=torch.bool)
         self._successful = torch.zeros(self.env.num_envs, dtype=torch.bool)
+        self._grasp_successful = torch.zeros(self.env.num_envs, dtype=torch.bool)
         self._termination_reasons: list[tuple[str, ...]] = [
             () for _ in range(self.env.num_envs)
         ]
+        self._penetration_history: dict[int, list[tuple[float, bool]]] = {
+            i: [] for i in range(self.env.num_envs)
+        }
+        self._recording_start_motion_steps: dict[int, int] = {}
         logger.info(f"=== ObjectAwareStateRecorder: saving to {self.save_dir} ===")
 
     def _initialize(self) -> None:
@@ -608,9 +613,38 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
         if object_root_pos_w is None or object_root_quat_w is None:
             raise RuntimeError("Object-aware pre-step object root pose was not cached.")
 
+        success_lift = getattr(self.env, "success_lift", None)
+        if success_lift is not None:
+            self._grasp_successful |= success_lift.detach().cpu().bool()
+
+        penetration = None
+        if self.cfg.selection_manifest_path is not None:
+            sensor_name = self.cfg.penetration_sensor_name
+            if sensor_name not in self.env.scene.sensors:
+                raise RuntimeError(
+                    f"Reference selection requires contact sensor {sensor_name!r}."
+                )
+            sensor = self.env.scene[sensor_name]
+            contact_force = sensor.data.force_matrix_w
+            force_magnitude = torch.norm(contact_force, dim=-1).sum(dim=(-1, -2))
+            penetration = force_magnitude > self.cfg.penetration_force_threshold
+
+        motion_fps = float(
+            getattr(self._motion_cmd.motion_lib, "target_fps", 1.0 / self.env.step_dt)
+        )
+
         for i in range(self.num_record_envs):
             if self.cfg.save_only_timeouts and self._completed[i]:
                 continue
+            if penetration is not None:
+                current_motion_step = int(motion_steps[i].item())
+                start_motion_step = self._recording_start_motion_steps.setdefault(
+                    i, current_motion_step
+                )
+                motion_time = float(current_motion_step - start_motion_step) / motion_fps
+                self._penetration_history[i].append(
+                    (motion_time, bool(penetration[i].item()))
+                )
             data = self._frame_data[i]
             data["frame_idx"].append(self.frame_id)
             data["motion_step"].append(int(motion_steps[i].item()))
@@ -689,6 +723,40 @@ class ObjectAwareStateRecorderTerm(recorder_manager.RecorderTerm):
                 if self.cfg.append_initial_xy_offset:
                     output_stem += _xy_offset_suffix(initial_offset)
             path = os.path.join(self.save_dir, f"{output_stem}.object_aware.pkl")
+            if self.cfg.selection_manifest_path is not None:
+                history = self._penetration_history[i]
+                initial_indices = [
+                    index
+                    for index, (time_s, is_penetrating) in enumerate(history)
+                    if is_penetrating
+                    and time_s <= self.cfg.penetration_detection_seconds
+                ]
+                penetration_detected = bool(initial_indices)
+                penetration_clear_time = None
+                if penetration_detected:
+                    index = initial_indices[-1] + 1
+                    while index < len(history) and history[index][1]:
+                        index += 1
+                    if index < len(history):
+                        penetration_clear_time = history[index][0]
+                with open(self.cfg.selection_manifest_path, "a", encoding="utf-8") as file:
+                    file.write(
+                        json.dumps(
+                            {
+                                "motion_key": motion_key,
+                                "timed_out": bool(self._successful[i].item()),
+                                "grasp_success": bool(self._grasp_successful[i].item()),
+                                "termination_reasons": list(self._termination_reasons[i]),
+                                "penetration_detected_in_initial_window": (
+                                    penetration_detected
+                                ),
+                                "penetration_clear_time_seconds": (
+                                    penetration_clear_time
+                                ),
+                            }
+                        )
+                        + "\n"
+                    )
             if self.cfg.save_only_timeouts and not self._successful[i]:
                 if os.path.exists(path):
                     os.remove(path)
@@ -738,3 +806,7 @@ class ObjectAwareStateRecorderCfg(manager_term_cfg.RecorderTermCfg):
     save_only_timeouts: bool = False
     append_initial_xy_offset: bool = False
     failure_manifest_path: str = None
+    selection_manifest_path: str = None
+    penetration_sensor_name: str = "table_to_hand_contact_sensor"
+    penetration_force_threshold: float = 1.0
+    penetration_detection_seconds: float = 2.0

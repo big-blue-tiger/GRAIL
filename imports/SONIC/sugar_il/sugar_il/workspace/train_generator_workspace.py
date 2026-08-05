@@ -20,6 +20,8 @@ import numpy as np
 import pickle
 import csv
 import dill
+import time
+from contextlib import nullcontext
 
 from sugar_il.common.pytorch_util import dict_apply
 from sugar_il.workspace.base_workspace import BaseWorkspace
@@ -31,27 +33,44 @@ from sugar_il.common.json_logger import JsonLogger
 from sugar_il.model.flowmatching.ema_model import EMAModel
 from sugar_il.model.common.lr_scheduler import get_scheduler
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration
+from accelerate.utils import ProjectConfiguration, set_seed
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+def wait_for_everyone(accelerator):
+    """Barrier that also works with Accelerate MULTI_CPU plus visible CUDA."""
+    if accelerator.num_processes > 1 and accelerator.device.type == "cpu":
+        torch.distributed.barrier()
+    else:
+        accelerator.wait_for_everyone()
 
 
 def save_loss_curve(output_dir, train_history, val_history):
     """Persist epoch losses as both a CSV table and a PNG plot."""
     csv_path = os.path.join(output_dir, "loss_curve.csv")
+    train_by_epoch = dict(train_history)
     val_by_epoch = dict(val_history)
+    epoch_progresses = sorted(set(train_by_epoch) | set(val_by_epoch))
     with open(csv_path, "w", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(("epoch", "train_loss", "val_loss"))
-        for epoch, train_loss in train_history:
-            writer.writerow((epoch, train_loss, val_by_epoch.get(epoch, "")))
+        writer.writerow(("epoch_progress", "train_loss", "val_loss"))
+        for epoch_progress in epoch_progresses:
+            writer.writerow(
+                (
+                    epoch_progress,
+                    train_by_epoch.get(epoch_progress, ""),
+                    val_by_epoch.get(epoch_progress, ""),
+                )
+            )
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     figure, axis = plt.subplots(figsize=(9, 5))
-    train_epochs, train_losses = zip(*train_history)
-    axis.plot(train_epochs, train_losses, label="train_loss", linewidth=1.5)
+    if train_history:
+        train_epochs, train_losses = zip(*train_history)
+        axis.plot(train_epochs, train_losses, label="train_loss", linewidth=1.5)
     if val_history:
         val_epochs, val_losses = zip(*val_history)
         axis.plot(val_epochs, val_losses, label="val_loss", marker="o", markersize=3)
@@ -59,7 +78,8 @@ def save_loss_curve(output_dir, train_history, val_history):
     axis.set_ylabel("Loss")
     axis.set_title("Training and Validation Loss")
     axis.grid(True, alpha=0.3)
-    axis.legend()
+    if train_history or val_history:
+        axis.legend()
     figure.tight_layout()
     figure.savefig(os.path.join(output_dir, "loss_curve.png"), dpi=160)
     plt.close(figure)
@@ -108,6 +128,7 @@ class TrainGeneratorWorkspace(BaseWorkspace):
         self.rng_state = None
         self.ema_optimization_step = 0
         self._resume_payload = None
+        self._resume_lr_override = None
 
         if cfg.start_ckpt_path is not None:
             if not cfg.training.resume:
@@ -132,7 +153,8 @@ class TrainGeneratorWorkspace(BaseWorkspace):
         paths = (
             "shape_meta",
             "policy",
-            "optimizer",
+            "optimizer.weight_decay",
+            "optimizer.betas",
             "dataloader.batch_size",
             "training.gradient_accumulate_every",
             "training.lr_scheduler",
@@ -150,9 +172,41 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                 saved = OmegaConf.to_container(saved, resolve=False)
             if current != saved:
                 mismatches.append(path)
+
+        current_lr = float(OmegaConf.select(self.cfg, "optimizer.lr"))
+        saved_lr = float(OmegaConf.select(saved_cfg, "optimizer.lr"))
+        if current_lr != saved_lr:
+            # Changing only the peak LR is a supported fine-tuning operation.
+            # The optimizer and scheduler states are still restored below, then
+            # the saved schedule is rebased to this new peak value.
+            self._resume_lr_override = (saved_lr, current_lr)
         if mismatches:
             raise ValueError(
                 "Resume would change training semantics: " + ", ".join(mismatches)
+            )
+
+    def _apply_resume_lr_override(self):
+        """Rebase a restored scheduler while preserving its current position."""
+        if self._resume_lr_override is None:
+            return
+
+        saved_lr, requested_lr = self._resume_lr_override
+        group_count = len(self.optimizer.param_groups)
+        self.lr_scheduler.base_lrs = [requested_lr] * group_count
+        current_lrs = []
+        for index, param_group in enumerate(self.optimizer.param_groups):
+            lr_lambda = self.lr_scheduler.lr_lambdas[index]
+            current_lr = requested_lr * lr_lambda(self.lr_scheduler.last_epoch)
+            param_group["initial_lr"] = requested_lr
+            param_group["lr"] = current_lr
+            current_lrs.append(current_lr)
+        self.lr_scheduler._last_lr = current_lrs
+
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            print(
+                "Resumed scheduler with peak learning rate changed from "
+                f"{saved_lr:.2e} to {requested_lr:.2e}; "
+                f"current learning rate is {current_lrs[0]:.2e}."
             )
 
     @staticmethod
@@ -176,9 +230,28 @@ class TrainGeneratorWorkspace(BaseWorkspace):
     def run(self):
         cfg = copy.deepcopy(self.cfg)
 
-        # Set GPU device before initializing accelerator
+        # LOCAL_RANK is populated by ``accelerate launch``/``torchrun``.  Do not
+        # force CUDA here so that configuration inspection and CPU smoke tests
+        # still work on machines without a GPU.
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
+        use_cpu = str(cfg.training.device).startswith("cpu")
+        if torch.cuda.is_available() and not use_cpu:
+            torch.cuda.set_device(local_rank)
+        mixed_precision = str(cfg.training.mixed_precision)
+        if (
+            mixed_precision == "bf16"
+            and torch.cuda.is_available()
+            and not use_cpu
+            and not torch.cuda.is_bf16_supported()
+        ):
+            mixed_precision = "fp16"
+            cfg.training.mixed_precision = mixed_precision
+            self.cfg.training.mixed_precision = mixed_precision
+            if local_rank == 0:
+                print(
+                    "BF16 is not supported by these GPUs; using FP16 instead.",
+                    flush=True,
+                )
         project_config = ProjectConfiguration(
             project_dir=self.output_dir,
             logging_dir=os.path.join(self.output_dir,"tb")
@@ -186,20 +259,26 @@ class TrainGeneratorWorkspace(BaseWorkspace):
         accelerator = Accelerator(
             log_with='tensorboard', # wandb
             project_config=project_config,
-            mixed_precision='bf16',  # Enable BF16 mixed precision training
-            device_placement=True
+            mixed_precision=mixed_precision,
+            device_placement=True,
+            cpu=use_cpu,
         )
+        # Model initialization happened before distributed setup and therefore
+        # used the same seed on every rank. From this point onward, give each
+        # rank an independent (but reproducible) data/noise RNG stream.
+        set_seed(cfg.training.seed, device_specific=True)
 
         if accelerator.is_main_process:
             print(f"Using mixed precision: {accelerator.mixed_precision}")
             print(f"Using device: {accelerator.device}")
             print(f"Local rank: {local_rank}")
+            print(f"Distributed processes: {accelerator.num_processes}")
             print(
                 "Flow matching: "
                 f"steps={self.model.num_inference_steps}, "
                 f"time_buckets={self.model.num_timestep_buckets}"
             )
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and not use_cpu:
                 print(f"CUDA Device: {torch.cuda.get_device_name(local_rank)}")
                 print(f"CUDA Capability: {torch.cuda.get_device_capability(local_rank)}")
 
@@ -222,12 +301,24 @@ class TrainGeneratorWorkspace(BaseWorkspace):
         # compute normalizer on the main process and save to disk
         normalizer_path = os.path.join(self.output_dir, 'normalizer.pkl')
         if accelerator.is_main_process:
+            print(
+                f"Computing normalizer from {len(dataset):,} training windows...",
+                flush=True,
+            )
+            normalizer_start_time = time.monotonic()
             normalizer = dataset.get_normalizer()
-            pickle.dump(normalizer, open(normalizer_path, 'wb'))
+            with open(normalizer_path, 'wb') as file:
+                pickle.dump(normalizer, file)
+            print(
+                "Normalizer ready in "
+                f"{time.monotonic() - normalizer_start_time:.1f}s",
+                flush=True,
+            )
 
         # load normalizer on all processes
-        accelerator.wait_for_everyone()
-        normalizer = pickle.load(open(normalizer_path, 'rb'))
+        wait_for_everyone(accelerator)
+        with open(normalizer_path, 'rb') as file:
+            normalizer = pickle.load(file)
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
@@ -270,6 +361,7 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                 )
             self.optimizer.load_state_dict(states["optimizer"])
             self.lr_scheduler.load_state_dict(states["lr_scheduler"])
+            self._apply_resume_lr_override()
 
         # configure ema
         self.ema: EMAModel = None
@@ -280,33 +372,109 @@ class TrainGeneratorWorkspace(BaseWorkspace):
             self.ema.optimization_step = self.ema_optimization_step
 
         # configure env
-        env_runner: GeneratorRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, GeneratorRunner)
+        env_runner: GeneratorRunner = None
+        if accelerator.is_main_process:
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir)
+            assert isinstance(env_runner, GeneratorRunner)
 
         # configure checkpoint
-        topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
-        )
+        topk_manager = None
+        if accelerator.is_main_process:
+            topk_manager = TopKCheckpointManager(
+                save_dir=os.path.join(self.output_dir, 'checkpoints'),
+                **cfg.checkpoint.topk
+            )
 
         # accelerator
         train_dataloader, val_dataloader, self.model, self.optimizer, self.lr_scheduler = accelerator.prepare(
             train_dataloader, val_dataloader, self.model, self.optimizer, self.lr_scheduler
         )
-        device = self.model.device
+        device = accelerator.device
         if self.ema_model is not None:
             self.ema_model.to(device)
         if self._resume_payload is not None:
             self._restore_rng_state()
+            if accelerator.num_processes > 1 and not accelerator.is_main_process:
+                # Checkpoints contain rank-zero RNG state. Preserve it exactly
+                # on rank zero and deterministically decorrelate worker ranks.
+                set_seed(
+                    cfg.training.seed + self.global_step,
+                    device_specific=True,
+                )
 
         # save batch for sampling
         train_sampling_batch = None
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
-        with JsonLogger(log_path) as json_logger:
+        logger_context = (
+            JsonLogger(log_path) if accelerator.is_main_process else nullcontext(None)
+        )
+        with logger_context as json_logger:
+            def run_validation(progress):
+                """Run distributed validation and return the global mean loss."""
+                if len(val_dataloader) == 0:
+                    return None
+
+                was_training = self.model.training
+                self.model.eval()
+                val_losses = []
+                with torch.no_grad():
+                    with tqdm.tqdm(
+                        val_dataloader,
+                        desc=(
+                            f"Validation epoch {self.epoch} "
+                            f"({progress:.0%})"
+                        ),
+                        leave=False,
+                        mininterval=cfg.training.tqdm_interval_sec,
+                        disable=not accelerator.is_main_process,
+                    ) as val_tepoch:
+                        for val_batch_idx, val_batch in enumerate(val_tepoch):
+                            val_batch = dict_apply(
+                                val_batch,
+                                lambda x: x.to(device, non_blocking=True),
+                            )
+                            val_loss_dict = self.model(val_batch, training=False)
+                            val_losses.append(val_loss_dict["loss"].item())
+                            if (
+                                cfg.training.max_val_steps is not None
+                                and val_batch_idx
+                                >= cfg.training.max_val_steps - 1
+                            ):
+                                break
+
+                val_loss_stats = torch.tensor(
+                    [sum(val_losses), len(val_losses)],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                )
+                val_loss_stats = accelerator.reduce(
+                    val_loss_stats, reduction="sum"
+                )
+                if was_training:
+                    self.model.train()
+                if val_loss_stats[1] <= 0:
+                    return None
+
+                val_loss = (val_loss_stats[0] / val_loss_stats[1]).item()
+                if accelerator.is_main_process:
+                    epoch_progress = self.epoch + progress
+                    self.val_loss_history.append((epoch_progress, float(val_loss)))
+                    if cfg.training.save_loss_curve:
+                        save_loss_curve(
+                            self.output_dir,
+                            self.train_loss_history,
+                            self.val_loss_history,
+                        )
+                    print(
+                        f"Epoch {self.epoch} validation at {progress:.0%}: "
+                        f"avg={val_loss:.6f}, "
+                        f"batches={int(val_loss_stats[1].item())}"
+                    )
+                return val_loss
+
             for local_epoch_idx in range(cfg.training.num_epochs):
                 self.model.train()
 
@@ -319,41 +487,68 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                     num_train_batches = min(
                         num_train_batches, cfg.training.max_train_steps
                     )
+                val_checks_per_epoch = max(
+                    1, int(cfg.training.val_checks_per_epoch)
+                )
+                validation_batches = {
+                    max(
+                        1,
+                        min(
+                            num_train_batches,
+                            (check_idx * num_train_batches
+                             + val_checks_per_epoch - 1)
+                            // val_checks_per_epoch,
+                        ),
+                    )
+                    for check_idx in range(1, val_checks_per_epoch + 1)
+                }
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}",
                         leave=False, mininterval=cfg.training.tqdm_interval_sec,
                         disable=not accelerator.is_main_process) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
                         # device transfer
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                        if train_sampling_batch is None:
+                        # Sampling is a main-process-only side task. Keeping this
+                        # batch only on rank zero also avoids wasting GPU memory.
+                        if accelerator.is_main_process:
                             train_sampling_batch = batch
 
-                        # always use the latest batch
-                        train_sampling_batch = batch
-
-                        # compute loss
-                        loss_dict = self.model.compute_loss(batch, training=True)
-                        raw_loss = loss_dict['loss']
                         is_last_batch = batch_idx == (num_train_batches - 1)
                         remainder = (
                             num_train_batches
                             % cfg.training.gradient_accumulate_every
                         )
-                        accumulation_size = (
-                            remainder
-                            if is_last_batch and remainder
-                            else cfg.training.gradient_accumulate_every
-                        )
-                        loss = raw_loss / accumulation_size
-                        accelerator.backward(loss)
-
                         # step optimizer
                         should_step = (
                             (batch_idx + 1) % cfg.training.gradient_accumulate_every == 0
                             or is_last_batch
                         )
+                        is_remainder_group = (
+                            remainder > 0
+                            and batch_idx >= num_train_batches - remainder
+                        )
+                        accumulation_size = (
+                            remainder
+                            if is_remainder_group
+                            else cfg.training.gradient_accumulate_every
+                        )
+                        # Skip redundant gradient all-reduces on accumulation
+                        # micro-batches; the final backward synchronizes the sum.
+                        sync_context = (
+                            nullcontext()
+                            if should_step
+                            else accelerator.no_sync(self.model)
+                        )
+                        with sync_context:
+                            # DDP requires both forward and backward to be inside
+                            # no_sync for an accumulation micro-batch.
+                            loss_dict = self.model(batch, training=True)
+                            raw_loss = loss_dict['loss']
+                            loss = raw_loss / accumulation_size
+                            accelerator.backward(loss)
+
                         if should_step:
-                            torch.nn.utils.clip_grad_norm_(
+                            accelerator.clip_grad_norm_(
                                 self.model.parameters(), max_norm=0.5
                             )
                             self.optimizer.step()
@@ -393,10 +588,23 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                             'lr': self.lr_scheduler.get_last_lr()[0]
                         }
 
+                        completed_batches = batch_idx + 1
+                        should_validate = (
+                            self.epoch % cfg.training.val_every == 0
+                            and completed_batches in validation_batches
+                        )
+                        if should_validate:
+                            val_loss = run_validation(
+                                completed_batches / num_train_batches
+                            )
+                            if val_loss is not None:
+                                step_log['val_loss'] = val_loss
+
                         if not is_last_batch:
-                            # log of last step is combined with validation and rollout
-                            accelerator.log(step_log, step=self.global_step)
-                            json_logger.log(step_log)
+                            if accelerator.is_main_process:
+                                # The last step is combined with validation/rollout.
+                                accelerator.log(step_log, step=self.global_step)
+                                json_logger.log(step_log)
                             self.global_step += 1
 
                         if (cfg.training.max_train_steps is not None) \
@@ -405,7 +613,15 @@ class TrainGeneratorWorkspace(BaseWorkspace):
 
                 # at the end of each epoch
                 # replace train_loss with epoch average
-                train_loss = np.mean(train_losses)
+                train_loss_stats = torch.tensor(
+                    [sum(train_losses), len(train_losses)],
+                    device=accelerator.device,
+                    dtype=torch.float64,
+                )
+                train_loss_stats = accelerator.reduce(train_loss_stats, reduction="sum")
+                train_loss = (
+                    train_loss_stats[0] / train_loss_stats[1].clamp_min(1)
+                ).item()
                 step_log['train_loss'] = train_loss
                 if accelerator.is_main_process:
                     print(
@@ -422,44 +638,19 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                if (self.epoch % cfg.training.rollout_every) == 0 \
+                        and accelerator.is_main_process:
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)
-
-                # run validation
-                if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0:
-                    with torch.no_grad():
-                        val_losses = list()
-                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
-                                leave=False, mininterval=cfg.training.tqdm_interval_sec,
-                                disable=not accelerator.is_main_process) as tepoch:
-                            for batch_idx, batch in enumerate(tepoch):
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss_dict = self.model.compute_loss(batch, training=False)
-                                val_losses.append(loss_dict['loss'])
-                                if (cfg.training.max_val_steps is not None) \
-                                    and batch_idx >= (cfg.training.max_val_steps-1):
-                                    break
-
-                        if len(val_losses) > 0:
-                            # Collect validation losses from all processes
-                            val_losses = torch.stack(val_losses)
-                            val_losses = accelerator.gather(val_losses)
-
-                            # Calculate mean loss on main process
-                            if accelerator.is_main_process:
-                                val_loss = torch.mean(val_losses).item()
-                                step_log['val_loss'] = val_loss
-                                print(
-                                    f"Epoch {self.epoch} validation summary: "
-                                    f"avg={val_loss:.6f}, batches={len(val_losses)}"
-                                )
+                # Other ranks must not enter the next DDP forward while rank zero
+                # is still performing rollout inference.
+                wait_for_everyone(accelerator)
 
                 if accelerator.is_main_process:
-                    self.train_loss_history.append((self.epoch, float(train_loss)))
-                    if 'val_loss' in step_log:
-                        self.val_loss_history.append((self.epoch, float(step_log['val_loss'])))
+                    # Epoch averages are positioned at the end of each epoch so
+                    # they share the same x-axis as intra-epoch validation.
+                    self.train_loss_history.append((self.epoch + 1.0, float(train_loss)))
                     if cfg.training.save_loss_curve \
                             and (self.epoch % cfg.training.loss_curve_every) == 0:
                         save_loss_curve(
@@ -520,10 +711,12 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                         del batch
                         del gt_action
                         del pred_action
+                wait_for_everyone(accelerator)
 
                 completed_epoch = self.epoch
-                accelerator.log(step_log, step=self.global_step)
-                json_logger.log(step_log)
+                if accelerator.is_main_process:
+                    accelerator.log(step_log, step=self.global_step)
+                    json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1
                 self.rng_state = self._capture_rng_state()
@@ -569,7 +762,9 @@ class TrainGeneratorWorkspace(BaseWorkspace):
                     )
                     self.model = model_ddp
 
-        self.wait_for_checkpoint()
+        if accelerator.is_main_process:
+            self.wait_for_checkpoint()
+        wait_for_everyone(accelerator)
         accelerator.end_training()
 
 @hydra.main(

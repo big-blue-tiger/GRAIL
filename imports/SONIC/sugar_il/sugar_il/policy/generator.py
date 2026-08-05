@@ -188,11 +188,16 @@ class Generator(ModuleAttrMixin):
         self,
         batch: dict,
         training: bool = True,
+        normalized: bool = False,
     ) -> dict[str, torch.Tensor]:
-        normalized_obs = self._normalize_obs(batch["obs"])
-        trajectory = self.normalizer["latent"].normalize(
-            batch["action"]["latent"]
-        )
+        if normalized:
+            normalized_obs = batch["obs"]
+            trajectory = batch["action"]["latent"]
+        else:
+            normalized_obs = self._normalize_obs(batch["obs"])
+            trajectory = self.normalizer["latent"].normalize(
+                batch["action"]["latent"]
+            )
         hand_target = batch["action"]["hand_primitive"].float()
         condition = self.obs_encoder(normalized_obs, training=training)
 
@@ -226,8 +231,18 @@ class Generator(ModuleAttrMixin):
             "hand_logits": hand_logits,
         }
 
-    def forward(self, batch: dict, training: bool = True):
-        return self.compute_loss(batch, training)["loss"]
+    def forward(
+        self,
+        batch: dict,
+        training: bool = True,
+        normalized: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """DDP entry point for training and validation."""
+        return self.compute_loss(
+            batch,
+            training,
+            normalized=normalized,
+        )
 
     def get_optimizer(
         self,

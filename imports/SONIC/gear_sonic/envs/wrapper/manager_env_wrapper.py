@@ -1,3 +1,4 @@
+import time
 from typing import TYPE_CHECKING  # noqa: I001
 
 import numpy as np
@@ -155,9 +156,11 @@ class ManagerEnvWrapper:
             env_config = exported_config.get("env_config", {})
             algo_config = exported_config.get("algo_config", {})
 
+            load_on_cpu = bool(self.config.get("action_transform_module_load_on_cpu", False))
+            module_device = torch.device("cpu") if load_on_cpu else self.device
             self.action_transform_module = custom_instantiate(
                 algo_config.actor, env_config=env_config, algo_config=algo_config, _resolve=False
-            ).to(self.device)
+            ).to(module_device)
             logger.info(f"Initialized action_transform_module from config: {action_transform_module_cfg}")
 
             # Load checkpoint if provided
@@ -175,12 +178,26 @@ class ManagerEnvWrapper:
                     trl.trainer.utils.exact_div = exact_div
                 except ImportError:
                     pass
+                load_started = time.monotonic()
+                load_device = "cpu" if load_on_cpu else self.device
+                logger.info(
+                    "Loading action_transform_module checkpoint: "
+                    f"path={action_transform_module_checkpoint}, map_location={load_device}"
+                )
                 checkpoint = torch.load(
-                    action_transform_module_checkpoint, map_location=self.device, weights_only=False
+                    action_transform_module_checkpoint,
+                    map_location=load_device,
+                    weights_only=False,
                 )
                 self.action_transform_module.load_state_dict(checkpoint["policy_state_dict"])
+                del checkpoint
+                if load_on_cpu:
+                    self.action_transform_module.to(self.device)
                 logger.info(
-                    f"Loaded action_transform_module checkpoint: {action_transform_module_checkpoint}"
+                    "Loaded action_transform_module checkpoint: "
+                    f"{action_transform_module_checkpoint} "
+                    f"in {time.monotonic() - load_started:.2f}s "
+                    f"(device={self.device}, cpu_load={load_on_cpu})"
                 )
 
             # Precompute tokenizer observation indices for meta_action target

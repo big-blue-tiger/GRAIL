@@ -1,0 +1,50 @@
+paths:
+  input: null
+  teacher_checkpoint: null
+  generator_checkpoint: null
+  output_dir: outputs/dagger_online
+  dataset_root: null
+
+training:
+  iterations: 100
+  epochs_per_rollout: 1
+  # Online training shares the GPU with Isaac Sim, teacher, ATM, and EMA.
+  # Keep this much smaller than the offline per-GPU batch size.
+  batch_size: 16
+  progress_every: 10
+  teacher_ratio: 0.5
+  # Match the fast offline generator training configuration.
+  mixed_precision: fp16
+
+rollout:
+  horizon: 40
+  execution_horizon: 20
+  control_fps: 50
+  progress_every: 10
+  # Print the Python stack repeatedly if one rollout phase stops returning.
+  # Set to 0 to disable after the rollout has been verified on a machine.
+  stall_trace_seconds: 60
+  # Constructor watchdog for CUDA/Kit initialization before the first rollout.
+  startup_trace_seconds: 90
+
+environment:
+  # Load at most this many motions/environments on the GPU at once. When the
+  # input contains more motions, DAgger cycles through batches per iteration.
+  max_parallel_envs: 16
+  # Isaac Sim's default timeline may stop at about 10 seconds.  A STOP event
+  # enters SimulationContext's render-wait callback and prevents Python from
+  # reaching the first optimizer step after a long rollout.
+  timeline_end_time: 1000000.0
+  randomize_initial_pose: true
+  init_z_offset: 0.05
+  root_x_range: [-0.1, 0.1]
+  root_y_range: [-0.1, 0.1]
+  collision_stack_size_exp: 28
+
+checkpoint:
+  every: 1
+
+logging:
+  project: dagger_train
+
+seed: 42

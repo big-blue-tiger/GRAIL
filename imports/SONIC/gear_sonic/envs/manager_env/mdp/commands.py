@@ -882,7 +882,9 @@ class TrackingCommand(CommandTerm):
         sampled_times = self.motion_lib.sample_time_steps(
             self.motion_ids[env_ids], truncate_time=None
         )
-        if self.cfg.sample_from_n_initial_frames is not None:
+        if self.cfg.fixed_start_frame is not None:
+            sampled_times.fill_(self.cfg.fixed_start_frame)
+        elif self.cfg.sample_from_n_initial_frames is not None:
             # Sample uniformly from first N frames
             n_frames = self.cfg.sample_from_n_initial_frames
             sampled_times = torch.randint(
@@ -3139,7 +3141,9 @@ class TrackingCommand(CommandTerm):
             self.motion_ids[env_ids], truncate_time=None
         )
 
-        if self.cfg.sample_from_n_initial_frames is not None:
+        if self.cfg.fixed_start_frame is not None:
+            sampled_times.fill_(self.cfg.fixed_start_frame)
+        elif self.cfg.sample_from_n_initial_frames is not None:
             n_frames = self.cfg.sample_from_n_initial_frames
             sampled_times = torch.randint(
                 0, n_frames, (len(env_ids),), dtype=sampled_times.dtype, device=self.device
@@ -3147,7 +3151,11 @@ class TrackingCommand(CommandTerm):
         elif self.cfg.start_from_first_frame:
             sampled_times.zero_()
 
-        if self.cfg.sample_before_contact and self._first_contact_frame is not None:
+        if (
+            self.cfg.fixed_start_frame is None
+            and self.cfg.sample_before_contact
+            and self._first_contact_frame is not None
+        ):
             sampled_times = self._sample_before_contact(env_ids, sampled_times)
 
         return sampled_times
@@ -3192,13 +3200,21 @@ class TrackingCommand(CommandTerm):
                     ) + self._n_terrain_motions
                     self.motion_ids[flat_envs] = flat_sequential
                 # Terrain envs: keep fixed motion_id (bound at init)
-                self.motion_start_time_steps[env_ids] = 0
+                self.motion_start_time_steps[env_ids] = (
+                    self.cfg.fixed_start_frame
+                    if self.cfg.fixed_start_frame is not None
+                    else 0
+                )
             elif self.is_evaluating:
                 self.motion_ids[env_ids] = (
                     torch.arange(self.num_envs).to(self.device)
                     % self.motion_lib._num_motions  # noqa: SLF001
                 )[env_ids]
-                self.motion_start_time_steps[env_ids] = 0
+                self.motion_start_time_steps[env_ids] = (
+                    self.cfg.fixed_start_frame
+                    if self.cfg.fixed_start_frame is not None
+                    else 0
+                )
             elif self.cfg.use_paired_motions:
                 self.motion_ids[env_ids] = (
                     torch.arange(self.num_envs).to(self.device)
@@ -3283,7 +3299,9 @@ class TrackingCommand(CommandTerm):
                     )
 
                 # Override to sample from initial frames if configured
-                if self.cfg.sample_from_n_initial_frames is not None:
+                if self.cfg.fixed_start_frame is not None:
+                    sampled_times.fill_(self.cfg.fixed_start_frame)
+                elif self.cfg.sample_from_n_initial_frames is not None:
                     # Sample uniformly from first N frames
                     n_frames = self.cfg.sample_from_n_initial_frames
                     sampled_times = torch.randint(
@@ -3293,7 +3311,11 @@ class TrackingCommand(CommandTerm):
                     sampled_times.zero_()
 
                 # Contact-based initialization: sample timestamps before first contact frame
-                if self.cfg.sample_before_contact and self._first_contact_frame is not None:
+                if (
+                    self.cfg.fixed_start_frame is None
+                    and self.cfg.sample_before_contact
+                    and self._first_contact_frame is not None
+                ):
                     sampled_times = self._sample_before_contact(env_ids, sampled_times)
 
                 self.motion_start_time_steps[env_ids] = sampled_times
@@ -4627,13 +4649,18 @@ class TrackingCommandCfg(CommandTermCfg):
     # Useful for debugging and replaying specific motions from the beginning
     start_from_first_frame: bool = False
 
+    # Start every motion from this exact motion-lib frame. When set, this takes
+    # precedence over start_from_first_frame and all randomized start sampling.
+    fixed_start_frame: int = None
+
     # Sample each motion at most once (no duplicates across environments)
     # Requires num_envs <= num_available_motions, otherwise will error
     # Useful for replay/evaluation to ensure coverage of all unique motions
     sample_unique_motions: bool = False
 
     # Sample from the first N frames of the motion (random uniform in [0, N-1])
-    # If set, this takes precedence over start_from_first_frame
+    # Ignored when fixed_start_frame is set; otherwise takes precedence over
+    # start_from_first_frame.
     # Useful for adding slight variation while still starting near the beginning
     sample_from_n_initial_frames: int = None
 

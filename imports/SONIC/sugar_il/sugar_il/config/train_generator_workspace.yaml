@@ -70,30 +70,43 @@ val_dataloader:
   pin_memory: True
   persistent_workers: True
 
-optimizer:
-  lr: 2e-4
+[optimizer:
+  # Kept as an interpolation so the learning rate can be overridden with
+  # ``lr=...`` directly from the Hydra command line.
+  lr: ${lr}
   weight_decay: 1e-4
   betas: [0.95, 0.999]
 
+# Peak learning rate before the cosine schedule starts decaying. This is not a
+# minimum: with the cosine scheduler the final learning rate approaches zero.
+lr: 2e-4
+
 training:
   device: "cuda:0"
+  # Accelerate accepts "no", "fp16", or "bf16". FP16 supports the target
+  # Quadro RTX 6000 (Turing); Ampere-or-newer systems may override with bf16.
+  mixed_precision: "fp16"
   seed: 42
   # start_ckpt_path requires resume=True and a complete training checkpoint.
   resume: False
   # optimization
   lr_scheduler: cosine
-  lr_warmup_steps: 4000
+  lr_warmup_steps: 7000
   # Optional schedule horizon, measured using the first run's batches per epoch.
   scheduler_num_epochs: null
   num_epochs: ${num_epochs}
   gradient_accumulate_every: 2
   # The generator uses LayerNorm/RMSNorm only, so EMA is safe here.
-  use_ema: True
+  use_ema: False
   # training loop control
   # in epochs
   rollout_every: 10
   checkpoint_every: 1
   val_every: 10000
+  # Number of evenly spaced validation runs in each validation epoch.
+  # For example, val_every=1 and val_checks_per_epoch=4 validates at
+  # 25%, 50%, 75%, and 100% of every epoch.
+  val_checks_per_epoch: 4
   save_loss_curve: True
   loss_curve_every: 1
   sample_every: 10
