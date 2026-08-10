@@ -3,8 +3,8 @@
 rsync -aP --checksum \
   --no-owner --no-group --omit-dir-times \
   -e "ssh -p 9991 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
-  /home/tide/robot/GRAIL/imports/SONIC/ \
-  ygc@202.120.37.249:/home/ygc/data0/GRAIL/imports/SONIC/
+  /home/tide/robot/GRAIL/grail/ \
+  ygc@202.120.37.249:/home/ygc/data0/GRAIL/grail/
 
 rsync -aP --checksum \
   --no-owner --no-group --omit-dir-times \

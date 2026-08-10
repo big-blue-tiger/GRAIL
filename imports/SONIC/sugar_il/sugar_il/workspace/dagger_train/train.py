@@ -7,7 +7,9 @@ import argparse
 from collections import Counter
 from contextlib import nullcontext
 import copy
+import csv
 import gc
+import json
 import math
 import os
 from pathlib import Path
@@ -20,6 +22,8 @@ import dill
 import numpy as np
 import torch
 import tqdm
+
+from sugar_il.workspace.dagger_train.diagnostics import CudaDiagnostics
 
 
 def _parser(app_launcher_cls) -> argparse.ArgumentParser:
@@ -133,6 +137,100 @@ def _flow_stage_done(label: str, started: float) -> None:
     )
 
 
+def _load_metric_history(log_path: Path) -> dict[int, dict[str, float]]:
+    """Load the latest curve values for each iteration from the JSON log."""
+    history: dict[int, dict[str, float]] = {}
+    if not log_path.is_file():
+        return history
+    with log_path.open() as file:
+        for line in file:
+            try:
+                record = json.loads(line)
+                iteration = int(record["iteration"])
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+            values = {}
+            for key in (
+                "train_loss",
+                "success_rate",
+                "time_out_rate",
+                "flowmatching_mean_episode_duration",
+            ):
+                value = record.get(key)
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    values[key] = float(value)
+            if values:
+                # A resumed/appended log can contain the same iteration more than
+                # once. Keep the newest value for a clean iteration x-axis.
+                history[iteration] = values
+    return history
+
+
+def _save_dagger_curves(output_dir: Path) -> None:
+    """Save DAgger metrics as a CSV and three iteration-indexed PNG curves."""
+    history = _load_metric_history(output_dir / "logs.json.txt")
+    if not history:
+        return
+
+    rows = [(iteration, history[iteration]) for iteration in sorted(history)]
+    csv_path = output_dir / "dagger_curves.csv"
+    with csv_path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            (
+                "iteration",
+                "train_loss",
+                "success_rate",
+                "flowmatching_mean_episode_duration",
+            )
+        )
+        for iteration, values in rows:
+            writer.writerow(
+                (
+                    iteration,
+                    values.get("train_loss", ""),
+                    values.get("success_rate", values.get("time_out_rate", "")),
+                    values.get("flowmatching_mean_episode_duration", ""),
+                )
+            )
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    curves = (
+        ("train_loss", "Loss", "DAgger Loss", "loss_curve.png"),
+        ("success_rate", "Success rate", "Overall Policy Success Rate", "success_rate_curve.png"),
+        (
+            "flowmatching_mean_episode_duration",
+            "Average duration (s)",
+            "Flowmatching Policy Average Duration",
+            "flowmatching_duration_curve.png",
+        ),
+    )
+    for key, ylabel, title, filename in curves:
+        points = []
+        for iteration, values in rows:
+            value = values.get(key)
+            if value is None and key == "success_rate":
+                value = values.get("time_out_rate")
+            if value is not None:
+                points.append((iteration, value))
+        if not points:
+            continue
+        x_values, y_values = zip(*points, strict=True)
+        figure, axis = plt.subplots(figsize=(9, 5))
+        axis.plot(x_values, y_values, marker="o", markersize=3, linewidth=1.5)
+        axis.set_xlabel("Iteration")
+        axis.set_ylabel(ylabel)
+        axis.set_title(title)
+        axis.grid(True, alpha=0.3)
+        figure.tight_layout()
+        figure.savefig(output_dir / filename, dpi=160)
+        plt.close(figure)
+
+
 def _create_accelerator(cfg):
     """Create the one accelerator before Isaac Sim initializes its CUDA context."""
     from accelerate import Accelerator
@@ -192,7 +290,16 @@ def _check_render_state(env) -> None:
 
 
 class DaggerTrainer:
-    def __init__(self, cfg, env, teacher, simulation_app, initial_obs, accelerator) -> None:
+    def __init__(
+        self,
+        cfg,
+        env,
+        teacher,
+        simulation_app,
+        initial_obs,
+        accelerator,
+        diagnostics,
+    ) -> None:
         import hydra
 
         from sugar_il.model.common.lr_scheduler import get_scheduler
@@ -206,6 +313,7 @@ class DaggerTrainer:
         if accelerator.num_processes != 1:
             raise RuntimeError("Online DAgger currently supports one GPU only")
         self.accelerator = accelerator
+        self.diagnostics = diagnostics
 
         started = _flow_stage_start("loading checkpoint on CPU")
         self.payload = torch.load(
@@ -257,6 +365,18 @@ class DaggerTrainer:
         )
         self.optimizer.load_state_dict(states["optimizer"])
         self.scheduler.load_state_dict(states["lr_scheduler"])
+        self.fixed_learning_rate = cfg.training.learning_rate
+        if self.fixed_learning_rate is not None:
+            self.fixed_learning_rate = float(self.fixed_learning_rate)
+            if self.fixed_learning_rate <= 0:
+                raise ValueError("training.learning_rate must be positive")
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.fixed_learning_rate
+                param_group["initial_lr"] = self.fixed_learning_rate
+            print(
+                f"[dagger] using fixed learning rate: {self.fixed_learning_rate:.6g}",
+                flush=True,
+            )
         _flow_stage_done("optimizer and scheduler restored on CPU", started)
 
         started = _flow_stage_start("preparing flow model and optimizer on CUDA")
@@ -352,22 +472,29 @@ class DaggerTrainer:
         )
         self.batch_size = cfg.training.batch_size or int(self.flow_cfg.dataloader.batch_size)
         _flow_stage_done("rollout storage allocated", started)
+        self.diagnostics.snapshot(f"iteration_{self.iteration:06d}_initialized")
 
     def _reset(self) -> dict[str, torch.Tensor]:
         print("[dagger] resetting environments for a new rollout", flush=True)
         started = time.monotonic()
-        obs = self.env.reset_all()
+        with self.diagnostics.phase("reset"):
+            obs = self.env.reset_all()
         print(
             f"[dagger] rollout reset complete in {time.monotonic() - started:.1f}s",
             flush=True,
         )
         starts = self.env.motion_command.motion_start_time_steps
-        if torch.any(starts != 0):
-            raise RuntimeError("Every DAgger episode must start from motion frame zero")
-        return {key: value.to(self.accelerator.device) for key, value in obs.items()}
+        expected_start = int(self.cfg.environment.start_frame)
+        if torch.any(starts != expected_start):
+            raise RuntimeError(
+                f"Every DAgger episode must start from motion frame {expected_start}"
+            )
+        result = {key: value.to(self.accelerator.device) for key, value in obs.items()}
+        self.diagnostics.snapshot(f"iteration_{self.iteration + 1:06d}_reset")
+        return result
 
     def _load_motion_batch(self, batch_index: int) -> dict[str, torch.Tensor]:
-        """Load one sequential motion batch and reset it at frame zero."""
+        """Load one sequential motion batch and reset it at the configured start frame."""
         start_idx = batch_index * self.env.num_envs
         end_idx = min(start_idx + self.env.num_envs, self.num_unique_motions)
         print(
@@ -387,37 +514,68 @@ class DaggerTrainer:
         # concatenate every observation before trimming max_rollout_history,
         # which is prohibitively expensive for many parallel environments.
         trace = getattr(self, "_phase_trace", False)
-        if trace:
-            print("[dagger] teacher: init_rollout start", flush=True)
-        self.teacher.init_rollout()
-        if trace:
-            print("[dagger] teacher: init_rollout complete", flush=True)
-            print("[dagger] teacher: policy rollout start", flush=True)
-        self.teacher.rollout(obs_dict=obs_dict)
-        if trace:
-            print("[dagger] teacher: policy rollout complete", flush=True)
-        residual = self.teacher.action_mean[:, :64].detach()
+        collection_mode = self.diagnostics.collection_mode
+        if collection_mode == "environment_only":
+            actor_obs = obs_dict["actor_obs"]
+            batch_size = actor_obs.shape[0]
+            return (
+                torch.zeros(batch_size, 64, device=actor_obs.device, dtype=actor_obs.dtype),
+                torch.zeros(batch_size, 2, device=actor_obs.device, dtype=actor_obs.dtype),
+            )
+        if collection_mode == "atm_only":
+            actor_obs = obs_dict["actor_obs"]
+            with self.diagnostics.phase("rollout/teacher_skipped"):
+                residual = torch.zeros(
+                    actor_obs.shape[0], 64, device=actor_obs.device, dtype=actor_obs.dtype
+                )
+        else:
+            if trace:
+                print("[dagger] teacher: init_rollout start", flush=True)
+            with self.diagnostics.phase("rollout/teacher_init"):
+                self.teacher.init_rollout()
+            if trace:
+                print("[dagger] teacher: init_rollout complete", flush=True)
+                print("[dagger] teacher: policy rollout start", flush=True)
+            with self.diagnostics.phase("rollout/teacher_policy"):
+                self.teacher.rollout(obs_dict=obs_dict)
+            if trace:
+                print("[dagger] teacher: policy rollout complete", flush=True)
+            with self.diagnostics.phase("rollout/teacher_action_mean"):
+                residual = self.teacher.action_mean[:, :64].detach()
+        if collection_mode == "teacher_only":
+            with self.diagnostics.phase("rollout/teacher_latent_passthrough"):
+                latent = residual
+            left = self.env.motion_command.get_hand_action("left_hand")
+            right = self.env.motion_command.get_hand_action("right_hand")
+            if left is None or right is None:
+                raise ValueError("Reference motion is missing hand actions")
+            hand = (torch.stack((left, right), dim=-1) >= 0).to(latent.dtype)
+            return latent, hand
         scale = float(self.env._latent_residual_scale)  # noqa: SLF001
         mode = self.env._latent_residual_mode  # noqa: SLF001
         if mode != "pre_quantization" or abs(scale - 0.1) > 1e-8:
             raise ValueError("Teacher requires pre_quantization residual scale 0.1")
-        atm_obs = self.env._prepare_obs_for_action_transform_module(obs_dict)  # noqa: SLF001
+        with self.diagnostics.phase("rollout/prepare_atm_observation"):
+            atm_obs = self.env._prepare_obs_for_action_transform_module(obs_dict)  # noqa: SLF001
         if trace:
             print("[dagger] teacher: ATM forward start", flush=True)
-        self.env.action_transform_module(
-            atm_obs,
-            latent_residual=residual * scale,
-            latent_residual_mode="pre_quantization",
-        )
+        with self.diagnostics.phase("rollout/atm_forward"):
+            self.env.action_transform_module(
+                atm_obs,
+                latent_residual=(torch.zeros_like(residual) if collection_mode == "atm_only" else residual * scale),
+                latent_residual_mode="pre_quantization",
+            )
         if trace:
             print("[dagger] teacher: ATM forward complete", flush=True)
-        latent = _last(
-            self.env.action_transform_module.actor_module._last_pre_quantization_latent_flat  # noqa: SLF001
-        ).detach()
+        with self.diagnostics.phase("rollout/latent_extraction"):
+            latent = _last(
+                self.env.action_transform_module.actor_module._last_pre_quantization_latent_flat  # noqa: SLF001
+            ).detach()
         if trace:
             print("[dagger] teacher: latent extraction complete", flush=True)
-        left = self.env.motion_command.get_hand_action("left_hand")
-        right = self.env.motion_command.get_hand_action("right_hand")
+        with self.diagnostics.phase("rollout/hand_target_extraction"):
+            left = self.env.motion_command.get_hand_action("left_hand")
+            right = self.env.motion_command.get_hand_action("right_hand")
         if left is None or right is None:
             raise ValueError("Reference motion is missing hand actions")
         hand = (torch.stack((left, right), dim=-1) >= 0).to(latent.dtype)
@@ -445,12 +603,18 @@ class DaggerTrainer:
         self.storage.clear()
         active = torch.ones(self.env.num_envs, dtype=torch.bool, device=device)
         active_count = self.env.num_envs
-        teacher_execution = _teacher_mask(
-            self.env.num_envs, self.cfg.training.teacher_ratio, device
-        )
+        if self.diagnostics.collection_mode in {"teacher_only", "atm_only"}:
+            teacher_execution = torch.ones(self.env.num_envs, dtype=torch.bool, device=device)
+        elif self.diagnostics.collection_mode == "environment_only":
+            teacher_execution = torch.zeros(self.env.num_envs, dtype=torch.bool, device=device)
+        else:
+            teacher_execution = _teacher_mask(
+                self.env.num_envs, self.cfg.training.teacher_ratio, device
+            )
         episode_starts = active.clone()
         reasons: Counter[str] = Counter()
         time_out_count = 0
+        successes = torch.zeros(self.env.num_envs, dtype=torch.bool, device=device)
         lengths = torch.zeros(self.env.num_envs, dtype=torch.long, device=device)
         horizon = self.cfg.rollout.horizon
         execution_horizon = self.cfg.rollout.execution_horizon
@@ -496,13 +660,14 @@ class DaggerTrainer:
                     "building generator observation",
                     flush=True,
                 )
-            generator_obs = generator_observation(
-                self.env,
-                wrapper,
-                obs_dict,
-                self.hand_frame_cfg,
-                self.hand_transform_fn,
-            )
+            with self.diagnostics.phase("rollout/generator_observation"):
+                generator_obs = generator_observation(
+                    self.env,
+                    wrapper,
+                    obs_dict,
+                    self.hand_frame_cfg,
+                    self.hand_transform_fn,
+                )
             trace_phase("generator observation complete")
             trace_phase("teacher targets start")
             if trace_step:
@@ -512,7 +677,12 @@ class DaggerTrainer:
                 )
             teacher_latent, teacher_hand = self._teacher_targets(obs_dict)
             trace_phase("teacher targets complete")
-            refresh = active & ~teacher_execution & (plan_cursor >= execution_horizon)
+            refresh = (
+                active
+                & ~teacher_execution
+                & (plan_cursor >= execution_horizon)
+                & (self.diagnostics.collection_mode != "environment_only")
+            )
             if refresh.any():
                 ids = refresh.nonzero(as_tuple=True)[0]
                 if trace_step:
@@ -522,9 +692,10 @@ class DaggerTrainer:
                         flush=True,
                     )
                 trace_phase(f"student prediction start ({len(ids)} envs)")
-                prediction = rollout_model.predict_action(
-                    {key: value[ids] for key, value in generator_obs.items()}
-                )
+                with self.diagnostics.phase("rollout/student_prediction"):
+                    prediction = rollout_model.predict_action(
+                        {key: value[ids] for key, value in generator_obs.items()}
+                    )
                 trace_phase("student prediction complete")
                 plan_latent[ids] = prediction["latent"]
                 plan_hand[ids] = prediction["hand_primitive"]
@@ -546,23 +717,30 @@ class DaggerTrainer:
                     flush=True,
                 )
             trace_phase("environment step start")
-            next_obs, _, dones, infos = self.env.step(
-                {"actions": action, "obs_dict": obs_dict, "action_mode": "direct_latent"}
-            )
+            with self.diagnostics.phase("rollout/environment_step"):
+                # DAgger collection is inference-only.  The direct-latent ATM
+                # decoder has trainable parameters, so without this boundary
+                # env.step() builds a fresh autograd graph on every simulator
+                # step and the wrapper/physics action state can retain it.
+                with torch.no_grad():
+                    next_obs, _, dones, infos = self.env.step(
+                        {"actions": action, "obs_dict": obs_dict, "action_mode": "direct_latent"}
+                    )
             trace_phase("environment step complete")
             dones = dones.reshape(-1).bool().to(device)
             time_outs = infos["time_outs"].reshape(-1).bool().to(device)
             trace_phase("storage append start")
-            self.storage.append(
-                generator_obs,
-                teacher_latent,
-                teacher_hand,
-                active,
-                dones & active,
-                time_outs & active,
-                episode_starts,
-                teacher_execution,
-            )
+            with self.diagnostics.phase("rollout/storage_append"):
+                self.storage.append(
+                    generator_obs,
+                    teacher_latent,
+                    teacher_hand,
+                    active,
+                    dones & active,
+                    time_outs & active,
+                    episode_starts,
+                    teacher_execution,
+                )
             trace_phase("storage append complete")
             if trace_step:
                 print(
@@ -575,18 +753,21 @@ class DaggerTrainer:
                 # complete rollout took longer than the timeout.
                 faulthandler.cancel_dump_traceback_later()
                 faulthandler.dump_traceback_later(stall_trace_seconds, repeat=True)
-            lengths += active.long()
-            finished = dones & active
-            finished_ids = finished.nonzero(as_tuple=True)[0].tolist()
-            for env_id in finished_ids:
-                term_reasons = _termination_reasons(self.env.env, env_id)
-                reasons.update(term_reasons or ("unknown",))
-            time_out_count += int((finished & time_outs).sum().item())
-            active_count -= len(finished_ids)
-            active &= ~finished
-            trace_phase("done processing complete")
-            episode_starts.zero_()
-            obs_dict = {key: value.to(device) for key, value in next_obs.items()}
+            with self.diagnostics.phase("rollout/done_processing"):
+                lengths += active.long()
+                finished = dones & active
+                finished_ids = finished.nonzero(as_tuple=True)[0].tolist()
+                for env_id in finished_ids:
+                    term_reasons = _termination_reasons(self.env.env, env_id)
+                    reasons.update(term_reasons or ("unknown",))
+                finished_successes = finished & time_outs
+                successes |= finished_successes
+                time_out_count += int(finished_successes.sum().item())
+                active_count -= len(finished_ids)
+                active &= ~finished
+                trace_phase("done processing complete")
+                episode_starts.zero_()
+                obs_dict = {key: value.to(device) for key, value in next_obs.items()}
             if self.storage.step % progress_every == 0 or active_count == 0:
                 elapsed = time.monotonic() - started_at
                 print(
@@ -619,6 +800,7 @@ class DaggerTrainer:
             if stall_trace_seconds > 0:
                 faulthandler.cancel_dump_traceback_later()
             return None
+        self._safe_teacher_cleanup()
         counts_started = time.monotonic()
         total, teacher_windows, student_windows = self.storage.window_counts()
         print(
@@ -628,11 +810,20 @@ class DaggerTrainer:
         )
         if stall_trace_seconds > 0:
             faulthandler.cancel_dump_traceback_later()
+        student_mask = ~teacher_execution
+        student_count = int(student_mask.sum().item())
+        flowmatching_mean_duration = (
+            float(lengths[student_mask].float().mean().item())
+            / float(self.cfg.rollout.control_fps)
+            if student_count
+            else 0.0
+        )
         print(
             f"[dagger] rollout complete: windows={total}, "
             f"teacher_windows={teacher_windows}, student_windows={student_windows}",
             flush=True,
         )
+        self.diagnostics.snapshot(f"iteration_{self.iteration + 1:06d}_rollout")
         return {
             "windows": total,
             "teacher_windows": teacher_windows,
@@ -640,24 +831,60 @@ class DaggerTrainer:
             "teacher_ratio": float(teacher_execution.float().mean().item()),
             "mean_episode_length": float(lengths.float().mean().item()),
             "time_out_rate": time_out_count / self.env.num_envs,
+            # Evaluation success means reaching the motion timeout without an
+            # early termination. Keep this explicit for plotting and JSON logs.
+            "success_rate": float(successes.float().mean().item()),
             "early_termination_rate": 1 - time_out_count / self.env.num_envs,
+            "flowmatching_mean_episode_duration": flowmatching_mean_duration,
             "termination_reasons": dict(reasons),
         }
 
+    def _safe_teacher_cleanup(self) -> None:
+        """Optionally release teacher/ATM inference state after a CUDA barrier."""
+        if not self.diagnostics.safe_teacher_cleanup:
+            return
+        with self.diagnostics.phase("rollout/teacher_cleanup", synchronize=True):
+            clear_rollout = getattr(self.teacher, "clear_rollout", None)
+            if clear_rollout is not None:
+                clear_rollout()
+            actor_module = getattr(
+                getattr(self.env, "action_transform_module", None), "actor_module", None
+            )
+            for name in (
+                "_last_pre_quantization_latent_flat",
+                "_last_full_latent_flat",
+                "_last_encoded_tokens",
+                "_last_encoded_latents",
+            ):
+                if actor_module is not None and hasattr(actor_module, name):
+                    setattr(actor_module, name, None)
+        with self.diagnostics.phase("rollout/teacher_cleanup_gc"):
+            gc.collect()
+        if torch.cuda.is_available():
+            with self.diagnostics.phase("rollout/teacher_cleanup_empty_cache"):
+                torch.cuda.empty_cache()
+        print(
+            f"[dagger] optional teacher cleanup complete ({_cuda_status()})",
+            flush=True,
+        )
+
     def train_latest(self) -> dict[str, float]:
-        total, _, _ = self.storage.window_counts()
+        with self.diagnostics.phase("train/window_counts"):
+            total, _, _ = self.storage.window_counts()
         if not total:
             raise RuntimeError("Latest rollout contains no valid 40-step training windows")
         # Rollout inference leaves temporary CUDA blocks in the caching
         # allocator. Release those before allocating activations and gradients.
-        gc.collect()
+        with self.diagnostics.phase("train/gc_collect"):
+            gc.collect()
         if torch.cuda.is_available():
             cache_started = time.monotonic()
             print(
                 f"[dagger] training cache clear starting ({_cuda_status()})",
                 flush=True,
             )
-            torch.cuda.empty_cache()
+            with self.diagnostics.phase("train/empty_cache"):
+                torch.cuda.empty_cache()
             print(
                 f"[dagger] training cache clear complete in "
                 f"{time.monotonic() - cache_started:.3f}s ({_cuda_status()})",
@@ -666,7 +893,8 @@ class DaggerTrainer:
         model = self.model
         model.train()
         normalization_started = time.monotonic()
-        self.storage.normalize_(self.accelerator.unwrap_model(model).normalizer)
+        with self.diagnostics.phase("train/storage_normalize"):
+            self.storage.normalize_(self.accelerator.unwrap_model(model).normalizer)
         normalization_seconds = time.monotonic() - normalization_started
         accumulation = int(self.flow_cfg.training.gradient_accumulate_every)
         epochs = self.cfg.training.epochs_per_rollout
@@ -687,10 +915,12 @@ class DaggerTrainer:
         )
         training_started_at = time.monotonic()
         sums = Counter()
-        self.optimizer.zero_grad()
+        with self.diagnostics.phase("train/zero_grad_initial"):
+            self.optimizer.zero_grad()
         if stall_trace_seconds > 0:
             faulthandler.dump_traceback_later(stall_trace_seconds, repeat=True)
-        batches = self.storage.batches(self.batch_size, epochs)
+        with self.diagnostics.phase("train/batch_iterator_create"):
+            batches = self.storage.batches(self.batch_size, epochs)
         with tqdm.tqdm(
             batches,
             total=num_batches,
@@ -732,9 +962,27 @@ class DaggerTrainer:
                         f"(sync={should_step}, group={group_size}; {_cuda_status()})",
                         flush=True,
                     )
+                if batch_idx == 1:
+                    self.diagnostics.snapshot(
+                        f"iteration_{self.iteration + 1:06d}_train_batch_2_forward"
+                    )
                 with sync_context:
-                    losses = model(batch, training=True, normalized=True)
-                    self.accelerator.backward(losses["loss"] / group_size)
+                    with self.diagnostics.phase("train/model_forward"):
+                        losses = model(batch, training=True, normalized=True)
+                    if trace_batch:
+                        loss_status = ", ".join(
+                            f"{key}=shape{tuple(value.shape)}/dtype={value.dtype}/device={value.device}"
+                            for key, value in losses.items()
+                            if isinstance(value, torch.Tensor)
+                        )
+                        print(
+                            f"[dagger] train batch={batch_idx + 1}: loss metadata "
+                            f"({loss_status})",
+                            flush=True,
+                        )
+                    if not self.diagnostics.forward_only:
+                        with self.diagnostics.phase("train/backward"):
+                            self.accelerator.backward(losses["loss"] / group_size)
                 if trace_batch:
                     print(
                         f"[dagger] train batch={batch_idx + 1}: forward/backward complete "
@@ -742,29 +990,39 @@ class DaggerTrainer:
                         flush=True,
                     )
 
-                if should_step:
+                if should_step and not self.diagnostics.forward_only and not self.diagnostics.disable_optimizer:
                     if trace_batch:
                         print(
                             f"[dagger] train batch={batch_idx + 1}: optimizer step start "
                             f"({_cuda_status()})",
                             flush=True,
                         )
-                    self.accelerator.clip_grad_norm_(model.parameters(), 0.5)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    self.scheduler.step()
+                    with self.diagnostics.phase("train/clip_grad_norm"):
+                        self.accelerator.clip_grad_norm_(model.parameters(), 0.5)
+                    with self.diagnostics.phase("train/optimizer_step"):
+                        self.optimizer.step()
+                    with self.diagnostics.phase("train/zero_grad"):
+                        self.optimizer.zero_grad()
+                    if self.fixed_learning_rate is None:
+                        with self.diagnostics.phase("train/scheduler_step"):
+                            self.scheduler.step()
                     if self.ema is not None:
-                        self.ema.step(self.accelerator.unwrap_model(model))
+                        with self.diagnostics.phase("train/ema_step"):
+                            self.ema.step(self.accelerator.unwrap_model(model))
                     if trace_batch:
                         print(
                             f"[dagger] train batch={batch_idx + 1}: optimizer step complete "
                             f"({_cuda_status()})",
                             flush=True,
                         )
-                loss_values = {
-                    key: float(losses[key].detach().item())
-                    for key in ("loss", "flow_loss", "hand_loss")
-                }
+                elif should_step and self.diagnostics.disable_optimizer:
+                    with self.diagnostics.phase("train/zero_grad_disabled_optimizer"):
+                        self.optimizer.zero_grad()
+                with self.diagnostics.phase("train/loss_item"):
+                    loss_values = {
+                        key: float(losses[key].detach().item())
+                        for key in ("loss", "flow_loss", "hand_loss")
+                    }
                 for key, value in loss_values.items():
                     sums[key] += value
                 if trace_batch:
@@ -774,7 +1032,9 @@ class DaggerTrainer:
                         flush=True,
                     )
                 # Release model outputs before the next CUDA forward pass.
-                del losses
+                with self.diagnostics.phase("train/batch_release"):
+                    del losses
+                    del batch
                 self.global_step += 1
                 completed = batch_idx + 1
                 if completed == 1 or completed % progress_every == 0 or is_last:
@@ -794,6 +1054,7 @@ class DaggerTrainer:
                     faulthandler.dump_traceback_later(stall_trace_seconds, repeat=True)
         if stall_trace_seconds > 0:
             faulthandler.cancel_dump_traceback_later()
+        self.diagnostics.snapshot(f"iteration_{self.iteration + 1:06d}_train")
         return {
             "train_loss": sums["loss"] / num_batches,
             "train_flow_loss": sums["flow_loss"] / num_batches,
@@ -803,13 +1064,28 @@ class DaggerTrainer:
 
     def save(self, tag: str = "latest") -> Path:
         model = self.accelerator.unwrap_model(self.model)
-        state_dicts = {
-            "model": _copy_cpu(model.state_dict()),
-            "optimizer": _copy_cpu(self.optimizer.state_dict()),
-            "lr_scheduler": _copy_cpu(self.scheduler.state_dict()),
-        }
-        if self.ema_model is not None:
-            state_dicts["ema_model"] = _copy_cpu(self.ema_model.state_dict())
+        with self.diagnostics.phase("save/state_dict"):
+            with self.diagnostics.phase("save/model_state_dict"):
+                model_state = model.state_dict()
+            with self.diagnostics.phase("save/model_cpu_copy"):
+                state_dicts = {"model": _copy_cpu(model_state)}
+            del model_state
+            with self.diagnostics.phase("save/optimizer_state_dict"):
+                optimizer_state = self.optimizer.state_dict()
+            with self.diagnostics.phase("save/optimizer_cpu_copy"):
+                state_dicts["optimizer"] = _copy_cpu(optimizer_state)
+            del optimizer_state
+            with self.diagnostics.phase("save/scheduler_state_dict"):
+                scheduler_state = self.scheduler.state_dict()
+            with self.diagnostics.phase("save/scheduler_cpu_copy"):
+                state_dicts["lr_scheduler"] = _copy_cpu(scheduler_state)
+            del scheduler_state
+            if self.ema_model is not None:
+                with self.diagnostics.phase("save/ema_state_dict"):
+                    ema_state = self.ema_model.state_dict()
+                with self.diagnostics.phase("save/ema_cpu_copy"):
+                    state_dicts["ema_model"] = _copy_cpu(ema_state)
+                del ema_state
         dagger_state = {"iteration": self.iteration, "runtime": self.runtime}
         pickles = {
             "global_step": dill.dumps(self.global_step),
@@ -823,8 +1099,11 @@ class DaggerTrainer:
         path = self.output_dir / "checkpoints" / f"{tag}.ckpt"
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
-        torch.save(payload, temporary, pickle_module=dill)
-        os.replace(temporary, path)
+        with self.diagnostics.phase("save/torch_save"):
+            torch.save(payload, temporary, pickle_module=dill)
+        with self.diagnostics.phase("save/replace"):
+            os.replace(temporary, path)
+        self.diagnostics.snapshot(f"iteration_{self.iteration:06d}_save_{tag}")
         return path
 
     def run(self) -> None:
@@ -834,6 +1113,9 @@ class DaggerTrainer:
             for _ in range(self.cfg.training.iterations):
                 rollout = self.collect()
                 if rollout is None:
+                    break
+                if self.diagnostics.collect_only:
+                    print("[dagger] collect-only diagnostic completed", flush=True)
                     break
                 train = self.train_latest()
                 self.iteration += 1
@@ -845,21 +1127,27 @@ class DaggerTrainer:
                 }
                 for reason, count in rollout["termination_reasons"].items():
                     log[f"termination/{reason}"] = count
-                logger.log(log)
-                self.accelerator.log(log, step=self.global_step)
+                with self.diagnostics.phase("iteration/json_log"):
+                    logger.log(log)
+                    _save_dagger_curves(self.output_dir)
+                with self.diagnostics.phase("iteration/tensorboard_log"):
+                    self.accelerator.log(log, step=self.global_step)
                 print(
                     f"Iteration {self.iteration}: windows={rollout['windows']}, "
                     f"loss={train['train_loss']:.6f}, timeout={rollout['time_out_rate']:.1%}"
                 )
-                print("[dagger] checkpoint save latest starting", flush=True)
-                self.save()
-                print("[dagger] checkpoint save latest complete", flush=True)
-                if self.iteration % self.cfg.checkpoint.every == 0:
+                if not self.diagnostics.skip_checkpoint:
+                    print("[dagger] checkpoint save latest starting", flush=True)
+                    with self.diagnostics.phase("iteration/save_latest"):
+                        self.save()
+                    print("[dagger] checkpoint save latest complete", flush=True)
+                if not self.diagnostics.skip_checkpoint and self.iteration % self.cfg.checkpoint.every == 0:
                     print(
                         f"[dagger] checkpoint save iteration_{self.iteration:06d} starting",
                         flush=True,
                     )
-                    self.save(f"iteration_{self.iteration:06d}")
+                    with self.diagnostics.phase("iteration/save_periodic"):
+                        self.save(f"iteration_{self.iteration:06d}")
                     print(
                         f"[dagger] checkpoint save iteration_{self.iteration:06d} complete",
                         flush=True,
@@ -954,6 +1242,8 @@ def main() -> None:
     os.environ["ENABLE_CAMERAS"] = "0"
 
     accelerator = _create_accelerator(cfg)
+    diagnostics = CudaDiagnostics(cfg.get("diagnostics", {}), Path(cfg.paths.output_dir))
+    diagnostics.start_memory_history()
     from gear_sonic.utils.common import seeding
 
     seeding(cfg.seed)
@@ -978,6 +1268,7 @@ def main() -> None:
         import omni.timeline
 
         timeline = omni.timeline.get_timeline_interface()
+        diagnostics.timeline = timeline
 
         def extend_timeline() -> None:
             timeline.set_looping(False)
@@ -1017,6 +1308,7 @@ def main() -> None:
                 launcher.app,
                 initial_obs,
                 accelerator,
+                diagnostics,
             )
         finally:
             if startup_trace_seconds > 0:

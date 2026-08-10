@@ -1,26 +1,17 @@
 # Online DAgger
 
-All DAgger-specific parameters live in `config.yaml`. The optimizer, learning-rate
-scheduler, model, normalizer, gradient accumulation, and EMA settings are restored
-from the flow checkpoint so resume cannot silently change its training semantics.
-
-Set the three required paths in a copied YAML config and run:
-
 ```bash
+conda activate grail
 python -m sugar_il.workspace.dagger_train.train \
-  --config sugar_il/sugar_il/workspace/dagger_train/config.yaml \
-  paths.input=/home/tide/robot/sbto/datas/sbto_to_grail/pickup_table/robot \
-  paths.teacher_checkpoint=../logs_rl/pnp_table_pnp_table-721/last.pt \
-  paths.generator_checkpoint=data/outputs/dagger_automation/<run>/<round>/checkpoints/latest.ckpt \
-  paths.output_dir=data/outputs/dagger_online \
-  --headless
+  paths.input=../../../data/hf_dataset/data_update/data/pickup_table/robot \
+  paths.teacher_checkpoint=../models/pnp_table/last.pt \
+  paths.generator_checkpoint=data/outputs/2026.08.02/17.35_train_generator_ObjectAwareSONIC/checkpoints/epoch-0002-val_loss-0.054.ckpt \
+  paths.output_dir=data/outputs/dagger_online_envs1024 \
+  training.teacher_ratio=0.5 \
+  training.learning_rate=2e-4 \
+  --headless \
+  environment.max_parallel_envs=1024 \
+  training.batch_size=128 \
+ 
 ```
 
-Replace `<run>/<round>` with the flow checkpoint to resume. Relative paths are
-resolved from the directory where the command is launched.
-
-Any YAML key can be overridden with the same dotted `key=value` form, for example:
-
-```bash
-training.teacher_ratio=0.25 training.iterations=200 checkpoint.every=20
-```

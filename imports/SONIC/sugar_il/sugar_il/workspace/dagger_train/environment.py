@@ -116,8 +116,10 @@ def load_sonic_config(
         env_cfg.object_usd_path = str(dataset_root / "object_usd")
 
         motion = sonic_cfg.manager_env.commands.motion
+        start_frame = int(cfg.environment.start_frame)
         motion.randomize_initial_pose_during_evaluation = cfg.environment.randomize_initial_pose
-        motion.start_from_first_frame = True
+        motion.fixed_start_frame = start_frame
+        motion.start_from_first_frame = start_frame == 0
         motion.init_z_offset = cfg.environment.init_z_offset
         motion.pose_range.x = list(cfg.environment.root_x_range)
         motion.pose_range.y = list(cfg.environment.root_y_range)

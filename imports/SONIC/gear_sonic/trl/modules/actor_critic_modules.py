@@ -574,14 +574,16 @@ class Actor(nn.Module):
         self.steps = 0
 
     def clear_rollout(self):
-        """Clear the observation buffer after rollout phase."""
+        """Clear rollout state after the caller has established a safe boundary."""
         self.obs_dict_buffer = TensorDict()
         self.dones_buffer = None
         self.steps = 0
-        del self.distribution
+        # Assignment keeps this method idempotent for diagnostic cleanup and
+        # avoids deleting attributes that may not have been initialized yet.
+        self.distribution = None
         if self.has_aux_loss:
-            del self.aux_losses
-            del self.aux_loss_coef
+            self.aux_losses = None
+            self.aux_loss_coef = None
 
     def eval_mode(self):
         self.is_eval_mode = True

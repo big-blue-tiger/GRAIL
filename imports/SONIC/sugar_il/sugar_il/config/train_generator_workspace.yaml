@@ -70,7 +70,7 @@ val_dataloader:
   pin_memory: True
   persistent_workers: True
 
-[optimizer:
+optimizer:
   # Kept as an interpolation so the learning rate can be overridden with
   # ``lr=...`` directly from the Hydra command line.
   lr: ${lr}

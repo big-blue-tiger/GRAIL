@@ -174,15 +174,19 @@ DAGGER_ROUNDS=10 GPU=0 ./run_dagger.sh
 ```bash
 cd /home/tide/robot/GRAIL/imports/SONIC/sugar_il
 python -m sugar_il.workspace.dagger_train.train \
-  paths.input=../../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+  paths.input=../../../data/hf_dataset/data_update/data/pickup_table/robot \
   paths.teacher_checkpoint=../models/pnp_table/last.pt \
-  paths.generator_checkpoint=data/outputs/2026.08.02/17.35_train_generator_ObjectAwareSONIC/checkpoints/epoch-0005-val_loss-0.063.ckpt\
-  paths.output_dir=data/outputs/dagger_online \
+  paths.generator_checkpoint=data/outputs/2026.08.02/17.35_train_generator_ObjectAwareSONIC/checkpoints/epoch-0002-val_loss-0.054.ckpt \
+  paths.output_dir=data/outputs/dagger_online_envs1024 \
   training.teacher_ratio=0.5 \
-  --headless
+  training.learning_rate=2e-4 \
+  --headless \
+  environment.max_parallel_envs=1024 \
+  training.batch_size=128 
+
 
 python -m sugar_il.workspace.dagger_train.train \
-  paths.input=../../../../sbto/datas/sbto_to_grail/pickup_table/robot \
+  paths.input=../../../data/hf_dataset/data_update/data/pickup_table/robot \
   paths.teacher_checkpoint=../models/pnp_table/last.pt \
   paths.generator_checkpoint=data/outputs/2026.08.02/17.35_train_generator_ObjectAwareSONIC/checkpoints/epoch-0005-val_loss-0.063.ckpt\
   paths.output_dir=data/outputs/dagger_online \
@@ -194,12 +198,17 @@ python -m sugar_il.workspace.dagger_train.train \
 
 ## clear the dataset
 ```bash
+
+GRAIL/data/hf_dataset/data_update/data/pickup_table/robot
+
 python -u gear_sonic/scripts/get_rl_motion_data.py \
   --gpu 0 \
   --checkpoint models/pnp_table/last.pt \
-  --input ../../data/hf_dataset/data/pickup_table_update \
+  --input ../../data/hf_dataset/data_update/data/pickup_table/robot \
   --output-dir outputs/grail/all \
-  --batch-size 8 \
+  --batch-size 8 
+
+
   --delete-failed-reference-data \
   --delete-reference-penetration-frames \
   ++manager_env.config.render_results=False \
