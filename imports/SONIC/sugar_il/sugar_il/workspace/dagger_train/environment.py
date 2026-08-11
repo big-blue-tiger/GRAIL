@@ -128,6 +128,13 @@ def load_sonic_config(
         motion.motion_lib_cfg.bps_dir = str(dataset_root / "bps")
         motion.motion_lib_cfg.filter_motion_keys = keys
         motion.motion_lib_cfg.target_fps = cfg.rollout.control_fps
+        # The checkpoint may have been produced by a multi-process teacher
+        # evaluation and therefore carry rank-based motion/USD sharding.  This
+        # DAgger process owns the complete input key list and implements its
+        # own sequential batching, so inheriting that shard would silently
+        # discard all but rank 0's slice (and shard the paired USDs as well).
+        motion.motion_lib_cfg.motion_shard_rank = 0
+        motion.motion_lib_cfg.motion_shard_world_size = 1
         for name in env_cfg.get("train_only_events", []):
             sonic_cfg.manager_env.events.pop(name, None)
         for name in env_cfg.get("train_only_terminations", []):

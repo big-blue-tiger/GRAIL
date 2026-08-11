@@ -393,6 +393,7 @@ class DaggerTrainer:
         started = _flow_stage_start("restoring DAgger state and RNG")
         self.dagger_state = _pickle(self.payload, "dagger_state", {})
         self.iteration = int(self.dagger_state.get("iteration", 0))
+        self.seed = int(self.dagger_state.get("seed", cfg.seed))
         self.global_step = int(_pickle(self.payload, "global_step", 0))
         saved_runtime = self.dagger_state.get("runtime")
         runtime = {
@@ -508,20 +509,23 @@ class DaggerTrainer:
         return self._reset()
 
     @torch.no_grad()
-    def _teacher_targets(self, obs_dict) -> tuple[torch.Tensor, torch.Tensor]:
-        # SONIC evaluation resets the one-step rollout buffer before every
-        # policy call. Keeping the previous TensorDict makes the second call
-        # concatenate every observation before trimming max_rollout_history,
-        # which is prohibitively expensive for many parallel environments.
+    def _teacher_targets(
+        self, obs_dict, cur_dones: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Match SONIC evaluation: init_rollout() is called once at the start
+        # of the complete rollout, then temporal history and done masks are
+        # carried across policy calls. Resetting here made every inference a
+        # one-frame rollout and substantially changed the teacher policy.
         trace = getattr(self, "_phase_trace", False)
         collection_mode = self.diagnostics.collection_mode
         if collection_mode == "environment_only":
             actor_obs = obs_dict["actor_obs"]
             batch_size = actor_obs.shape[0]
-            return (
-                torch.zeros(batch_size, 64, device=actor_obs.device, dtype=actor_obs.dtype),
-                torch.zeros(batch_size, 2, device=actor_obs.device, dtype=actor_obs.dtype),
+            zeros = torch.zeros(
+                batch_size, 64, device=actor_obs.device, dtype=actor_obs.dtype
             )
+            hand = torch.zeros(batch_size, 2, device=actor_obs.device, dtype=actor_obs.dtype)
+            return zeros, zeros, hand
         if collection_mode == "atm_only":
             actor_obs = obs_dict["actor_obs"]
             with self.diagnostics.phase("rollout/teacher_skipped"):
@@ -530,14 +534,9 @@ class DaggerTrainer:
                 )
         else:
             if trace:
-                print("[dagger] teacher: init_rollout start", flush=True)
-            with self.diagnostics.phase("rollout/teacher_init"):
-                self.teacher.init_rollout()
-            if trace:
-                print("[dagger] teacher: init_rollout complete", flush=True)
                 print("[dagger] teacher: policy rollout start", flush=True)
             with self.diagnostics.phase("rollout/teacher_policy"):
-                self.teacher.rollout(obs_dict=obs_dict)
+                self.teacher.rollout(obs_dict=obs_dict, cur_dones=cur_dones)
             if trace:
                 print("[dagger] teacher: policy rollout complete", flush=True)
             with self.diagnostics.phase("rollout/teacher_action_mean"):
@@ -550,7 +549,7 @@ class DaggerTrainer:
             if left is None or right is None:
                 raise ValueError("Reference motion is missing hand actions")
             hand = (torch.stack((left, right), dim=-1) >= 0).to(latent.dtype)
-            return latent, hand
+            return residual, latent, hand
         scale = float(self.env._latent_residual_scale)  # noqa: SLF001
         mode = self.env._latent_residual_mode  # noqa: SLF001
         if mode != "pre_quantization" or abs(scale - 0.1) > 1e-8:
@@ -581,7 +580,7 @@ class DaggerTrainer:
         hand = (torch.stack((left, right), dim=-1) >= 0).to(latent.dtype)
         if trace:
             print("[dagger] teacher: hand extraction complete", flush=True)
-        return latent, hand
+        return residual, latent, hand
 
     def collect(self):
         from sugar_il.wrapper.sugar_il_wrapper import GeneratorWrapper
@@ -623,6 +622,7 @@ class DaggerTrainer:
         plan_cursor = torch.full(
             (self.env.num_envs,), execution_horizon, dtype=torch.long, device=device
         )
+        teacher_dones = torch.zeros(self.env.num_envs, dtype=torch.bool, device=device)
         rollout_model = self.ema_model or self.accelerator.unwrap_model(self.model)
         wrapper = GeneratorWrapper(rollout_model, device)
         progress_every = int(self.cfg.rollout.progress_every)
@@ -639,6 +639,11 @@ class DaggerTrainer:
             f"capacity={self.storage.num_transitions_per_env}",
             flush=True,
         )
+
+        # SONIC's policy is temporal. Initialize its history once per complete
+        # rollout, exactly as the standard evaluation callback does.
+        with self.diagnostics.phase("rollout/teacher_init"):
+            self.teacher.init_rollout()
 
         if stall_trace_seconds > 0:
             faulthandler.dump_traceback_later(stall_trace_seconds, repeat=True)
@@ -675,7 +680,9 @@ class DaggerTrainer:
                     f"[dagger] step {self.storage.step + 1}: running teacher policy",
                     flush=True,
                 )
-            teacher_latent, teacher_hand = self._teacher_targets(obs_dict)
+            teacher_residual, teacher_latent, teacher_hand = self._teacher_targets(
+                obs_dict, teacher_dones
+            )
             trace_phase("teacher targets complete")
             refresh = (
                 active
@@ -702,7 +709,11 @@ class DaggerTrainer:
                 plan_cursor[ids] = 0
 
             student_ids = (active & ~teacher_execution).nonzero(as_tuple=True)[0]
-            action_latent = teacher_latent.clone()
+            # Mixed mode expects raw teacher residuals for teacher envs and
+            # full pre-quantization latents for student envs.  Executing the
+            # teacher via direct-latent mode needlessly reconstructed its
+            # action and did not follow the standard SONIC evaluation path.
+            action_latent = teacher_residual.clone()
             action_hand = teacher_hand.clone()
             if len(student_ids):
                 cursor = plan_cursor[student_ids]
@@ -724,7 +735,12 @@ class DaggerTrainer:
                 # step and the wrapper/physics action state can retain it.
                 with torch.no_grad():
                     next_obs, _, dones, infos = self.env.step(
-                        {"actions": action, "obs_dict": obs_dict, "action_mode": "direct_latent"}
+                        {
+                            "actions": action,
+                            "obs_dict": obs_dict,
+                            "action_mode": "mixed",
+                            "is_teacher_env": teacher_execution,
+                        }
                     )
             trace_phase("environment step complete")
             dones = dones.reshape(-1).bool().to(device)
@@ -757,14 +773,22 @@ class DaggerTrainer:
                 lengths += active.long()
                 finished = dones & active
                 finished_ids = finished.nonzero(as_tuple=True)[0].tolist()
-                for env_id in finished_ids:
-                    term_reasons = _termination_reasons(self.env.env, env_id)
-                    reasons.update(term_reasons or ("unknown",))
                 finished_successes = finished & time_outs
+                early_finished_ids = (finished & ~time_outs).nonzero(as_tuple=True)[0].tolist()
+                for env_id in early_finished_ids:
+                    term_reasons = tuple(
+                        reason
+                        for reason in _termination_reasons(self.env.env, env_id)
+                        if reason != "time_out"
+                    )
+                    # Match SONIC eval's single-cause accounting: when several
+                    # conditions trigger on the same step, use manager order.
+                    reasons.update((term_reasons[0] if term_reasons else "unknown",))
                 successes |= finished_successes
                 time_out_count += int(finished_successes.sum().item())
                 active_count -= len(finished_ids)
                 active &= ~finished
+                teacher_dones = dones
                 trace_phase("done processing complete")
                 episode_starts.zero_()
                 obs_dict = {key: value.to(device) for key, value in next_obs.items()}
@@ -823,6 +847,19 @@ class DaggerTrainer:
             f"teacher_windows={teacher_windows}, student_windows={student_windows}",
             flush=True,
         )
+        early_termination_count = self.env.num_envs - time_out_count
+        print(
+            f"[dagger] rollout outcomes: success/time_out={time_out_count}, "
+            f"early_terminated={early_termination_count}, total={self.env.num_envs}, "
+            f"success_rate={time_out_count / self.env.num_envs:.1%}",
+            flush=True,
+        )
+        if reasons:
+            print("[dagger] early termination reasons:", flush=True)
+            for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0])):
+                print(f"[dagger]   {reason}: {count}", flush=True)
+        else:
+            print("[dagger] early termination reasons: none", flush=True)
         self.diagnostics.snapshot(f"iteration_{self.iteration + 1:06d}_rollout")
         return {
             "windows": total,
@@ -1086,7 +1123,11 @@ class DaggerTrainer:
                 with self.diagnostics.phase("save/ema_cpu_copy"):
                     state_dicts["ema_model"] = _copy_cpu(ema_state)
                 del ema_state
-        dagger_state = {"iteration": self.iteration, "runtime": self.runtime}
+        dagger_state = {
+            "iteration": self.iteration,
+            "seed": self.seed,
+            "runtime": self.runtime,
+        }
         pickles = {
             "global_step": dill.dumps(self.global_step),
             "scheduler_total_steps": self.payload["pickles"]["scheduler_total_steps"],
@@ -1108,6 +1149,7 @@ class DaggerTrainer:
 
     def run(self) -> None:
         from sugar_il.common.json_logger import JsonLogger
+        from gear_sonic.utils.common import seeding
 
         with JsonLogger(str(self.output_dir / "logs.json.txt")) as logger:
             for _ in range(self.cfg.training.iterations):
@@ -1136,6 +1178,9 @@ class DaggerTrainer:
                     f"Iteration {self.iteration}: windows={rollout['windows']}, "
                     f"loss={train['train_loss']:.6f}, timeout={rollout['time_out_rate']:.1%}"
                 )
+                self.seed += 1
+                seeding(self.seed)
+                print(f"[dagger] next iteration seed: {self.seed}", flush=True)
                 if not self.diagnostics.skip_checkpoint:
                     print("[dagger] checkpoint save latest starting", flush=True)
                     with self.diagnostics.phase("iteration/save_latest"):
