@@ -175,27 +175,10 @@ class CudaDiagnostics:
         self.nvtx = bool(config.get("nvtx", False))
         self.tensor_census = bool(config.get("tensor_census", False))
         self.safe_teacher_cleanup = bool(config.get("safe_teacher_cleanup", False))
-        self.collection_mode = str(config.get("collection_mode", "full"))
         self.collect_only = bool(config.get("collect_only", False))
         self.forward_only = bool(config.get("forward_only", False))
         self.disable_optimizer = bool(config.get("disable_optimizer", False))
         self.skip_checkpoint = bool(config.get("skip_checkpoint", False))
-        valid_collection_modes = {"full", "environment_only", "teacher_only", "atm_only"}
-        if self.collection_mode not in valid_collection_modes:
-            raise ValueError(
-                "diagnostics.collection_mode must be one of "
-                + ", ".join(sorted(valid_collection_modes))
-            )
-        if self.enabled is False and (
-            self.collection_mode != "full"
-            or self.collect_only
-            or self.forward_only
-            or self.disable_optimizer
-            or self.skip_checkpoint
-        ):
-            raise ValueError(
-                "diagnostic isolation modes require diagnostics.enabled=true"
-            )
         self.memory_history = bool(config.get("memory_history", False))
         self.memory_snapshot = bool(config.get("memory_snapshot", False))
         self.max_history_entries = int(config.get("max_history_entries", 100000))

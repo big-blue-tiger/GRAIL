@@ -7,9 +7,13 @@ paths:
 
 training:
   # Optional fixed learning rate for online DAgger. When set, this overrides
-  # the optimizer state restored from the generator checkpoint and disables
-  # scheduler updates. Leave null to resume the checkpoint's LR schedule.
+  # the restored or freshly created optimizer learning rate and disables
+  # scheduler updates. Leave null to keep the checkpoint's LR schedule.
   learning_rate: null
+  # When true, restore only the policy model weights from paths.generator_checkpoint
+  # and construct a fresh optimizer, LR scheduler, iteration counter, and RNG.
+  # When false, perform a full DAgger resume (model + optimizer + scheduler + state).
+  load_model_only: false
   iterations: 300
   epochs_per_rollout: 1
   # Online training shares the GPU with Isaac Sim, teacher, ATM, and EMA.
@@ -25,12 +29,6 @@ rollout:
   execution_horizon: 20
   control_fps: 50
   progress_every: 10
-  # Print the Python stack repeatedly if one rollout phase stops returning.
-  # Set to 0 to disable after the rollout has been verified on a machine.
-  stall_trace_seconds: 60
-  # Constructor watchdog for CUDA/Kit initialization before the first rollout.
-  startup_trace_seconds: 90
-  phase_trace: false
 
 diagnostics:
   # Keep disabled for normal training; enable explicitly for the CUDA/Kit
@@ -43,9 +41,6 @@ diagnostics:
   tensor_census: false
   # Experimental: synchronize before clearing teacher/ATM rollout state.
   safe_teacher_cleanup: false
-  # Isolation modes for the plan's collect matrix. Any non-default mode also
-  # requires diagnostics.enabled=true so it cannot be enabled accidentally.
-  collection_mode: full
   collect_only: false
   forward_only: false
   disable_optimizer: false
@@ -56,18 +51,19 @@ diagnostics:
   snapshot_dir: diagnostics/memory
 
 environment:
-  # Load at most this many motions/environments on the GPU at once. When the
-  # input contains more motions, DAgger cycles through batches per iteration.
+  # Load at most this many motions/environments on the GPU at once.
   max_parallel_envs: 64
+  # Select which max_parallel_envs-sized motion batch to train.
+  motion_batch_index: 0
   # Isaac Sim's default timeline may stop at about 10 seconds.  A STOP event
   # enters SimulationContext's render-wait callback and prevents Python from
   # reaching the first optimizer step after a long rollout.
   timeline_end_time: 1000000.0
   start_frame: 50
   randomize_initial_pose: false
-  init_z_offset: 0.05
-  root_x_range: [-0.1, 0.1]
-  root_y_range: [-0.1, 0.1]
+  init_z_offset: 0.06
+  root_x_range: [-0.01, 0.01]
+  root_y_range: [-0.01, 0.01]
   collision_stack_size_exp: 28
 
 checkpoint:

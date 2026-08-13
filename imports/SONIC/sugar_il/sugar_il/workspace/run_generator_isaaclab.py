@@ -17,24 +17,12 @@ EXECUTION_HORIZON = 20
 CONTROL_FPS = 50
 FLOW_INFERENCE_STEPS = 4
 FLOW_TIMESTEP_BUCKETS = 1000
+INITIAL_MOTION_FRAME_INDEX = 50
 
 DEFAULT_MOTION = Path(
-    "/home/tide/robot/sbto/datas/sbto_to_grail/pickup_table/robot/"
-    "pickup_table__apple_11__002.pkl"
+    "/home/tide/robot/GRAIL/data/hf_dataset/data/pickup_table_update/robot/"
+    "pickup_table__alcohol_5__001.pkl"
 )
-
-
-@dataclass(frozen=True)
-class RobotInitialPose:
-    """Fixed robot pose used instead of a pose from the reference motion."""
-
-    position: tuple[float, float, float] = (-0.3783, 0.6882, 0.7783)
-    quaternion_wxyz: tuple[float, float, float, float] = (
-        0.7187,
-        -0.0441,
-        -0.0730,
-        -0.6900,
-    )
 
 
 @dataclass(frozen=True)
@@ -44,12 +32,11 @@ class RandomizationRanges:
     table_height: tuple[float, float] = (0.60, 0.61)
     object_x_offset: tuple[float, float] = (-0.0, 0.0)
     object_y_offset: tuple[float, float] = (-0.0, 0.0)
-    robot_x_offset: tuple[float, float] = (-0.4, 0.4)
-    robot_y_offset: tuple[float, float] = (-0.4, 0.4)
-    robot_z_offset: tuple[float, float] = (-0.001, 0.001)
+    robot_x_offset: tuple[float, float] = (-0.3, 0.3)
+    robot_y_offset: tuple[float, float] = (-0.01, 0.4)
+    robot_z_offset: tuple[float, float] = (0.04, 0.06)
 
 
-ROBOT_INITIAL_POSE = RobotInitialPose()
 RANDOMIZATION = RandomizationRanges()
 
 
@@ -68,6 +55,10 @@ class MotionAssets:
 
 @dataclass(frozen=True)
 class ReferenceScene:
+    robot_position: tuple[float, float, float]
+    robot_quaternion_wxyz: tuple[float, float, float, float]
+    robot_body_joint_positions_mujoco: tuple[float, ...]
+    robot_hand_joint_positions: tuple[float, ...]
     object_position: tuple[float, float, float]
     object_quaternion_wxyz: tuple[float, float, float, float]
     table_position: tuple[float, float, float]
@@ -122,21 +113,45 @@ def _first_motion(payload: dict, path: Path) -> dict:
 
 
 def load_reference_scene(assets: MotionAssets) -> ReferenceScene:
-    """Load only frame-zero object pose and table metadata."""
+    """Load robot frame index 50, frame-zero object pose, and table metadata."""
     import joblib
 
+    robot_motion = _first_motion(joblib.load(assets.robot), assets.robot)
     object_motion = _first_motion(joblib.load(assets.objects), assets.objects)
     meta = joblib.load(assets.meta)
     try:
+        robot_position = robot_motion["root_trans_offset"][
+            INITIAL_MOTION_FRAME_INDEX
+        ]
+        # Motion files store quaternions as xyzw; Isaac Lab expects wxyz.
+        robot_quaternion_xyzw = robot_motion["root_rot"][
+            INITIAL_MOTION_FRAME_INDEX
+        ]
+        robot_body_joint_positions_mujoco = robot_motion["dof"][
+            INITIAL_MOTION_FRAME_INDEX
+        ]
+        robot_hand_joint_positions = robot_motion["hand_dof_pos"][
+            INITIAL_MOTION_FRAME_INDEX
+        ]
         object_position = object_motion["root_pos"][0, 0]
         object_quaternion = object_motion["root_quat"][0, 0]
         table_position = meta["table_pos"]
         table_quaternion = meta["table_quat"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError(f"Invalid object/table initialization data: {exc}") from exc
+        raise ValueError(f"Invalid robot/object/table initialization data: {exc}") from exc
 
     table_size = meta.get("table_size", (1.0, 0.6, 0.04))
     return ReferenceScene(
+        robot_position=tuple(float(x) for x in robot_position),
+        robot_quaternion_wxyz=tuple(
+            float(robot_quaternion_xyzw[index]) for index in (3, 0, 1, 2)
+        ),
+        robot_body_joint_positions_mujoco=tuple(
+            float(x) for x in robot_body_joint_positions_mujoco
+        ),
+        robot_hand_joint_positions=tuple(
+            float(x) for x in robot_hand_joint_positions
+        ),
         object_position=tuple(float(x) for x in object_position),
         object_quaternion_wxyz=tuple(float(x) for x in object_quaternion),
         table_position=tuple(float(x) for x in table_position),
@@ -201,7 +216,7 @@ def _parse_args(app_launcher_cls) -> argparse.Namespace:
 def _sample_scene(reference: ReferenceScene, args, episode_seed: int) -> EpisodeScene:
     if args.mode == "single":
         return EpisodeScene(
-            robot_position=ROBOT_INITIAL_POSE.position,
+            robot_position=reference.robot_position,
             object_position=reference.object_position,
             table_position=reference.table_position,
         )
@@ -214,9 +229,9 @@ def _sample_scene(reference: ReferenceScene, args, episode_seed: int) -> Episode
     table_delta_z = table_z - reference.table_position[2]
     return EpisodeScene(
         robot_position=(
-            ROBOT_INITIAL_POSE.position[0] + rng.uniform(*ranges.robot_x_offset),
-            ROBOT_INITIAL_POSE.position[1] + rng.uniform(*ranges.robot_y_offset),
-            ROBOT_INITIAL_POSE.position[2] + rng.uniform(*ranges.robot_z_offset),
+            reference.robot_position[0] + rng.uniform(*ranges.robot_x_offset),
+            reference.robot_position[1] + rng.uniform(*ranges.robot_y_offset),
+            reference.robot_position[2] + rng.uniform(*ranges.robot_z_offset),
         ),
         object_position=(
             reference.object_position[0] + rng.uniform(*ranges.object_x_offset),
@@ -387,7 +402,7 @@ def _reset_episode(env, scene: EpisodeScene, reference: ReferenceScene, torch):
     obj = env.env.scene["object"]
     table = env.env.scene["table"]
     robot.write_root_pose_to_sim(
-        pose(scene.robot_position, ROBOT_INITIAL_POSE.quaternion_wxyz)
+        pose(scene.robot_position, reference.robot_quaternion_wxyz)
     )
     obj.write_root_pose_to_sim(
         pose(scene.object_position, reference.object_quaternion_wxyz)
@@ -396,6 +411,45 @@ def _reset_episode(env, scene: EpisodeScene, reference: ReferenceScene, torch):
         pose(scene.table_position, reference.table_quaternion_wxyz)
     )
     zero_velocity = torch.zeros((1, 6), dtype=torch.float32, device=device)
+
+    from gear_sonic.envs.env_utils.joint_utils import get_hand_joint_indices
+    from gear_sonic.envs.manager_env.mdp.observations import G1_MUJOCO_ORDER
+
+    body_joint_indices = torch.tensor(
+        [robot.joint_names.index(name) for name in G1_MUJOCO_ORDER],
+        dtype=torch.long,
+        device=device,
+    )
+    hand_joint_indices = get_hand_joint_indices(robot)
+    if len(body_joint_indices) != len(reference.robot_body_joint_positions_mujoco):
+        raise ValueError(
+            "Reference motion body joint count does not match the robot: "
+            f"{len(reference.robot_body_joint_positions_mujoco)} != "
+            f"{len(body_joint_indices)}"
+        )
+    if len(hand_joint_indices) != len(reference.robot_hand_joint_positions):
+        raise ValueError(
+            "Reference motion hand joint count does not match the robot: "
+            f"{len(reference.robot_hand_joint_positions)} != {len(hand_joint_indices)}"
+        )
+    joint_pos = robot.data.default_joint_pos[:1].clone()
+    joint_pos[:, body_joint_indices] = torch.tensor(
+        reference.robot_body_joint_positions_mujoco,
+        dtype=torch.float32,
+        device=device,
+    )
+    joint_pos[:, hand_joint_indices] = torch.tensor(
+        reference.robot_hand_joint_positions,
+        dtype=torch.float32,
+        device=device,
+    )
+    joint_vel = torch.zeros_like(joint_pos)
+    robot.write_joint_state_to_sim(joint_pos, joint_vel)
+    # Keep reset-time actuator targets consistent with the injected frame.
+    robot.set_joint_position_target(joint_pos)
+    robot.set_joint_velocity_target(joint_vel)
+    robot.set_joint_effort_target(torch.zeros_like(joint_pos))
+
     robot.write_root_velocity_to_sim(zero_velocity)
     obj.write_root_velocity_to_sim(zero_velocity)
 

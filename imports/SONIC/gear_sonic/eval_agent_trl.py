@@ -163,15 +163,13 @@ def main(override_config: omegaconf.OmegaConf):
     import accelerate
     import torch  # noqa: E402, RUF100
 
+    requested_gpu = os.environ.get("SONIC_GPU")
+    if requested_gpu is not None:
+        gpu_idx = int(requested_gpu)
+        os.environ["ACCELERATE_TORCH_DEVICE"] = f"cuda:{gpu_idx}"
+
     kwargs = accelerate.InitProcessGroupKwargs(timeout=dt.timedelta(seconds=6000))
     accelerator = accelerate.Accelerator(kwargs_handlers=[kwargs])
-
-    device = str(accelerator.device)
-    if accelerator.device.type == "cuda":
-        try:
-            torch.cuda.set_device(accelerator.local_process_index)
-        except Exception:  # noqa: S110, BLE001
-            pass
 
     device = str(accelerator.device)
     config.multi_gpu = accelerator.num_processes > 1
@@ -198,7 +196,11 @@ def main(override_config: omegaconf.OmegaConf):
             pass
         return default_idx
 
-    render_gpu_idx = _pick_display_gpu_index(default_idx=0)
+    render_gpu_idx = (
+        int(requested_gpu)
+        if requested_gpu is not None
+        else _pick_display_gpu_index(default_idx=0)
+    )
 
     if simulator_type == "IsaacSim":
         try:
@@ -236,7 +238,10 @@ def main(override_config: omegaconf.OmegaConf):
             "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
         )
         if args_cli.headless:
-            args_cli.kit_args = base_kit_args + " --no-window"
+            args_cli.kit_args = (
+                base_kit_args
+                + f" --no-window --/renderer/activeGpu={render_gpu_idx}"
+            )
         else:
             args_cli.kit_args = base_kit_args + f" --/renderer/activeGpu={render_gpu_idx}"
 

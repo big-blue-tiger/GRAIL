@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import faulthandler
 import io
 import math
 from pathlib import Path
@@ -145,7 +144,7 @@ def load_sonic_config(
     return sonic_cfg
 
 
-def prepare_evaluation_env(env, *, stack_timeout: int = 120) -> dict[str, torch.Tensor]:
+def prepare_evaluation_env(env) -> dict[str, torch.Tensor]:
     """Load the paired motions and reset every environment in evaluation mode."""
     print("[dagger] enabling evaluation mode", flush=True)
     env.is_evaluating = True
@@ -156,11 +155,7 @@ def prepare_evaluation_env(env, *, stack_timeout: int = 120) -> dict[str, torch.
     print("[dagger] loading evaluation motions", flush=True)
     env._motion_lib.load_motions_for_evaluation(start_idx=env.start_idx)  # noqa: SLF001
     print("[dagger] resetting all environments after motion loading", flush=True)
-    faulthandler.dump_traceback_later(stack_timeout, repeat=True)
-    try:
-        obs = env.reset_all()
-    finally:
-        faulthandler.cancel_dump_traceback_later()
+    obs = env.reset_all()
     print("[dagger] evaluation environments are ready", flush=True)
     return obs
 

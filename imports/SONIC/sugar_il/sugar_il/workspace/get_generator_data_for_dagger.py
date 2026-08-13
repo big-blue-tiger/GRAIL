@@ -178,7 +178,7 @@ def _parent(args, extra: list[str]) -> None:
             cmd,
             check=True,
             cwd=Path(__file__).resolve().parents[3],
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu},
+            env={**os.environ, "SONIC_GPU": str(args.gpu)},
         )
 
 

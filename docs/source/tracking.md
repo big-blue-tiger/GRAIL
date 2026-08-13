@@ -192,25 +192,13 @@ python -u gear_sonic/eval_agent_trl.py \
 
 ### render ego video
 ```bash
-python -u gear_sonic/scripts/get_rl_motion_data.py \
-  --gpu 0 \
-  --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-sbto_data_717/last.pt \
-  --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot/pickup_table_120.pkl \
-  --output-dir outputs/grail/single
 
 python -u gear_sonic/scripts/get_rl_motion_data.py \
   --gpu 1 \
-  --checkpoint logs_rl/GRAB_Tracking/manager/universal_token/hoi/pnp_table_pnp_table-20260721_142019/last.pt \
-  --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
-  --output-dir outputs/grail/all \
-  --batch-size 64
-
-python -u gear_sonic/scripts/get_rl_motion_data.py \
-  --gpu 0 \
   --checkpoint logs_rl/pnp_table_pnp_table-721/last.pt \
   --input ../../../sbto/datas/sbto_to_grail/pickup_table/robot \
   --output-dir outputs/grail/all \
-  --batch-size 128
+  --batch-size 16
   --delete-failed-reference-data \
    --batch-size 128 \
 

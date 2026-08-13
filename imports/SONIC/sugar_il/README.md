@@ -98,12 +98,12 @@ metadata, object USD, and BPS. Reference robot actions are not replayed. The
 default path is:
 
 ```text
-/home/tide/robot/sbto/datas/sbto_to_grail/pickup_table/robot/pickup_table__apple_18__004.pkl
+/home/tide/robot/GRAIL/data/hf_dataset/data/pickup_table_update/robot/pickup_table__alcohol_0__001.pkl
 ```
 
 ```bash
 python -u sugar_il/sugar_il/workspace/run_generator_isaaclab.py \
-  --generator-checkpoint sugar_il/data/outputs/2026.08.02/17.35_train_generator_ObjectAwareSONIC/checkpoints/epoch-0005-val_loss-0.063.ckpt\
+  --generator-checkpoint sugar_il/data/outputs/dagger_online_envs1024/122.ckpt \
   --mode single --seed 24 --device cuda:0 --no-render-video --headless
 ```
 
@@ -120,7 +120,7 @@ Batch success-rate test (random table height / object / robot pose per episode):
 
 ```bash
 python -u sugar_il/sugar_il/workspace/run_generator_isaaclab.py \
-  --generator-checkpoint sugar_il/data/outputs/dagger_automation/2026.07.30-15.57.39-31304/round_09/checkpoints/epoch-0382-val_loss-0.014.ckpt \
+  --generator-checkpoint sugar_il/data/outputs/dagger_online_envs1024/122.ckpt  \
   --mode batch --episodes 20 --render-video --headless
 ```
 
@@ -173,16 +173,19 @@ DAGGER_ROUNDS=10 GPU=0 ./run_dagger.sh
 #### use python
 ```bash
 cd /home/tide/robot/GRAIL/imports/SONIC/sugar_il
+
 python -m sugar_il.workspace.dagger_train.train \
-  paths.input=../../../data/hf_dataset/data_update/data/pickup_table/robot \
+  paths.input=../../../data//hf_dataset/data_update/data/pickup_table/robot \
   paths.teacher_checkpoint=../models/pnp_table/last.pt \
-  paths.generator_checkpoint=data/outputs/2026.08.02/17.35_train_generator_ObjectAwareSONIC/checkpoints/epoch-0002-val_loss-0.054.ckpt \
-  paths.output_dir=data/outputs/dagger_online_envs2048 \
+  paths.generator_checkpoint=data/outputs/dagger_online_envs1024/checkpoints/iteration_000122.ckpt \
+  paths.output_dir=data/outputs/dagger_online_envs1024_0813 \
+  training.load_model_only=true \
   training.teacher_ratio=0.5 \
   training.learning_rate=2e-4 \
   --headless \
-  environment.max_parallel_envs=2048 \
-  training.batch_size=256 
+  environment.max_parallel_envs=1400 \
+  training.batch_size=256 \
+  --device cuda:1
 
 
 python -m sugar_il.workspace.dagger_train.train \
@@ -202,17 +205,18 @@ python -m sugar_il.workspace.dagger_train.train \
 GRAIL/data/hf_dataset/data_update/data/pickup_table/robot
 
 python -u gear_sonic/scripts/get_rl_motion_data.py \
-  --gpu 0 \
+  --gpu 2 \
   --checkpoint models/pnp_table/last.pt \
   --input ../../data/hf_dataset/data_update/data/pickup_table/robot \
   --output-dir outputs/grail/all \
-  --batch-size 8 
-
+  --batch-size 256 \
+  ++manager_env.config.render_results=False \
+    ++manager_env.recorders.render_envs=null
 
   --delete-failed-reference-data \
   --delete-reference-penetration-frames \
   ++manager_env.config.render_results=False \
-  ++manager_env.recorders.render_envs=null
+
 ```
 
 ## TEST generator

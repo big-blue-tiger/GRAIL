@@ -325,7 +325,7 @@ def main() -> None:
                 cmd,
                 check=True,
                 cwd=sonic_root,
-                env={**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu},
+                env={**os.environ, "SONIC_GPU": str(args.gpu)},
             )
             if selection_manifest is not None:
                 _save_selected_reference_data(
