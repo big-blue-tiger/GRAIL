@@ -88,14 +88,6 @@ three GPUs.
 
 ## Inference
 
-`GeneratorWrapper.observation_from_world()` receives the current robot/object
-world poses and uses the same `world_pose_to_body()` conversion as training.
-Each inference call predicts 40 consecutive frames (64-D latent + 2-D hand
-primitive); the simulator executes the first 20 frames and then replans.
-
-The reference `--motion-file` is used for the object frame-zero pose, table
-metadata, object USD, and BPS. Reference robot actions are not replayed. The
-default path is:
 
 ```text
 /home/tide/robot/GRAIL/data/hf_dataset/data/pickup_table_update/robot/pickup_table__alcohol_0__001.pkl
@@ -103,7 +95,7 @@ default path is:
 
 ```bash
 python -u sugar_il/sugar_il/workspace/run_generator_isaaclab.py \
-  --generator-checkpoint sugar_il/data/outputs/dagger_online_envs1024/122.ckpt \
+  --generator-checkpoint sugar_il/data/outputs/dagger_online_envs1024/iteration_000089.ckpt \
   --mode single --seed 24 --device cuda:0 --no-render-video --headless
 ```
 
@@ -222,7 +214,7 @@ python -u gear_sonic/scripts/get_rl_motion_data.py \
 ## TEST generator
 ```bash
 python -u sugar_il/workspace/test_generator_isaaclab.py \
-  --generator-checkpoint data/outputs/2026.08.02/17.35_train_generator_ObjectAwareSONIC/checkpoints/epoch-0002-val_loss-0.054.ckpt \
+  --generator-checkpoint data/outputs/dagger_online_envs1024/iteration_000089.ckpt \
   --episodes 16 \
   --parallel-envs 16 \
   --render-video \

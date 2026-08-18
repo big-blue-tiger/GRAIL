@@ -68,13 +68,11 @@ QUAT_CONVENTION=wxyz bash grail/visualization/scripts/visualize.sh \
 
 # Data-export dir — defaults match (xyzw)
 bash grail/visualization/scripts/visualize.sh \
-    logs_rl/<exp>/exported/step_010000/shard_0
+    data/hf_dataset/data/pickup_table_update
 
 # Public-release dir — defaults match (xyzw)
 bash grail/visualization/scripts/visualize.sh \
-    data/pickup_table
-bash grail/visualization/scripts/visualize.sh \
-    ../sbto/datas/sbto_to_grail/pickup_table
+    data/hf_dataset/data_update/data/pickup_table
 ```
 
 Positional arguments (all but the first are optional):

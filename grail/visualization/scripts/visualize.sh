@@ -20,7 +20,7 @@
 #
 # Usage: ./visualize.sh <motion_lib_path> [max_videos] [cam_offset_x,cam_offset_y,cam_offset_z] [quat_convention]
 # Example:
-#   ./visualize.sh data/release/dataset/pickup_table
+#   ./visualize.sh data/hf_dataset/data/pickup_table_update
 #   ./visualize.sh data/release/dataset/pickup_table 0          # render all motions
 #   ./visualize.sh /abs/path/to/motion_lib 16 -3.5,0.0,1.2 xyzw
 #   QUAT_CONVENTION=wxyz ./visualize.sh data/motion_lib/<name> 16
