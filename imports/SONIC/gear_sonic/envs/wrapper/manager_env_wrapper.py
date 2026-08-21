@@ -120,6 +120,16 @@ class ManagerEnvWrapper:
         # The 64-dim output goes directly to ATM decoder (no encoding step).
         self._use_student_direct_latent = self.config.get("use_student_direct_latent", False)
 
+        # Hand-action source can differ between teacher and student execution.
+        # Fall back to the legacy flag so existing experiments keep their old behavior.
+        legacy_motion_hands = bool(self.config.get("use_motion_hand_actions", False))
+        self._teacher_use_motion_hand_actions = bool(
+            self.config.get("teacher_use_motion_hand_actions", legacy_motion_hands)
+        )
+        self._student_use_motion_hand_actions = bool(
+            self.config.get("student_use_motion_hand_actions", legacy_motion_hands)
+        )
+
         if self._use_latent_residual:
             logger.info(
                 f"Latent residual enabled: mode={self._latent_residual_mode}, "
@@ -610,7 +620,10 @@ class ManagerEnvWrapper:
         - cameras.camera_pitch_rand_range: ±radians for pitch
         - cameras.camera_yaw_rand_range: ±radians for yaw
         """
-        cameras_config = self.config.get("cameras", {})
+        # Non-visual policies may explicitly set ``cameras: null`` to remove
+        # inherited RGB camera configuration.  Treat that the same as an empty
+        # mapping so reset-time randomization remains a no-op.
+        cameras_config = self.config.get("cameras") or {}
 
         # Check if randomization is enabled via switch
         if not cameras_config.get("camera_extrinsics_randomization", False):
@@ -816,6 +829,19 @@ class ManagerEnvWrapper:
 
         return body_actions
 
+    def get_reference_hand_actions(self) -> torch.Tensor:
+        """Return the current reference left/right hand primitives."""
+        motion_cmd = self.env.command_manager.get_term("motion")
+        left_action = motion_cmd.get_hand_action("left_hand")
+        right_action = motion_cmd.get_hand_action("right_hand")
+        if left_action is None or right_action is None:
+            raise ValueError(
+                "Motion hand actions are enabled but hand_action_left/right were not found. "
+                "Ensure processed_robot_motions.pkl contains 'hand_action_left' and "
+                "'hand_action_right' arrays."
+            )
+        return torch.stack([left_action, right_action], dim=-1)
+
     def step(self, actions):
         if self.action_transform_module is not None:
             # Use provided obs_dict or fall back to stored obs from last reset/step
@@ -832,8 +858,8 @@ class ManagerEnvWrapper:
             meta_actions = actions["actions"]
             # Determine action mode: "direct_latent", "residual", or "mixed"
             # Priority: 1) explicit action_mode in actions dict, 2) config flag
-            # During training: trainer sets action_mode explicitly
-            # During eval: fallback to config flags
+            # The current student trainer uses the config fallback; mixed/teacher
+            # rollout callers can select their mode explicitly.
             action_mode = actions.get("action_mode", None)
             if action_mode is None:
                 # Fallback for eval scripts that don't set action_mode
@@ -843,6 +869,22 @@ class ManagerEnvWrapper:
                     action_mode = "residual"
                 else:
                     action_mode = "residual"  # Default to residual if nothing specified
+
+            # Validate and normalize the per-environment mode mask once so body and
+            # hand action routing cannot disagree in mixed rollouts.
+            is_teacher_env = None
+            if action_mode == "mixed":
+                is_teacher_env = actions.get("is_teacher_env")
+                if is_teacher_env is None:
+                    raise ValueError(
+                        "action_mode='mixed' requires 'is_teacher_env' mask in actions dict"
+                    )
+                is_teacher_env = is_teacher_env.to(device=meta_actions.device, dtype=torch.bool)
+                if is_teacher_env.dim() != 1 or is_teacher_env.shape[0] != meta_actions.shape[0]:
+                    raise ValueError(
+                        "is_teacher_env must be a 1D mask with one value per environment; "
+                        f"got shape {tuple(is_teacher_env.shape)} for {meta_actions.shape[0]} envs"
+                    )
 
             # Shift meta action buffers for meta_action_rate_l2 reward (token smoothness)
             self.env._prev_meta_action = self.env._last_meta_action.clone()  # noqa: SLF001
@@ -856,21 +898,44 @@ class ManagerEnvWrapper:
             tokenizer_meta_actions = meta_actions[:, :tokenizer_action_dim]
             hand_actions_raw = meta_actions[:, tokenizer_action_dim:]
 
-            # Override hand actions with motion data if configured
-            if self.config.get("use_motion_hand_actions", False):
-                motion_cmd = self.env.command_manager.get_term("motion")
-                left_action = motion_cmd.get_hand_action("left_hand")
-                right_action = motion_cmd.get_hand_action("right_hand")
+            # Teacher/residual execution may use reference hands while the
+            # student/direct-latent policy executes its own two hand primitives.
+            if action_mode == "residual":
+                motion_hand_mask = torch.full(
+                    (meta_actions.shape[0],),
+                    self._teacher_use_motion_hand_actions,
+                    device=meta_actions.device,
+                    dtype=torch.bool,
+                )
+            elif action_mode == "direct_latent":
+                motion_hand_mask = torch.full(
+                    (meta_actions.shape[0],),
+                    self._student_use_motion_hand_actions,
+                    device=meta_actions.device,
+                    dtype=torch.bool,
+                )
+            elif action_mode == "mixed":
+                motion_hand_mask = torch.where(
+                    is_teacher_env,
+                    torch.full_like(is_teacher_env, self._teacher_use_motion_hand_actions),
+                    torch.full_like(is_teacher_env, self._student_use_motion_hand_actions),
+                )
+            else:
+                raise ValueError(
+                    f"Unknown action_mode: {action_mode}. "
+                    f"Valid modes are 'direct_latent', 'residual', or 'mixed'."
+                )
 
-                if left_action is None or right_action is None:
-                    raise ValueError(
-                        "use_motion_hand_actions=True but hand_action_left/right not found in motion data. "
-                        "Ensure processed_robot_motions.pkl contains 'hand_action_left' and 'hand_action_right' arrays."  # noqa: E501
-                    )
-
+            if motion_hand_mask.any().item():
                 # Use motion data directly: -1.0 = open, +1.0 = closed
                 # Threshold at 0 in _convert_primitive_to_finger_actions
-                hand_actions_raw = torch.stack([left_action, right_action], dim=-1)
+                motion_hand_actions = self.get_reference_hand_actions()
+                hand_actions_raw = hand_actions_raw.clone()
+                hand_actions_raw[motion_hand_mask] = motion_hand_actions[motion_hand_mask]
+
+            # Action history and action-based rewards must reflect the primitives
+            # that are actually sent to the environment after source selection.
+            self.env._last_meta_action[:, tokenizer_action_dim:] = hand_actions_raw  # noqa: SLF001
 
             # Convert primitive actions to finger joint targets if enabled
             if self._use_finger_primitive and self._finger_primitive_map:
@@ -900,12 +965,6 @@ class ManagerEnvWrapper:
             elif action_mode == "mixed":
                 # Mixed rollout: some envs use teacher (residual), some use student (direct_latent)
                 # is_teacher_env is a boolean mask: True = teacher/residual, False = student/direct_latent
-                is_teacher_env = actions.get("is_teacher_env")
-                if is_teacher_env is None:
-                    raise ValueError(
-                        "action_mode='mixed' requires 'is_teacher_env' mask in actions dict"
-                    )
-
                 num_envs = tokenizer_meta_actions.shape[0]
                 atm = self.action_transform_module.actor_module
 

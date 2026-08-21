@@ -162,6 +162,29 @@ class PolicyCfg(ObsGroup):
 
 
 @configclass
+class StudentVectorCfg(ObsGroup):
+    """Single-frame structured observation group for the vector student.
+
+    The declaration order is part of the student input ABI.  Keep it aligned
+    with the corresponding Hydra observation configuration and the 138-dim
+    vector encoder.
+    """
+
+    object_bps = None
+    table_geometry = None
+    object_pos_b = None
+    object_ori_b_6d = None
+    hand_object_transform_6d = None
+    hand_object_contact_force_magnitude = None
+    base_lin_vel = None
+    base_ang_vel = None
+    joint_pos = None
+    joint_vel = None
+    projected_gravity = None
+    table_pos_b = None
+
+
+@configclass
 class PolicyAtmCfg(ObsGroup):
     """Observations for action_transform_module (ATM).
 
@@ -495,6 +518,7 @@ class ObservationsCfg:
     teacher: TeacherCfg = None  # Teacher observations for distillation
     camera_rgb: CameraRGBCfg = None  # Separate vision observation group
     state_token: PolicyCfg = None  # Current joint position + projected gravity token input
+    student_obs: StudentVectorCfg = None  # Structured non-visual diffusion-student input
     residual_action: ResidualAction = None
 
 
@@ -1035,25 +1059,24 @@ def motion_anchor_ori_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor
 
 
 def object_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    """Object position in robot body frame.
+    """Current simulated object position in the simulated pelvis frame.
 
-    Returns the object's position relative to the robot's anchor (pelvis),
-    fully transformed into the robot's local coordinate system.
+    Both poses come from the live simulation state.  In particular, this must
+    not use the reference object's motion or a reference root orientation.
 
     Returns:
         torch.Tensor: Object position in body frame, shape (num_envs, 3)
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-
-    # object_root_pos is (num_envs, num_objects, 3) - take first object
-    object_pos_w = command.object_root_pos[:, 0]  # (num_envs, 3)
-    object_quat_w = command.object_root_quat[:, 0]  # (num_envs, 4)
+    object_asset = utils.get_active_object(env)
+    robot_pos_w = command.robot.data.body_pos_w[:, command.robot_anchor_body_index]
+    robot_quat_w = command.robot.data.body_quat_w[:, command.robot_anchor_body_index]
 
     pos_b, _ = subtract_frame_transforms(
-        command.robot_anchor_pos_w,  # Robot anchor (pelvis) position
-        command.robot_anchor_quat_w,  # Robot anchor orientation
-        object_pos_w,
-        object_quat_w,
+        robot_pos_w,
+        robot_quat_w,
+        object_asset.data.root_pos_w,
+        object_asset.data.root_quat_w,
     )
     return pos_b.view(env.num_envs, -1)  # (num_envs, 3)
 
@@ -1074,31 +1097,31 @@ def object_bps(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
 
 
 def object_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    """Object orientation in robot body frame (quaternion representation).
+    """Current simulated object orientation in the simulated pelvis frame.
 
     Returns the object's orientation relative to the robot's anchor,
-    represented as quaternion (xyzw format).
+    represented as a quaternion in Isaac Lab's ``wxyz`` convention.
 
     Returns:
         torch.Tensor: Object orientation in body frame, shape (num_envs, 4)
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-
-    object_pos_w = command.object_root_pos[:, 0]
-    object_quat_w = command.object_root_quat[:, 0]
+    object_asset = utils.get_active_object(env)
+    robot_pos_w = command.robot.data.body_pos_w[:, command.robot_anchor_body_index]
+    robot_quat_w = command.robot.data.body_quat_w[:, command.robot_anchor_body_index]
 
     _, ori_b = subtract_frame_transforms(
-        command.robot_anchor_pos_w,
-        command.robot_anchor_quat_w,
-        object_pos_w,
-        object_quat_w,
+        robot_pos_w,
+        robot_quat_w,
+        object_asset.data.root_pos_w,
+        object_asset.data.root_quat_w,
     )
 
     return ori_b.view(env.num_envs, -1)  # (num_envs, 4)
 
 
 def object_ori_b_6d(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    """Object orientation in robot body frame (6D rotation representation).
+    """Current simulated object orientation in the simulated pelvis frame.
 
     Returns the object's orientation relative to the robot's anchor,
     represented as the first two columns of the rotation matrix.
@@ -1107,15 +1130,15 @@ def object_ori_b_6d(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
         torch.Tensor: Object orientation in body frame, shape (num_envs, 6)
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-
-    object_pos_w = command.object_root_pos[:, 0]
-    object_quat_w = command.object_root_quat[:, 0]
+    object_asset = utils.get_active_object(env)
+    robot_pos_w = command.robot.data.body_pos_w[:, command.robot_anchor_body_index]
+    robot_quat_w = command.robot.data.body_quat_w[:, command.robot_anchor_body_index]
 
     _, ori_b = subtract_frame_transforms(
-        command.robot_anchor_pos_w,
-        command.robot_anchor_quat_w,
-        object_pos_w,
-        object_quat_w,
+        robot_pos_w,
+        robot_quat_w,
+        object_asset.data.root_pos_w,
+        object_asset.data.root_quat_w,
     )
 
     mat = matrix_from_quat(ori_b)
@@ -1359,6 +1382,61 @@ def table_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
         table_quat_w,
     )
     return pos_b.view(env.num_envs, -1)  # (num_envs, 3)
+
+
+def table_geometry(
+    env: ManagerBasedEnv, command_name: str, table_size: tuple[float, float, float]
+) -> torch.Tensor:
+    """Return the table top's XY bounds in the robot-anchor frame.
+
+    The four values are ``[x_min, x_max, y_min, y_max]``.  Bounds are
+    computed from the four top-surface corners, so the result remains correct
+    when the table is rotated relative to the robot.  ``table_size`` follows
+    the simulator convention ``[width, depth, thickness]``.
+    """
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+
+    if "table" not in env.scene.rigid_objects:
+        return torch.zeros(env.num_envs, 4, device=env.device)
+
+    size = torch.as_tensor(table_size, device=env.device, dtype=torch.float32)
+    if size.numel() != 3:
+        raise ValueError(f"table_size must contain [width, depth, thickness], got {table_size}")
+    size = size.reshape(3)
+    width, depth, thickness = size.unbind()
+    half_width = width * 0.5
+    half_depth = depth * 0.5
+    half_thickness = thickness * 0.5
+    local_corners = torch.stack(
+        [
+            torch.stack([-half_width, -half_depth, half_thickness]),
+            torch.stack([-half_width, half_depth, half_thickness]),
+            torch.stack([half_width, -half_depth, half_thickness]),
+            torch.stack([half_width, half_depth, half_thickness]),
+        ],
+        dim=0,
+    )
+
+    table = env.scene["table"]
+    table_pos_w = table.data.root_pos_w
+    table_quat_w = table.data.root_quat_w
+    num_envs = table_pos_w.shape[0]
+    corners_local = local_corners.unsqueeze(0).expand(num_envs, -1, -1)
+    corners_world = quat_apply(
+        table_quat_w[:, None, :].expand(-1, 4, -1).reshape(-1, 4),
+        corners_local.reshape(-1, 3),
+    ).reshape(num_envs, 4, 3) + table_pos_w[:, None, :]
+
+    anchor_delta = corners_world - command.robot_anchor_pos_w[:, None, :]
+    anchor_inv = quat_inv(command.robot_anchor_quat_w)
+    corners_anchor = quat_apply(
+        anchor_inv[:, None, :].expand(-1, 4, -1).reshape(-1, 4),
+        anchor_delta.reshape(-1, 3),
+    ).reshape(num_envs, 4, 3)
+    xy = corners_anchor[..., :2]
+    mins = xy.amin(dim=1)
+    maxs = xy.amax(dim=1)
+    return torch.cat([mins[:, 0:1], maxs[:, 0:1], mins[:, 1:2], maxs[:, 1:2]], dim=-1)
 
 
 def table_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
@@ -2881,6 +2959,25 @@ def get_finger_tips_contact_force(env: ManagerBasedEnv, sensor_cfg: SceneEntityC
 
     # Shape: (N, 1, num_links, 3) -> select all tracked links and flatten.
     return force[:, 0, :, :].reshape(env.num_envs, -1)
+
+
+def get_hand_object_contact_force_magnitude(
+    env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg, expected_links: int = 8
+) -> torch.Tensor:
+    """Return one L2 contact-force magnitude for each configured hand link."""
+    sensor = env.scene[sensor_cfg.name]
+    force = sensor.data.force_matrix_w
+    if force.ndim != 4 or force.shape[1] != 1 or force.shape[-1] != 3:
+        raise ValueError(
+            "Expected contact force matrix with shape [B,1,num_links,3], "
+            f"got {tuple(force.shape)}"
+        )
+    link_forces = force[:, 0, :, :]
+    if link_forces.shape[1] != expected_links:
+        raise ValueError(
+            f"Expected {expected_links} configured contact links, got {link_forces.shape[1]}"
+        )
+    return torch.linalg.vector_norm(link_forces, dim=-1)
 
 
 def grab_contact_flag(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

@@ -1,8 +1,9 @@
-"""Diffusion-style latent policy for visual SONIC distillation.
+"""Diffusion-style latent policies for SONIC distillation.
 
 This module follows the conditioning pattern used by real-stanford's
 diffusion_policy: encode observations, denoise an action vector conditioned on
-those observations, and train with flow-matching or DDPM objectives.  The
+those observations, and train with flow-matching or DDPM objectives.  Both
+RGB and structured-vector condition encoders use the same diffusion head.  The
 action vector here is the SONIC decoder-input latent plus hand command.
 """
 
@@ -87,7 +88,12 @@ class EncoderRgbDiffusionPolicy(nn.Module):
         self.cond_dim = cond_dim
         timestep_dim = int(module_config_dict.get("timestep_dim", 128))
 
-        self.image_encoder = self._build_image_encoder(module_config_dict, image_feature_dim)
+        self.skip_image_encoder = bool(module_config_dict.get("_skip_image_encoder", False))
+        self.image_encoder = (
+            nn.Identity()
+            if self.skip_image_encoder
+            else self._build_image_encoder(module_config_dict, image_feature_dim)
+        )
         self.use_state_token = self.state_key is not None
         if self.use_state_token:
             if obs_dim_dict is None and env_config is not None:
@@ -114,18 +120,19 @@ class EncoderRgbDiffusionPolicy(nn.Module):
             self.state_dim = 0
             state_token_dim = 0
         self.normalize_image = bool(module_config_dict.get("normalize_image", True))
-        self.register_buffer(
-            "image_mean",
-            torch.tensor(module_config_dict.get("image_mean", [0.485, 0.456, 0.406])).view(
-                1, 3, 1, 1
-            ),
-        )
-        self.register_buffer(
-            "image_std",
-            torch.tensor(module_config_dict.get("image_std", [0.229, 0.224, 0.225])).view(
-                1, 3, 1, 1
-            ),
-        )
+        if not self.skip_image_encoder:
+            self.register_buffer(
+                "image_mean",
+                torch.tensor(module_config_dict.get("image_mean", [0.485, 0.456, 0.406])).view(
+                    1, 3, 1, 1
+                ),
+            )
+            self.register_buffer(
+                "image_std",
+                torch.tensor(module_config_dict.get("image_std", [0.229, 0.224, 0.225])).view(
+                    1, 3, 1, 1
+                ),
+            )
         self.cond_encoder = _build_mlp(
             image_feature_dim + state_token_dim,
             module_config_dict.get("cond_hidden_dims", [512]),
@@ -469,6 +476,144 @@ class EncoderRgbDiffusionPolicy(nn.Module):
             }
 
         return self._sample(cond)
+
+
+class EncoderVectorDiffusionPolicy(EncoderRgbDiffusionPolicy):
+    """Flow-matching latent policy conditioned on one structured vector.
+
+    This class intentionally reuses ``EncoderRgbDiffusionPolicy``'s diffusion
+    target, normalization, flow-matching, DDPM fallback, and sampling logic.
+    The RGB encoder is disabled before the parent is constructed, so no
+    ResNet or image buffers are created.  The condition path is a direct
+    ``observation_input_dim -> cond_dim`` MLP, matching the RGB policy's
+    post-encoder condition head.
+    """
+
+    def __init__(
+        self,
+        obs_dim_dict=None,
+        module_config_dict=None,
+        module_dim_dict=None,
+        env_config=None,
+        algo_config=None,
+        process_output_dim=False,
+        **kwargs,
+    ):
+        config = dict(module_config_dict or {})
+        self.observation_key = config.get("observation_key", "student_obs")
+        self.observation_input_dim = int(config.get("observation_input_dim", 138))
+        if obs_dim_dict is not None and self.observation_key in obs_dim_dict:
+            configured_dim = obs_dim_dict[self.observation_key]
+            if not isinstance(configured_dim, int):
+                configured_dim = int(torch.tensor(configured_dim).prod().item())
+            if configured_dim != self.observation_input_dim:
+                raise ValueError(
+                    f"{self.observation_key} configured dim mismatch: "
+                    f"observation manager reports {configured_dim}, "
+                    f"policy expects {self.observation_input_dim}"
+                )
+        # Strip inherited visual-adaptor keys before constructing the parent;
+        # the composed experiment may inherit the historical RGB config, but
+        # this policy must not retain or instantiate any visual submodule.
+        for visual_key in (
+            "image_key",
+            "image_shape",
+            "image_encoder_type",
+            "resnet_type",
+            "pretrained",
+            "trainable",
+            "normalize_image",
+            "image_mean",
+            "image_std",
+            "proprio_key",
+            "proprio_feature_dim",
+            "proprio_hidden_dims",
+            "fusion_hidden_dims",
+            "replace_terms",
+        ):
+            config.pop(visual_key, None)
+        config["_skip_image_encoder"] = True
+        # The parent uses image_feature_dim as the input width of cond_encoder;
+        # repurpose that width for the structured vector without constructing an
+        # image encoder.  state_key is deliberately disabled for this policy.
+        config["image_feature_dim"] = self.observation_input_dim
+        config["state_key"] = None
+        config["normalize_image"] = False
+
+        super().__init__(
+            obs_dim_dict=obs_dim_dict,
+            module_config_dict=config,
+            module_dim_dict=module_dim_dict,
+            env_config=env_config,
+            algo_config=algo_config,
+            process_output_dim=process_output_dim,
+            **kwargs,
+        )
+
+        normalization = config.get("observation_normalization", "standardize")
+        if normalization not in ("none", "standardize"):
+            raise ValueError(
+                "Unsupported observation_normalization="
+                f"{normalization}; expected 'none' or 'standardize'"
+            )
+        self.observation_normalization = normalization
+        self.observation_norm_momentum = float(
+            config.get("observation_norm_momentum", 0.05)
+        )
+        self.observation_norm_clip = float(config.get("observation_norm_clip", 5.0))
+        self.observation_std_eps = float(config.get("observation_std_eps", 1.0e-4))
+        self.register_buffer("observation_mean", torch.zeros(self.observation_input_dim))
+        self.register_buffer("observation_var", torch.ones(self.observation_input_dim))
+        self.register_buffer("observation_updates", torch.zeros((), dtype=torch.long))
+
+    @torch.no_grad()
+    def _update_observation_stats(self, observation):
+        if self.observation_normalization != "standardize":
+            return
+        flat = observation.detach().reshape(-1, self.observation_input_dim).float()
+        if flat.numel() == 0:
+            return
+        batch_mean = flat.mean(dim=0)
+        batch_var = flat.var(dim=0, unbiased=False).clamp_min(self.observation_std_eps**2)
+        if int(self.observation_updates.item()) == 0:
+            self.observation_mean.copy_(batch_mean.to(self.observation_mean))
+            self.observation_var.copy_(batch_var.to(self.observation_var))
+        else:
+            momentum = self.observation_norm_momentum
+            self.observation_mean.lerp_(batch_mean.to(self.observation_mean), momentum)
+            self.observation_var.lerp_(batch_var.to(self.observation_var), momentum)
+        self.observation_updates += 1
+
+    def _normalize_observation(self, observation):
+        if self.observation_normalization == "none":
+            return observation
+        mean = self.observation_mean.to(device=observation.device, dtype=observation.dtype)
+        std = self.observation_var.clamp_min(self.observation_std_eps**2).sqrt().to(
+            device=observation.device, dtype=observation.dtype
+        )
+        normalized = (observation - mean) / std
+        if self.observation_norm_clip > 0:
+            normalized = normalized.clamp(-self.observation_norm_clip, self.observation_norm_clip)
+        return normalized
+
+    def _encode_condition(self, obs_dict, update_state_stats=False):
+        if self.observation_key not in obs_dict:
+            raise KeyError(
+                f"EncoderVectorDiffusionPolicy requires observation key "
+                f"'{self.observation_key}'"
+            )
+        observation = obs_dict[self.observation_key].float()
+        if observation.shape[-1] != self.observation_input_dim:
+            observation = observation.reshape(*observation.shape[:-1], -1)
+        if observation.shape[-1] != self.observation_input_dim:
+            raise ValueError(
+                f"{self.observation_key} dim mismatch: got {observation.shape[-1]}, "
+                f"expected {self.observation_input_dim}"
+            )
+        if update_state_stats:
+            self._update_observation_stats(observation)
+        return self.cond_encoder(self._normalize_observation(observation))
+
 
 class EncoderRgbMlpPolicy(EncoderRgbDiffusionPolicy):
     """RGB/state latent policy trained with direct MSE, not diffusion loss."""

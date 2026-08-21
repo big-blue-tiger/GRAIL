@@ -1,0 +1,39 @@
+# @package _global_
+#
+# Non-visual structured-state diffusion student for the complete
+# pickup_table motion set.  The student architecture, flow-matching
+# target construction, DAgger rollout mixing, and frozen decoder path are
+# inherited from the apple vector experiment; this config only removes the
+# single-motion apple restriction and points all paired assets at the full
+# dataset.
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_apple_heading_w10_diffusion_decoder_latent_vector_obs
+  - _self_
+
+exp_var: robocasa_pickup_table_diffusion_decoder_latent_vector_obs
+experiment_name: ${exp_base}_${exp_var}
+
+# Match the official GRAIL paired-motion setup.  With fewer envs than motion
+# clips, each env keeps its deterministic motion/USD assignment; num_envs=80
+# can be used when one rollout should cover every currently available clip.
+num_envs: 16
+motion_shard_by_rank: true
+
+manager_env:
+  config:
+    object_usd_path: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd
+    multi_object_per_env: false
+
+  commands:
+    motion:
+      use_paired_motions: true
+      # Both filter locations must be cleared.  The parent apple experiment
+      # sets the same single key at command and motion-lib levels.
+      filter_motion_keys: null
+      motion_lib_cfg:
+        motion_file: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot
+        object_motion_file: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects
+        bps_dir: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps
+        filter_motion_keys: null
+        max_unique_motions: null

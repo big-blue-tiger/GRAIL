@@ -1,0 +1,8 @@
+hand_object_contact_force_magnitude:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:get_hand_object_contact_force_magnitude
+  params:
+    sensor_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: "object_to_hand_contact_sensor"
+    expected_links: 8

@@ -236,6 +236,10 @@ class PrinterHVCallback(TrainerCallback):  # noqa: F405
     A bare [`TrainerCallback`] that just prints the logs.
     """  # noqa: D200, D212
 
+    def __init__(self, loss_keys=None):
+        """Optionally restrict which ``loss/*`` metrics are printed to the console."""
+        self.loss_keys = None if loss_keys is None else frozenset(loss_keys)
+
     def on_log(self, args, state, control, logs=None, **kwargs):  # noqa: ARG002
         _ = logs.pop("total_flos", None)
         if state.is_world_process_zero:
@@ -257,6 +261,16 @@ class PrinterHVCallback(TrainerCallback):  # noqa: F405
                     else:
                         new_key = k.replace("objective/", "")
                         log_string += f"""{f'Mean {new_key}:':>{pad}} {v:.5f}\n"""
+
+            # Training losses are already aggregated across update steps and
+            # distributed workers by ``_get_train_metrics``.  Experiments may
+            # provide a console-only allowlist to hide inactive diagnostics
+            # without removing them from metric tracking.
+            for k, v in logs.items():
+                if k.startswith("loss/") and (
+                    self.loss_keys is None or k in self.loss_keys
+                ):
+                    log_string += f"""{f'{k}:':>{pad}} {v:.5f}\n"""
 
             env_log_string = ""
             ep_string = ""
@@ -612,9 +626,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             self.env,
             self.accelerator,
         )
-        self.add_callback(
-            PrinterHVCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK  # noqa: F405
-        )
+        if self.args.disable_tqdm:
+            self.add_callback(
+                PrinterHVCallback(loss_keys=self.config.get("console_loss_keys", None))
+            )
+        else:
+            self.add_callback(DEFAULT_PROGRESS_CALLBACK)  # noqa: F405
         self.control = TrainerControl()  # noqa: F405
         self.state = ppo_trainer.OnlineTrainerState(
             is_local_process_zero=self.is_local_process_zero(),
@@ -775,6 +792,14 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.diffusion_target_latent_mode = self.config.get(
             "diffusion_target_latent_mode", "decoder_input"
         )
+        self.diffusion_hand_target_source = self.config.get(
+            "diffusion_hand_target_source", "teacher_policy"
+        )
+        if self.diffusion_hand_target_source not in {"teacher_policy", "reference_motion"}:
+            raise ValueError(
+                "diffusion_hand_target_source must be 'teacher_policy' or 'reference_motion', "
+                f"got {self.diffusion_hand_target_source!r}"
+            )
 
     def _setup_storage(self):
         """Allocate rollout storage buffers and episode tracking accumulators.
@@ -1004,6 +1029,20 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         finally:
             for term_cfg, noise_cfg in saved_noises:
                 term_cfg.noise = noise_cfg
+
+        # The teacher executes reference hand primitives, so preserve the exact
+        # per-timestep values as the student's hand-action supervision.  Querying
+        # them later during minibatch updates would use the wrong motion frame.
+        if (
+            self.diffusion_decoder_distill
+            and self.diffusion_hand_target_source == "reference_motion"
+        ):
+            get_reference_hands = getattr(self.env, "get_reference_hand_actions", None)
+            if get_reference_hands is None:
+                raise RuntimeError(
+                    "reference_motion hand targets require env.get_reference_hand_actions()"
+                )
+            clean_obs["reference_hand_actions"] = get_reference_hands().detach()
 
         return clean_obs or None
 
@@ -1434,8 +1473,13 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         if needs_teacher:
             self.ref_model.eval()
             with torch.no_grad():
+                teacher_model_obs_dict = {
+                    key: value
+                    for key, value in mb_teacher_obs_dict.items()
+                    if key != "reference_hand_actions"
+                }
                 teacher_results = self.ref_model.act(
-                    obs_dict=mb_teacher_obs_dict, episode_attnmask=episode_attnmask
+                    obs_dict=teacher_model_obs_dict, episode_attnmask=episode_attnmask
                 )
                 if self.diffusion_decoder_distill:
                     diffusion_target = self._build_diffusion_decoder_target(
@@ -1494,9 +1538,26 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         can run in direct-latent mode.
         """
         latent_residual = teacher_action_mean[..., : self.diffusion_latent_dim].detach()
-        hand_action = teacher_action_mean[
-            ..., self.diffusion_latent_dim : self.diffusion_latent_dim + self.diffusion_hand_dim
-        ].detach()
+        if self.diffusion_hand_target_source == "reference_motion":
+            hand_action = obs_dict.get("reference_hand_actions")
+            if hand_action is None:
+                raise RuntimeError(
+                    "reference_motion hand target requested but reference_hand_actions "
+                    "was not stored in the rollout"
+                )
+            if hand_action.shape[:-1] != latent_residual.shape[:-1] or (
+                hand_action.shape[-1] != self.diffusion_hand_dim
+            ):
+                raise RuntimeError(
+                    "reference_hand_actions shape must match the teacher batch and hand dim; "
+                    f"got {tuple(hand_action.shape)}, expected "
+                    f"{tuple(latent_residual.shape[:-1]) + (self.diffusion_hand_dim,)}"
+                )
+            hand_action = hand_action.detach()
+        else:
+            hand_action = teacher_action_mean[
+                ..., self.diffusion_latent_dim : self.diffusion_latent_dim + self.diffusion_hand_dim
+            ].detach()
         if self.diffusion_target_latent_mode == "teacher_residual":
             return torch.cat([latent_residual, hand_action], dim=-1)
 

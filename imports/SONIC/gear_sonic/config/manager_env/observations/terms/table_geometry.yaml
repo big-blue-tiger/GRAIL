@@ -1,0 +1,6 @@
+table_geometry:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:table_geometry
+  params:
+    command_name: "motion"
+    table_size: ${manager_env.config.table_size}

@@ -14,12 +14,12 @@ defaults:
 exp_var: robocasa_apple_heading_w10_visual_adaptor_dagger
 experiment_name: ${exp_base}_${exp_var}
 
-num_envs: 1024
+num_envs: 16
 motion_shard_by_rank: false
 
 algo:
   config:
-    teacher_checkpoint: /root/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/apple_heading_w10_20260708_083408/last.pt
+    teacher_checkpoint: /home/tide/robot/GRAIL/imports/SONIC/models/pnp_table/last.pt
     teacher_input_key: actor_obs
     ppo_loss_coef: 0.0
     distill_teacher_loss_coef: 1.0
@@ -30,17 +30,17 @@ algo:
 
 manager_env:
   config:
-    gpu_collision_stack_size_exp: 30
-    object_usd_path: /root/GRAIL/data/motion_lib/mixed_robocasa_pickup_table_2_g1_ha/object_usd
+    gpu_collision_stack_size_exp: 28
+    object_usd_path: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd
 
   commands:
     motion:
-      filter_motion_keys: [apple_0_kid_indoor2-pickup-table_rand00001]
+      filter_motion_keys: [pickup_table__apple_0__000]
       motion_lib_cfg:
-        motion_file: /root/GRAIL/data/motion_lib/mixed_robocasa_pickup_table_2_g1_ha/robot
-        object_motion_file: /root/GRAIL/data/motion_lib/mixed_robocasa_pickup_table_2_g1_ha/objects
-        bps_dir: /root/GRAIL/data/motion_lib/mixed_robocasa_pickup_table_2_g1_ha/bps
-        filter_motion_keys: [apple_0_kid_indoor2-pickup-table_rand00001]
+        motion_file: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot
+        object_motion_file: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects
+        bps_dir: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps
+        filter_motion_keys: [pickup_table__apple_0__000]
         asset:
-          assetRoot: /root/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/
+          assetRoot: /home/tide/robot/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/
         smpl_motion_file: dummy

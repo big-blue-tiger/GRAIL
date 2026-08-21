@@ -2958,9 +2958,10 @@ class TrackingCommand(CommandTerm):
             self.cfg.motion_lib_cfg.get("motion_file", "") if self.cfg.motion_lib_cfg else ""
         )
         if motion_file and os.path.isdir(motion_file):
-            meta_dir = motion_file.replace("/robot", "/meta")
-        elif motion_file and "/robot" in motion_file:
-            meta_dir = os.path.dirname(motion_file).replace("/robot", "/meta")
+            motion_dir = os.path.normpath(motion_file)
+            meta_dir = os.path.join(os.path.dirname(motion_dir), "meta")
+        elif motion_file and os.path.basename(os.path.dirname(motion_file)) == "robot":
+            meta_dir = os.path.join(os.path.dirname(os.path.dirname(motion_file)), "meta")
         else:
             meta_dir = "data/motion_lib_grab/meta"
         meta_file = os.path.join(meta_dir, f"{motion_key}.pkl")
@@ -3298,6 +3299,24 @@ class TrackingCommand(CommandTerm):
                     sampled_times = self._sample_before_contact(env_ids, sampled_times)
 
                 self.motion_start_time_steps[env_ids] = sampled_times
+
+            if self.is_evaluating:
+                # Evaluation normally starts at frame zero.  Allow callers to
+                # request a deterministic later frame while safely clamping
+                # short motions to their final valid frame.
+                eval_start_frame = max(int(self.cfg.eval_start_frame), 0)
+                motion_num_steps = self.motion_lib.get_motion_num_steps(
+                    self.motion_ids[env_ids]
+                ).to(device=self.device)
+                max_start_frames = (motion_num_steps - 1).clamp_min(0).to(
+                    dtype=self.motion_start_time_steps.dtype
+                )
+                requested_start_frames = torch.full_like(
+                    max_start_frames, eval_start_frame
+                )
+                self.motion_start_time_steps[env_ids] = torch.minimum(
+                    requested_start_frames, max_start_frames
+                )
 
             if self.encoder_sample_probs is not None:
                 has_smpl = self.motion_lib.motion_has_smpl[self.motion_ids[env_ids]]
@@ -4599,6 +4618,10 @@ class TrackingCommandCfg(CommandTermCfg):
     # Always start from the first frame of the motion file during resampling
     # Useful for debugging and replaying specific motions from the beginning
     start_from_first_frame: bool = False
+
+    # Deterministic start frame used only while is_evaluating=True.  Values
+    # beyond a motion's length are clamped to its final valid frame.
+    eval_start_frame: int = 0
 
     # Sample each motion at most once (no duplicates across environments)
     # Requires num_envs <= num_available_motions, otherwise will error

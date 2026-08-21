@@ -25,9 +25,16 @@ algo:
     diffusion_target_latent_mode: decoder_input
     diffusion_latent_dim: 64
     diffusion_hand_dim: 2
+    # Teacher execution uses motion primitives, so supervise the student's two
+    # hand outputs with those same per-timestep reference values.
+    diffusion_hand_target_source: reference_motion
     compute_aux_loss: true
     aux_loss_scale: 1.0
     distill_rollout_with_action_mean: true
+    # Console-only filter: PPO has zero weight in this experiment and the
+    # aggregate auxiliary loss is the complete optimized objective.
+    console_loss_keys:
+      - loss/total_aux_loss_avg
 
     actor:
       _target_: gear_sonic.trl.modules.actor_critic_modules.Actor
@@ -75,3 +82,9 @@ manager_env:
     # The diffusion student predicts the full latent sent to the decoder, not a
     # residual to add to the ATM encoder output.
     use_student_direct_latent: true
+    # Teacher/residual execution follows the reference hand primitives.  The
+    # direct-latent student must execute its own final two policy outputs.
+    # Disable the inherited blanket override and select each source explicitly.
+    use_motion_hand_actions: false
+    teacher_use_motion_hand_actions: true
+    student_use_motion_hand_actions: false

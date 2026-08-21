@@ -897,6 +897,18 @@ class MySceneCfg(InteractiveSceneCfg):
                 else:
                     resolved_paths = [os.path.abspath(usd_path)]
 
+                if not resolved_paths:
+                    filter_hint = (
+                        f" after applying filter_motion_keys={filter_motion_keys!r}"
+                        if filter_motion_keys
+                        else ""
+                    )
+                    raise ValueError(
+                        f"No object USD files were resolved from {usd_path!r}{filter_hint}. "
+                        "Check that the motion keys exist in motion_file and that matching "
+                        "<motion_key>.usd files exist in object_usd_path."
+                    )
+
                 # --- Step 2: Spawn based on multi_object_per_env flag ---
                 if multi_object_per_env:
                     # MULTI-OBJECT MODE: One RigidObjectCfg per USD, all present in every env.

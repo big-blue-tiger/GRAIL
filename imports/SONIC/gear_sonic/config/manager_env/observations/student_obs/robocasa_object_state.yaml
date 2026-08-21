@@ -1,0 +1,22 @@
+# Single-frame structured observation for the non-visual diffusion student.
+# Term order is the student input ABI; the flattened dimension is 138.
+defaults:
+  - ../terms/object_bps@_here_
+  - ../terms/table_geometry@_here_
+  - ../terms/object_pos_b@_here_
+  - ../terms/object_ori_b_6d@_here_
+  - ../terms/hand_object_transform_6d@_here_
+  - ../terms/hand_object_contact_force_magnitude@_here_
+  - ../terms/base_lin_vel@_here_
+  - ../terms/base_ang_vel@_here_
+  - ../terms/joint_pos@_here_
+  - ../terms/joint_vel@_here_
+  - ../terms/projected_gravity@_here_
+  - ../terms/table_pos_b@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.observations.StudentVectorCfg
+enable_corruption: false
+concatenate_terms: true
+
+# The config intentionally leaves all terms uncorrupted.  This group is
+# privileged structured state supplied directly to the student backbone.

@@ -1,0 +1,60 @@
+# @package _global_
+#
+# Non-visual structured-state diffusion student for the apple tabletop task.
+# The DAgger/flow-matching/decoder-distillation path is inherited unchanged;
+# only the student condition source and camera-related environment nodes differ.
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_apple_heading_w10_diffusion_decoder_latent
+  - /manager_env/observations/student_obs: robocasa_object_state
+  - _self_
+
+exp_var: robocasa_apple_heading_w10_diffusion_decoder_latent_vector_obs
+experiment_name: ${exp_base}_${exp_var}
+
+algo:
+  config:
+    actor:
+      backbone:
+        _target_: gear_sonic.trl.modules.diffusion_policy_modules.EncoderVectorDiffusionPolicy
+        process_output_dim: true
+        module_config_dict:
+          observation_key: student_obs
+          observation_input_dim: 138
+          observation_normalization: standardize
+          observation_norm_momentum: 0.05
+          observation_norm_clip: 5.0
+          observation_std_eps: 1.0e-4
+          output_dim: [robot_action_dim]
+          cond_dim: 512
+          timestep_dim: 128
+          cond_hidden_dims: [512]
+          denoiser_hidden_dims: [1024, 1024, 512]
+          activation: SiLU
+          diffusion_objective: flow_matching
+          target_normalization: standardize
+          target_norm_momentum: 0.05
+          target_norm_clip: 5.0
+          target_std_eps: 1.0e-4
+          num_train_timesteps: 100
+          num_inference_steps: 4
+          num_timestep_buckets: 1000
+          noise_beta_alpha: 1.5
+          noise_beta_beta: 1.0
+          noise_s: 0.999
+          beta_start: 1.0e-4
+          beta_end: 2.0e-2
+          diffusion_loss_coef: 1.0
+
+manager_env:
+  observations:
+    # The inherited experiment enables this group for RGB.  Nulling it keeps
+    # the observation manager and trainer from requesting an ego camera.
+    camera_rgb: null
+  config:
+    enable_cameras: false
+    render_ego: false
+    render_results: false
+    overview_camera: false
+    cameras: null
+    camera_resolution: null
