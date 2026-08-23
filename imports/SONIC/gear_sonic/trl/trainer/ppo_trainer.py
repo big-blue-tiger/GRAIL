@@ -801,7 +801,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 f"got {self.diffusion_hand_target_source!r}"
             )
 
-        # Step-level DAgger mixing is opt-in so legacy DAgger experiments that
+        # Iteration-level DAgger mixing is opt-in so legacy DAgger experiments that
         # do not use the residual/direct-latent wrapper keep their old rollout.
         self.dagger_mixed_rollout = bool(
             self.config.get("use_dagger", False) and "dagger_rollout_mode" in self.config
@@ -828,10 +828,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             )
         if self.dagger_mixed_rollout:
             if self.ref_model is None:
-                raise ValueError("Step-level mixed DAgger rollout requires a frozen ref_model")
+                raise ValueError("Mixed DAgger rollout requires a frozen ref_model")
             if getattr(self.env, "action_transform_module", None) is None:
                 raise ValueError(
-                    "Step-level mixed DAgger rollout requires env.action_transform_module"
+                    "Mixed DAgger rollout requires env.action_transform_module"
                 )
 
         # A reference policy is never trainable and must never enter the
@@ -1119,15 +1119,15 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
 
     @staticmethod
     def _sample_dagger_teacher_mask(num_envs, student_ratio, device):
-        """Sample an exact-size per-step split (``True`` means Teacher)."""
+        """Sample an exact-size per-iteration split (``True`` means Teacher)."""
         if num_envs <= 0:
             raise ValueError(f"num_envs must be positive, got {num_envs}")
         if not 0.0 <= student_ratio <= 1.0:
             raise ValueError(f"student_ratio must be in [0, 1], got {student_ratio}")
 
         # Ratios that cannot be represented exactly by num_envs use the nearest
-        # integer, with .5 rounded upward. randperm changes membership every
-        # timestep while the number of Student environments stays exact.
+        # integer, with .5 rounded upward. The caller reuses this permutation
+        # for every environment step in the current rollout iteration.
         num_student = min(num_envs, int(math.floor(num_envs * student_ratio + 0.5)))
         permutation = torch.randperm(num_envs, device=device)
         is_teacher_env = torch.ones(num_envs, device=device, dtype=torch.bool)
@@ -1185,11 +1185,21 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         policy_model.init_rollout()
         teacher_model = None
         student_ratio = 1.0
+        is_teacher_env = None
         if self.dagger_mixed_rollout:
             teacher_model = self.ref_model
             teacher_model.eval()
             teacher_model.init_rollout()
             student_ratio = self._get_dagger_student_ratio()
+            # _rollout_step is called once per training iteration. Sample the
+            # Teacher/Student environment membership here so every step in this
+            # iteration uses the same split.
+            is_teacher_env = self._sample_dagger_teacher_mask(
+                self.num_envs, student_ratio, device
+            )
+            self._last_dagger_student_ratio = student_ratio
+            self._last_dagger_num_teacher = int(is_teacher_env.sum().item())
+            self._last_dagger_num_student = self.num_envs - self._last_dagger_num_teacher
         self.storage.clear()
 
         dones = torch.zeros(self.env.num_envs, device=device)
@@ -1204,7 +1214,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 if teacher_model is not None:
                     if clean_obs_dict is None:
                         raise RuntimeError(
-                            "Step-level mixed DAgger requires clean Teacher observations"
+                            "Mixed DAgger rollout requires clean Teacher observations"
                         )
                     teacher_obs_dict = obs_dict.copy()
                     teacher_obs_dict.update(
@@ -1214,22 +1224,14 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                             if key != "reference_hand_actions"
                         }
                     )
-                    # Both policies see the complete batch every timestep. This
-                    # keeps recurrent/history state valid when membership in the
-                    # execution mask changes at the next environment step.
+                    # Both policies see the complete batch every timestep so
+                    # their recurrent/history state remains valid throughout
+                    # the rollout.
                     teacher_state_dict = self.policy_step(
                         teacher_model, teacher_obs_dict, cur_dones=dones
                     )
-                    is_teacher_env = self._sample_dagger_teacher_mask(
-                        self.num_envs, student_ratio, device
-                    )
                     env_step_state = self._build_mixed_rollout_actions(
                         policy_state_dict, teacher_state_dict, is_teacher_env
-                    )
-                    self._last_dagger_student_ratio = student_ratio
-                    self._last_dagger_num_teacher = int(is_teacher_env.sum().item())
-                    self._last_dagger_num_student = (
-                        self.num_envs - self._last_dagger_num_teacher
                     )
 
                 # Append states to storage
