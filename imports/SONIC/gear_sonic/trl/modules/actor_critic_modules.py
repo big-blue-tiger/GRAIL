@@ -243,6 +243,58 @@ class Actor(nn.Module):
             action_mean = output
         return action_mean
 
+    def predict_action_chunk(self, obs_dict):
+        """Stateless action-chunk inference that bypasses the Gaussian policy API."""
+        if not getattr(self.actor_module, "is_action_chunk_policy", False):
+            raise RuntimeError("predict_action_chunk requires an action-chunk backbone")
+        obs_dict = obs_dict.copy()
+        if self.running_mean_std is not None:
+            obs_dict[self.input_key] = self.running_mean_std(obs_dict[self.input_key])
+        net_input = obs_dict if self.input_obs_dict else obs_dict[self.input_key]
+        chunk = self.actor_module.sample_action_chunk(net_input)
+        if chunk.shape[-1] != self.num_actions:
+            raise RuntimeError(
+                f"Action chunk last dim must be {self.num_actions}, got {tuple(chunk.shape)}"
+            )
+        invalid = ~torch.isfinite(chunk)
+        if invalid.any():
+            if self.safe_nan:
+                print(  # noqa: T201
+                    "[WARNING] Invalid action chunk entries detected; replacing them with 0.0"
+                )
+                chunk = torch.nan_to_num(chunk, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                raise FloatingPointError("Action chunk contains NaN or Inf")
+        return chunk
+
+    def compute_action_chunk_loss(
+        self,
+        obs_dict,
+        diffusion_target,
+        diffusion_target_valid,
+        update_running_stats=False,
+    ):
+        """DDP-safe CFM forward without Normal/log-prob/value computation."""
+        if not getattr(self.actor_module, "is_action_chunk_policy", False):
+            raise RuntimeError("compute_action_chunk_loss requires an action-chunk backbone")
+        obs_dict = obs_dict.copy()
+        if self.running_mean_std is not None:
+            obs_dict[self.input_key] = self.running_mean_std(obs_dict[self.input_key])
+        net_input = obs_dict if self.input_obs_dict else obs_dict[self.input_key]
+        return self.actor_module(
+            net_input,
+            compute_aux_loss=True,
+            diffusion_target=diffusion_target,
+            diffusion_target_valid=diffusion_target_valid,
+            update_running_stats=update_running_stats,
+        )
+
+    @torch.no_grad()
+    def update_action_chunk_normalizers(self, obs_dict, diffusion_target, valid):
+        if not getattr(self.actor_module, "is_action_chunk_policy", False):
+            raise RuntimeError("update_action_chunk_normalizers requires an action-chunk backbone")
+        self.actor_module.update_chunk_normalizers(obs_dict, diffusion_target, valid)
+
     @property
     def has_normalized_actions(self):
         return False
@@ -274,6 +326,11 @@ class Actor(nn.Module):
             is_training: Forwarded to ``forward`` to enable aux loss collection.
             **kwargs: Forwarded to ``forward``.
         """
+        if getattr(self.actor_module, "is_action_chunk_policy", False):
+            raise RuntimeError(
+                "Action-chunk policies must use predict_action_chunk(); "
+                "the Actor Normal/log-prob path is intentionally disabled"
+            )
         mean = self.forward(
             obs_dict, episode_attnmask=episode_attnmask, is_training=is_training, **kwargs
         )
@@ -578,10 +635,13 @@ class Actor(nn.Module):
         self.obs_dict_buffer = TensorDict()
         self.dones_buffer = None
         self.steps = 0
-        del self.distribution
+        # Keep lifecycle state present so repeated init/clear cycles are
+        # idempotent.  Deleting these attributes made the second DAgger
+        # rollout fail when the frozen Teacher did not produce aux losses.
+        self.distribution = None
         if self.has_aux_loss:
-            del self.aux_losses
-            del self.aux_loss_coef
+            self.aux_losses = None
+            self.aux_loss_coef = None
 
     def eval_mode(self):
         self.is_eval_mode = True

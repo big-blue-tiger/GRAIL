@@ -56,6 +56,7 @@ from tqdm import tqdm  # noqa: E402, F401
 
 from gear_sonic.trl.callbacks import hv_callback_handler  # noqa: E402
 from gear_sonic.trl.modules import data_utils  # noqa: E402
+from gear_sonic.trl.modules.action_chunk import ActionChunkExecutor  # noqa: E402
 from gear_sonic.trl.utils import (
     common,
     rl,
@@ -139,6 +140,7 @@ class PolicyAndValueWrapper(nn.Module):
             - ``"policy_distill"`` -- policy forward for distillation (no log-probs).
             - ``"policy_distill_ppo"`` -- distillation forward that also computes
               log-probs for PPO training.
+            - ``"policy_chunk_distill"`` -- masked action-chunk CFM without PPO.
             - ``"policy_w_and_wo_imgaug"`` -- two policy forwards (with and without
               image augmentation) for image-augmentation BC loss.
             - ``"policy_deterministic"`` -- deterministic (mean) action only.
@@ -180,6 +182,8 @@ class PolicyAndValueWrapper(nn.Module):
             }
             if "normalized_actions" in policy_state_dict:
                 results["normalized_actions"] = policy_state_dict["normalized_actions"]
+        elif mode == "policy_chunk_distill":
+            results = self.policy.compute_action_chunk_loss(**kwargs)
         elif mode == "policy_w_and_wo_imgaug":
             # The first forward is without image augmentation
             self.policy.transform_eval()
@@ -250,8 +254,15 @@ class PrinterHVCallback(TrainerCallback):  # noqa: F405
             log_string = (
                 f"""{print_str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {logs['fps']:.0f} steps/s (Collection: {logs['collection_time']:.3f}s, Learning {logs['learn_time']:.3f}s)\n"""  # noqa: E501
-                f"""{'Mean action noise std:':>{pad}} {logs['Policy/mean_noise_std']:.2f}\n"""
             )
+            # Pure action-chunk CFM deliberately bypasses the Actor Normal
+            # distribution and freezes its std, so this PPO-only metric is not
+            # present in chunk logs.
+            if "Policy/mean_noise_std" in logs:
+                log_string += (
+                    f"{'Mean action noise std:':>{pad}} "
+                    f"{logs['Policy/mean_noise_std']:.2f}\n"
+                )
 
             for k, v in logs.items():
                 if k.startswith("objective/"):
@@ -548,21 +559,30 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         args.is_main_process = accelerator.is_main_process
         args.local_batch_size = self.env.config.num_envs
         args.batch_size = int(args.local_batch_size * args.world_size)
-        try:
-            args.mini_batch_size = ppo_trainer.exact_div(
-                args.batch_size,
-                args.num_mini_batches,
-                "`batch_size` must be a multiple of `num_mini_batches`",
-            )
-            args.local_mini_batch_size = ppo_trainer.exact_div(
-                args.local_batch_size,
-                args.num_mini_batches,
-                "`local_batch_size` must be a multiple of `num_mini_batches`",
-            )
-        except Exception as e:  # noqa: BLE001
-            print(f"Error: {e}")  # noqa: T201
-            args.mini_batch_size = 1
-            args.local_mini_batch_size = 1
+        chunk_config = self.config.get("action_chunk", {}) or {}
+        if chunk_config.get("enabled", False):
+            # Chunk CFM batches mature E*16 anchors later and applies its own
+            # fixed minibatch schedule.  PPO's env-count divisibility check is
+            # irrelevant here and produces a false error for small GPU smokes
+            # such as num_envs=2.
+            args.mini_batch_size = args.batch_size
+            args.local_mini_batch_size = args.local_batch_size
+        else:
+            try:
+                args.mini_batch_size = ppo_trainer.exact_div(
+                    args.batch_size,
+                    args.num_mini_batches,
+                    "`batch_size` must be a multiple of `num_mini_batches`",
+                )
+                args.local_mini_batch_size = ppo_trainer.exact_div(
+                    args.local_batch_size,
+                    args.num_mini_batches,
+                    "`local_batch_size` must be a multiple of `num_mini_batches`",
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"Error: {e}")  # noqa: T201
+                args.mini_batch_size = 1
+                args.local_mini_batch_size = 1
 
         if args.per_device_train_batch_size is None:
             args.per_device_train_batch_size = (
@@ -760,6 +780,72 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.num_act = self.policy_model.num_actions
 
         self.num_steps_per_env = self.config.num_steps_per_env
+        self.action_chunk_config = self.config.get("action_chunk", {}) or {}
+        self.action_chunk_enabled = bool(self.action_chunk_config.get("enabled", False))
+        self.action_chunk_horizon = int(self.action_chunk_config.get("horizon", 1))
+        self.action_chunk_target_offset = int(
+            self.action_chunk_config.get("target_offset", 0)
+        )
+        self.action_chunk_train_execute_steps = int(
+            self.action_chunk_config.get("train_execute_steps", self.num_steps_per_env)
+        )
+        self.action_chunk_eval_execute_steps = int(
+            self.action_chunk_config.get("eval_execute_steps", 1)
+        )
+        self.action_chunk_capacity = int(self.action_chunk_config.get("buffer_capacity", 64))
+        self.action_chunk_target_batch_size = int(
+            self.action_chunk_config.get("target_build_batch_size", 1024)
+        )
+        self.action_chunk_num_epochs = int(
+            self.action_chunk_config.get("num_learning_epochs", 3)
+        )
+        self.action_chunk_num_minibatches = int(
+            self.action_chunk_config.get("num_mini_batches", 4)
+        )
+        self.action_chunk_replan_on_discontinuity = bool(
+            self.action_chunk_config.get("replan_on_discontinuity", True)
+        )
+        if self.action_chunk_enabled:
+            if self.action_chunk_target_offset != 0:
+                raise ValueError("Only s_t -> [a_t,...,a_t+H-1] target_offset=0 is supported")
+            if self.action_chunk_train_execute_steps != self.num_steps_per_env:
+                raise ValueError(
+                    "action_chunk.train_execute_steps must equal num_steps_per_env; got "
+                    f"{self.action_chunk_train_execute_steps} and {self.num_steps_per_env}"
+                )
+            if not 0 < self.action_chunk_train_execute_steps <= self.action_chunk_horizon:
+                raise ValueError("Invalid action chunk train execution length")
+            if not 0 < self.action_chunk_eval_execute_steps <= self.action_chunk_horizon:
+                raise ValueError("Invalid action chunk eval execution length")
+            if self.action_chunk_capacity <= (
+                self.action_chunk_horizon + self.num_steps_per_env
+            ):
+                raise ValueError(
+                    "action_chunk.buffer_capacity must be strictly greater than "
+                    "horizon + num_steps_per_env"
+                )
+            if self.action_chunk_target_batch_size <= 0:
+                raise ValueError("action_chunk.target_build_batch_size must be positive")
+            if self.action_chunk_num_epochs <= 0 or self.action_chunk_num_minibatches <= 0:
+                raise ValueError("action chunk epoch/minibatch counts must be positive")
+            if self.args.gradient_accumulation_steps != 1:
+                raise ValueError(
+                    "action-chunk CFM currently requires gradient_accumulation_steps=1"
+                )
+            if not self.config.get("distill_only", False):
+                raise ValueError("action-chunk CFM requires distill_only=true")
+            if not self.config.get("freeze_noise_std", False):
+                raise ValueError("action-chunk CFM requires freeze_noise_std=true")
+            if self.value_model is not None:
+                raise ValueError("action-chunk CFM must not instantiate a value model")
+            if not getattr(self.policy_model.actor_module, "is_action_chunk_policy", False):
+                raise ValueError("action_chunk.enabled requires an action-chunk policy backbone")
+            if self.policy_model.actor_module.action_horizon != self.action_chunk_horizon:
+                raise ValueError(
+                    "Policy and trainer action horizons differ: "
+                    f"{self.policy_model.actor_module.action_horizon} vs "
+                    f"{self.action_chunk_horizon}"
+                )
         self.use_padding_mask = self.config.get("use_padding_mask", False)
         self.ppo_shuffle_every_epoch = self.config.get("ppo_shuffle_every_epoch", True)
         self.empty_cache_every_n_ppo_epoch = self.config.get("empty_cache_every_n_ppo_epoch", -1)
@@ -786,6 +872,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.diffusion_decoder_distill = (
             self.config.get("diffusion_decoder_distill", False) and self.ref_model is not None
         )
+        if self.action_chunk_enabled and not self.diffusion_decoder_distill:
+            raise ValueError(
+                "action-chunk CFM requires diffusion_decoder_distill and a frozen Teacher"
+            )
         self.diffusion_latent_dim = int(self.config.get("diffusion_latent_dim", 64))
         self.diffusion_hand_dim = int(self.config.get("diffusion_hand_dim", 2))
         self.diffusion_target_key = self.config.get("diffusion_target_key", "diffusion_target")
@@ -859,6 +949,25 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         buffers in a ``RolloutStorage`` instance sized for
         ``(num_envs, num_steps_per_env)``.
         """
+        if self.action_chunk_enabled:
+            self.storage = None
+            # `algo_obs_dim_dict` stores flattened feature counts (for example
+            # proprio_obs=805), while the environment returns structured
+            # tensors (for example [E,5,161]).  Allocate the ring from the
+            # first real reset observation in `_train_action_chunk` instead of
+            # guessing its storage shape here.
+            self.action_chunk_buffer = None
+            self._chunk_episode_uid = torch.zeros(
+                self.env.num_envs, dtype=torch.long, device=self.accelerator.device
+            )
+            self._chunk_transition_id = torch.zeros(
+                self.env.num_envs, dtype=torch.long, device=self.accelerator.device
+            )
+            self._chunk_latest_batch = None
+            self._chunk_metrics = {}
+            self._setup_episode_tracking()
+            return
+
         self.storage = data_utils.RolloutStorage(
             self.env.num_envs, self.num_steps_per_env, device=self.accelerator.device
         )
@@ -892,6 +1001,36 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 "normalized_actions", shape=(self.num_act,), dtype=torch.float
             )
 
+        self._setup_episode_tracking()
+
+    def _initialize_action_chunk_buffer(self, obs_dict):
+        """Allocate the delayed-label ring from runtime observation shapes."""
+        observation_shapes = {}
+        for key in ("proprio_obs", "privileged_obs"):
+            if key not in obs_dict:
+                raise KeyError(f"Action-chunk training requires observation '{key}'")
+            value = obs_dict[key]
+            if not torch.is_tensor(value):
+                raise TypeError(f"Action-chunk observation '{key}' must be a tensor")
+            if value.ndim < 2 or value.shape[0] != self.env.num_envs:
+                raise ValueError(
+                    f"Action-chunk observation '{key}' must start with "
+                    f"[{self.env.num_envs},...], got {tuple(value.shape)}"
+                )
+            observation_shapes[key] = tuple(value.shape[1:])
+
+        self.action_chunk_buffer = data_utils.ActionChunkDaggerBuffer(
+            num_envs=self.env.num_envs,
+            capacity=self.action_chunk_capacity,
+            horizon=self.action_chunk_horizon,
+            rollout_steps=self.num_steps_per_env,
+            action_dim=self.num_act,
+            observation_shapes=observation_shapes,
+            device=self.accelerator.device,
+        )
+
+    def _setup_episode_tracking(self):
+        """Initialize episode/logging state shared by PPO and chunk-only training."""
         self.state.rewbuffer = deque(maxlen=100)
         self.state.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(
@@ -1162,6 +1301,224 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         env_step_state["is_teacher_env"] = is_teacher_env
         return env_step_state
 
+    def _action_chunk_motion_metadata(self, allow_transition_fallback=True):
+        command = getattr(self.env, "motion_command", None)
+        if command is None:
+            if not allow_transition_fallback:
+                return None
+            zeros = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.accelerator.device
+            )
+            return zeros, self._chunk_transition_id.clone()
+        motion_id = command.motion_ids.to(self.accelerator.device).long().clone()
+        reference_frame = (
+            command.motion_start_time_steps + command.time_steps
+        ).to(self.accelerator.device).long().clone()
+        return motion_id, reference_frame
+
+    def _build_action_chunk_teacher_targets(self, clean_obs, teacher_mean):
+        """Build full decoder targets once for a time-major rollout block."""
+        steps, envs = teacher_mean.shape[:2]
+        total = steps * envs
+        finite = torch.isfinite(teacher_mean).all(dim=-1)
+        for value in clean_obs.values():
+            if torch.is_tensor(value) and value.shape[:2] == (steps, envs):
+                if value.is_floating_point():
+                    finite &= torch.isfinite(value).reshape(steps, envs, -1).all(dim=-1)
+
+        flat_mean = torch.nan_to_num(teacher_mean).reshape(total, -1)
+        flat_obs = {}
+        for key, value in clean_obs.items():
+            if torch.is_tensor(value) and value.shape[:2] == (steps, envs):
+                flattened = value.reshape(total, *value.shape[2:])
+                flat_obs[key] = torch.nan_to_num(flattened) if value.is_floating_point() else flattened
+            else:
+                flat_obs[key] = value
+
+        targets = []
+        for start in range(0, total, self.action_chunk_target_batch_size):
+            end = min(start + self.action_chunk_target_batch_size, total)
+            obs_batch = {
+                key: value[start:end]
+                if torch.is_tensor(value) and value.shape[0] == total
+                else value
+                for key, value in flat_obs.items()
+            }
+            targets.append(
+                self._build_diffusion_decoder_target(obs_batch, flat_mean[start:end])
+            )
+        target = torch.cat(targets, dim=0).reshape(steps, envs, self.num_act)
+        finite &= torch.isfinite(target).all(dim=-1)
+        return torch.nan_to_num(target), finite
+
+    def _rollout_step_action_chunk(self, model, obs_dict):
+        """Collect 16 mixed-DAgger steps using cached 40-frame Student plans."""
+        if self.action_chunk_buffer is None:
+            raise RuntimeError(
+                "Action chunk buffer is not initialized from runtime observations"
+            )
+        if not self.dagger_mixed_rollout or self.ref_model is None:
+            raise RuntimeError("Action-chunk rollout requires mixed DAgger and a Teacher")
+        self._train_rollout_mode()
+        device = self.accelerator.device
+        student = model.policy
+        teacher = self.ref_model
+        teacher.eval()
+        teacher.init_rollout()
+
+        student_ratio = self._get_dagger_student_ratio()
+        is_teacher_env = self._sample_dagger_teacher_mask(
+            self.num_envs, student_ratio, device
+        )
+        is_student_env = ~is_teacher_env
+        executor = ActionChunkExecutor(
+            policy=student,
+            num_envs=self.num_envs,
+            horizon=self.action_chunk_horizon,
+            execute_steps=self.action_chunk_train_execute_steps,
+            action_dim=self.num_act,
+            device=device,
+        )
+        self._last_dagger_student_ratio = student_ratio
+        self._last_dagger_num_teacher = int(is_teacher_env.sum().item())
+        self._last_dagger_num_student = int(is_student_env.sum().item())
+
+        obs_staging = {"proprio_obs": [], "privileged_obs": []}
+        clean_staging = {}
+        teacher_mean_staging = []
+        episode_staging = []
+        motion_staging = []
+        frame_staging = []
+        transition_staging = []
+        done_staging = []
+        obs_finite_staging = []
+        dones = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        previous_motion = None
+        previous_frame = None
+
+        with torch.no_grad():
+            for step in range(self.num_steps_per_env):
+                motion_id, reference_frame = self._action_chunk_motion_metadata()
+                discontinuity = torch.zeros_like(dones)
+                if previous_motion is not None:
+                    discontinuity = (motion_id != previous_motion) | (
+                        reference_frame != previous_frame + 1
+                    )
+                    if not self.action_chunk_replan_on_discontinuity:
+                        discontinuity.zero_()
+                student_action = executor.act(
+                    obs_dict,
+                    reset_mask=dones,
+                    discontinuity_mask=discontinuity,
+                    active_mask=is_student_env,
+                )
+                previous_motion = motion_id
+                previous_frame = reference_frame
+
+                clean_obs = self._compute_clean_obs_dict(obs_dict)
+                if clean_obs is None:
+                    raise RuntimeError("Action-chunk DAgger requires clean Teacher observations")
+                teacher_obs = obs_dict.copy()
+                teacher_obs.update(
+                    {
+                        key: value
+                        for key, value in clean_obs.items()
+                        if key != "reference_hand_actions"
+                    }
+                )
+                teacher_state = self.policy_step(teacher, teacher_obs, cur_dones=dones)
+                executed = student_action.clone()
+                executed[is_teacher_env] = teacher_state["actions"].detach()[is_teacher_env]
+                env_step_state = {
+                    "actions": executed,
+                    "executed_actions": executed,
+                    "obs_dict": obs_dict,
+                    "action_mode": "mixed",
+                    "is_teacher_env": is_teacher_env,
+                }
+
+                for key in obs_staging:
+                    value = obs_dict[key].detach()
+                    obs_staging[key].append(value)
+                obs_finite = torch.ones(self.num_envs, dtype=torch.bool, device=device)
+                for value in (obs_dict["proprio_obs"], obs_dict["privileged_obs"]):
+                    obs_finite &= torch.isfinite(value).reshape(self.num_envs, -1).all(dim=-1)
+                obs_finite_staging.append(obs_finite)
+                for key, value in clean_obs.items():
+                    if torch.is_tensor(value):
+                        clean_staging.setdefault(key, []).append(value.detach())
+                teacher_mean_staging.append(teacher_state["action_mean"].detach())
+                episode_staging.append(self._chunk_episode_uid.clone())
+                motion_staging.append(motion_id)
+                frame_staging.append(reference_frame)
+                transition_staging.append(self._chunk_transition_id.clone())
+
+                results = self.env.step(env_step_state)
+                obs_dict, rewards, dones, infos = results[:4]
+                for key in obs_dict:
+                    obs_dict[key] = obs_dict[key].to(device)
+                rewards = rewards.to(device)
+                dones = dones.to(device=device, dtype=torch.bool).reshape(-1)
+                done_staging.append(dones.clone())
+
+                rewards_stored = rewards.unsqueeze(1) if rewards.dim() == 1 else rewards
+                self.ep_infos.append(infos["episode"])
+                self._process_env_step(rewards, dones, infos)
+                self.cur_reward_sum += rewards_stored
+                self.cur_episode_length += 1
+                new_ids = dones.nonzero(as_tuple=False)
+                self.state.rewbuffer.extend(
+                    self.cur_reward_sum[new_ids].cpu().numpy().tolist()
+                )
+                self.state.lenbuffer.extend(
+                    self.cur_episode_length[new_ids].cpu().numpy().tolist()
+                )
+                self.cur_reward_sum[new_ids] = 0
+                self.cur_episode_length[new_ids] = 0
+                self._chunk_episode_uid[dones] += 1
+                self._chunk_transition_id += 1
+
+        teacher.clear_rollout()
+        stacked_obs = {key: torch.stack(value, dim=0) for key, value in obs_staging.items()}
+        stacked_clean = {key: torch.stack(value, dim=0) for key, value in clean_staging.items()}
+        teacher_mean = torch.stack(teacher_mean_staging, dim=0)
+        teacher_target, target_finite = self._build_action_chunk_teacher_targets(
+            stacked_clean, teacher_mean
+        )
+        frame_finite = torch.stack(obs_finite_staging, dim=0) & target_finite
+        self.action_chunk_buffer.append(
+            observations=stacked_obs,
+            teacher_target=teacher_target,
+            episode_uid=torch.stack(episode_staging, dim=0),
+            motion_id=torch.stack(motion_staging, dim=0),
+            reference_frame=torch.stack(frame_staging, dim=0),
+            transition_id=torch.stack(transition_staging, dim=0),
+            frame_finite=frame_finite,
+            done_after_action=torch.stack(done_staging, dim=0),
+        )
+        self._chunk_latest_batch = self.action_chunk_buffer.pop()
+        valid_count = (
+            int(self._chunk_latest_batch["diffusion_target_valid"].sum().item())
+            if self._chunk_latest_batch is not None
+            else 0
+        )
+        total_count = self.num_envs * self.num_steps_per_env
+        self._chunk_metrics = {
+            "chunk/buffer_size": float(self.action_chunk_buffer.size),
+            "chunk/valid_anchors": float(valid_count),
+            "chunk/valid_ratio": float(valid_count / total_count)
+            if self._chunk_latest_batch is not None
+            else 0.0,
+            "chunk/student_model_calls": float(executor.model_calls),
+            "chunk/replanned_envs": float(executor.replanned_envs),
+        }
+        if self._chunk_latest_batch is not None:
+            for reason, check in self._chunk_latest_batch["validity_checks"].items():
+                self._chunk_metrics[f"chunk/invalid_{reason}"] = float(
+                    (~check).sum().item()
+                )
+        return obs_dict
+
     def _rollout_step(self, model, obs_dict):
         """Collect a full rollout of ``num_steps_per_env`` transitions and compute returns.
 
@@ -1178,6 +1535,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             The final observation dict after the last environment step,
             to be used as the starting point for the next rollout.
         """
+        if self.action_chunk_enabled:
+            return self._rollout_step_action_chunk(model, obs_dict)
         self._train_rollout_mode()
         device = self.accelerator.device
         policy_model = model.policy
@@ -2133,6 +2492,269 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
 
         return metrics
 
+    @staticmethod
+    def _all_reduce_count(count):
+        count = count.clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(count)
+        return count
+
+    def _train_action_chunk_batch(self, model, batch):
+        """Run the fixed 3x4 globally weighted masked-CFM update schedule."""
+        if batch is None:
+            return {"optimizer_steps": 0, "loss": 0.0, "global_valid": 0}
+        obs_dict = batch["obs_dict"]
+        target = batch["diffusion_target"]
+        valid = batch["diffusion_target_valid"].bool()
+        prefix = valid.shape
+        flat_count = math.prod(prefix)
+        flat_obs = {
+            key: value.reshape(flat_count, *value.shape[len(prefix) :])
+            for key, value in obs_dict.items()
+        }
+        flat_target = target.reshape(
+            flat_count, self.action_chunk_horizon, self.num_act
+        )
+        flat_valid = valid.reshape(flat_count)
+
+        # Update all three EMA normalizers exactly once per mature batch.  The
+        # policy implementation all-reduces masked moments across ranks.
+        self.policy_model.update_action_chunk_normalizers(
+            flat_obs, flat_target, flat_valid
+        )
+        valid_indices = flat_valid.nonzero(as_tuple=False).squeeze(-1)
+        local_valid_total = torch.tensor(
+            valid_indices.numel(), device=self.accelerator.device, dtype=torch.long
+        )
+        global_valid_total = self._all_reduce_count(local_valid_total)
+        if global_valid_total.item() == 0:
+            return {"optimizer_steps": 0, "loss": 0.0, "global_valid": 0}
+
+        self._train_mode()
+        losses = []
+        optimizer_steps = 0
+        world_size = self.accelerator.num_processes
+        for _epoch in range(self.action_chunk_num_epochs):
+            if valid_indices.numel() > 0:
+                permutation = valid_indices[
+                    torch.randperm(valid_indices.numel(), device=valid_indices.device)
+                ]
+            else:
+                permutation = valid_indices
+            minibatches = torch.tensor_split(
+                permutation, self.action_chunk_num_minibatches
+            )
+            for indices in minibatches:
+                local_count = torch.tensor(
+                    indices.numel(), device=self.accelerator.device, dtype=torch.long
+                )
+                global_count = self._all_reduce_count(local_count)
+                if global_count.item() == 0:
+                    continue
+                if indices.numel() == 0:
+                    mb_obs = {
+                        key: torch.zeros_like(value[:1]) for key, value in flat_obs.items()
+                    }
+                    mb_target = torch.zeros_like(flat_target[:1])
+                    mb_valid = torch.zeros(1, dtype=torch.bool, device=flat_target.device)
+                else:
+                    mb_obs = {
+                        key: value.index_select(0, indices) for key, value in flat_obs.items()
+                    }
+                    mb_target = flat_target.index_select(0, indices)
+                    mb_valid = torch.ones(
+                        indices.numel(), dtype=torch.bool, device=flat_target.device
+                    )
+
+                results = model.forward(
+                    modes=["policy_chunk_distill"],
+                    input_kwargs={
+                        "policy_chunk_distill": {
+                            "obs_dict": mb_obs,
+                            "diffusion_target": mb_target,
+                            "diffusion_target_valid": mb_valid,
+                            "update_running_stats": False,
+                        }
+                    },
+                )["policy_chunk_distill"]
+                local_loss = results["aux_losses"]["diffusion_flow"]
+                loss_coef = results["aux_loss_coef"].get("diffusion_flow", 1.0)
+                scale = (
+                    world_size
+                    * float(indices.numel())
+                    / float(global_count.item())
+                )
+                loss = local_loss * loss_coef * self.config.get("aux_loss_scale", 1.0) * scale
+                self.accelerator.backward(loss)
+                grad_norm = self._gradient_clipping()
+                if grad_norm is not None:
+                    self.optimizer.step()
+                    optimizer_steps += 1
+                else:
+                    print("NaN in action-chunk gradient; optimizer step skipped")  # noqa: T201
+                self.optimizer.zero_grad()
+                losses.append(float(local_loss.detach().item()))
+        return {
+            "optimizer_steps": optimizer_steps,
+            "loss": float(np.mean(losses)) if losses else 0.0,
+            "global_valid": int(global_valid_total.item()),
+        }
+
+    def _train_action_chunk(self):
+        """Pure delayed-DAgger CFM loop, deliberately independent of PPO/GAE."""
+        args = self.args
+        accelerator = self.accelerator
+        device = accelerator.device
+        model = self.model
+        accelerator.print("===training action-chunk flow policy===")
+        start_time = time.time()
+        self.state.max_steps = args.num_total_batches
+        self.state.num_train_epochs = args.total_episodes / self.train_dataset_len
+        for name in ("logging", "eval", "save"):
+            value = getattr(args, f"{name}_steps", None)
+            if value is not None:
+                setattr(
+                    self.state,
+                    f"{name}_steps",
+                    math.ceil(self.state.max_steps * value) if value < 1 else value,
+                )
+        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+        if self.is_deepspeed_enabled:
+            self.deepspeed = self.model
+            self.model_wrapped = self.model
+
+        obs_dict = self.env.reset_all()
+        if self.config.get("init_at_random_ep_len", False):
+            env_for_lengths = self.env if hasattr(self.env, "episode_length_buf") else None
+            if env_for_lengths is None and hasattr(self.env, "env"):
+                env_for_lengths = self.env.env
+            if env_for_lengths is not None and hasattr(env_for_lengths, "episode_length_buf"):
+                max_episode_length = int(
+                    getattr(env_for_lengths, "max_episode_length", 0)
+                )
+                if max_episode_length > 0:
+                    env_for_lengths.episode_length_buf[:] = torch.randint_like(
+                        env_for_lengths.episode_length_buf,
+                        high=max_episode_length,
+                    )
+        for key in obs_dict:
+            obs_dict[key] = obs_dict[key].to(device)
+        self._initialize_action_chunk_buffer(obs_dict)
+        self._chunk_episode_uid.zero_()
+        self._chunk_transition_id.zero_()
+
+        for batch_idx in range(1, args.num_total_batches + 1):
+            batch_start = time.time()
+            self.state.episode += args.batch_size
+            if self.schedule_dict is not None:
+                self.scheduled_params_dict = scheduler.update_scheduled_params(
+                    self, self.schedule_dict, self.state.global_step
+                )
+            reinit_dr_freq = self.env.config.get("reinit_dr_freq", 0)
+            if reinit_dr_freq > 0 and self.state.global_step % reinit_dr_freq == 0:
+                self.env.reinit_dr()
+                if self.env.config.get("reset_on_reinit_dr", False):
+                    obs_dict = self.env.reset_all()
+                    for key in obs_dict:
+                        obs_dict[key] = obs_dict[key].to(device)
+                    self.action_chunk_buffer.clear()
+                    self._chunk_episode_uid += 1
+                    self.cur_reward_sum.zero_()
+                    self.cur_episode_length.zero_()
+
+            with torch.no_grad():
+                with models_utils.unwrap_model_for_generation(
+                    self.model,
+                    self.accelerator,
+                    gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                ) as rollout_model:
+                    obs_dict = self._rollout_step_action_chunk(rollout_model, obs_dict)
+            end_collection = time.time()
+            collection_time = end_collection - batch_start
+            update_metrics = self._train_action_chunk_batch(
+                model, self._chunk_latest_batch
+            )
+            learn_time = time.time() - end_collection
+
+            if update_metrics["optimizer_steps"] > 0:
+                self.lr_scheduler.step()
+            self.sync_adaptive_sampling()
+            with torch.no_grad():
+                self.state.tot_timesteps += (
+                    self.num_steps_per_env * self.num_envs * accelerator.num_processes
+                )
+                self.state.tot_time += collection_time + learn_time
+                self.state.epoch = self.state.episode / self.train_dataset_len
+                self.state.global_step += 1
+                elapsed = max(time.time() - start_time, 1.0e-6)
+                ep_infos = process_ep_infos(self.ep_infos, device)
+                log_dict = {
+                    "loss/diffusion_flow": update_metrics["loss"],
+                    "chunk/global_valid_anchors": update_metrics["global_valid"],
+                    "chunk/optimizer_steps": update_metrics["optimizer_steps"],
+                    "collection_time": collection_time,
+                    "learn_time": learn_time,
+                    "tot_timesteps": self.state.tot_timesteps,
+                    "tot_time": self.state.tot_time,
+                    "it": self.state.global_step,
+                    "fps": int(self.state.tot_timesteps / elapsed),
+                    "lr": self.optimizer.param_groups[0]["lr"],
+                    "episode": self.state.episode,
+                    "experiment_save_dir": self.args.output_dir,
+                    "batch_idx": batch_idx,
+                    "num_total_batches": args.num_total_batches,
+                }
+                if self.state.rewbuffer:
+                    reward_values = np.asarray(self.state.rewbuffer)
+                    log_dict["objective/rewards"] = float(
+                        reward_values.sum(axis=-1).mean()
+                    )
+                if self.state.lenbuffer:
+                    log_dict["objective/length"] = float(
+                        np.asarray(self.state.lenbuffer).mean()
+                    )
+                log_dict.update(self._chunk_metrics)
+                for key, value in ep_infos.items():
+                    log_dict[f"Episode/{key}"] = value
+                for key, value in self.scheduled_params_dict.items():
+                    log_dict[f"scheduled_params/{key}"] = value
+                self.append_to_log_dict(log_dict)
+                env_metrics = self.episode_env_tensors.mean_and_clear()
+                log_dict.update({f"Env/{key}": value for key, value in env_metrics.items()})
+                self.log(log_dict)
+                self.ep_infos.clear()
+
+            before_callback_motion = self._action_chunk_motion_metadata()
+            self.control = self.callback_handler.on_step_end(
+                args, self.state, self.control
+            )
+            after_callback_motion = self._action_chunk_motion_metadata()
+            callback_changed_env = (
+                not torch.equal(before_callback_motion[0], after_callback_motion[0])
+                or not torch.equal(before_callback_motion[1], after_callback_motion[1])
+            )
+            if callback_changed_env:
+                # Evaluation callbacks reuse and reset the same simulator.  A
+                # delayed label ring cannot remain continuous across that reset.
+                obs_dict = self.env.reset_all()
+                for key in obs_dict:
+                    obs_dict[key] = obs_dict[key].to(device)
+                self.action_chunk_buffer.clear()
+                self._chunk_episode_uid += 1
+                self.cur_reward_sum.zero_()
+                self.cur_episode_length.zero_()
+            if self.control.should_training_stop:
+                break
+
+        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+        if self.control.should_save:
+            self._save_checkpoint(model, trial=None, metrics=None)
+            self.control = self.callback_handler.on_save(
+                self.args, self.state, self.control
+            )
+        if common.wandb_run_exists():
+            wandb.finish()
+
     def train(self):
         """Run the full PPO training loop until ``num_total_batches`` iterations.
 
@@ -2144,6 +2766,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             5. Log metrics and invoke ``on_step_end`` callbacks (which handle
                checkpointing, evaluation, and early stopping).
         """
+        if self.action_chunk_enabled:
+            return self._train_action_chunk()
         args = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
@@ -2771,6 +3395,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             obs_dict[obs_key] = obs_dict[obs_key].to(self.accelerator.device)
 
         self.callback_handler.on_step_end(self.args, self.state, self.control)
+        chunk_executor = None
+        previous_motion_metadata = None
+        previous_dones = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.accelerator.device
+        )
 
         with torch.no_grad():  # noqa: SIM117
             with models_utils.unwrap_model_for_generation(
@@ -2778,18 +3407,50 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 self.accelerator,
                 gather_deepspeed3_params=self.args.ds3_gather_for_generation,
             ) as model:
+                if self.action_chunk_enabled:
+                    chunk_executor = ActionChunkExecutor(
+                        policy=model.policy,
+                        num_envs=self.num_envs,
+                        horizon=self.action_chunk_horizon,
+                        execute_steps=self.action_chunk_eval_execute_steps,
+                        action_dim=self.num_act,
+                        device=self.accelerator.device,
+                    )
                 while True:
                     device = self.accelerator.device
                     policy_model = model.policy
                     value_model = model.value_model  # noqa: F841
-                    policy_model.init_rollout()
-
                     policy_state_dict = {}  # noqa: F841
                     actor_state = {}
-                    actions = policy_model.rollout(obs_dict=obs_dict)  # noqa: F841
-                    action_mean = policy_model.action_mean.detach()
+                    if chunk_executor is None:
+                        policy_model.init_rollout()
+                        actions = policy_model.rollout(obs_dict=obs_dict)  # noqa: F841
+                        action_mean = policy_model.action_mean.detach()
+                    else:
+                        motion_metadata = self._action_chunk_motion_metadata(
+                            allow_transition_fallback=False
+                        )
+                        discontinuity = None
+                        if (
+                            motion_metadata is not None
+                            and previous_motion_metadata is not None
+                        ):
+                            discontinuity = (
+                                (motion_metadata[0] != previous_motion_metadata[0])
+                                | (motion_metadata[1] != previous_motion_metadata[1] + 1)
+                            )
+                            if not self.action_chunk_replan_on_discontinuity:
+                                discontinuity.zero_()
+                        action_mean = chunk_executor.act(
+                            obs_dict,
+                            reset_mask=previous_dones,
+                            discontinuity_mask=discontinuity,
+                        )
+                        previous_motion_metadata = motion_metadata
 
                     actor_state["actions"] = action_mean
+                    if chunk_executor is not None:
+                        actor_state["obs_dict"] = obs_dict
                     results = self.env.step(actor_state)
                     obs_dict, rewards, dones, infos = (
                         results[0],
@@ -2797,6 +3458,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                         results[2],
                         results[3],
                     )  # noqa: F841
+                    previous_dones = dones.to(device=device, dtype=torch.bool).reshape(-1)
 
                     for obs_key in obs_dict.keys():  # noqa: SIM118
                         obs_dict[obs_key] = obs_dict[obs_key].to(device)

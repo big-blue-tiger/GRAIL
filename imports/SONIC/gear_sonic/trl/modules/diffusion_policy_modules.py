@@ -32,6 +32,209 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 
+class _RmsNorm(nn.Module):
+    """Minimal RMSNorm matching the old SUGAR RDT parameterization."""
+
+    def __init__(self, dim, eps=1.0e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = float(eps)
+
+    def forward(self, value):
+        normalized = value.float() * torch.rsqrt(
+            value.float().pow(2).mean(dim=-1, keepdim=True) + self.eps
+        )
+        return normalized.to(value.dtype) * self.weight.to(value)
+
+
+class _RdtTimestepEmbedder(nn.Module):
+    """Old-SUGAR/RDT sinusoidal timestep embedding followed by a two-layer MLP."""
+
+    def __init__(self, hidden_dim, frequency_dim=256):
+        super().__init__()
+        self.frequency_dim = int(frequency_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.frequency_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, timesteps):
+        half = self.frequency_dim // 2
+        frequencies = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=timesteps.device, dtype=torch.float32)
+            / max(half, 1)
+        )
+        args = timesteps.float().reshape(-1, 1) * frequencies.reshape(1, -1)
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if self.frequency_dim % 2:
+            embedding = F.pad(embedding, (0, 1))
+        return self.mlp(embedding.to(dtype=self.mlp[0].weight.dtype))
+
+
+class _RdtSelfAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads, dropout):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+        self.num_heads = int(num_heads)
+        self.head_dim = hidden_dim // num_heads
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=True)
+        self.q_norm = _RmsNorm(self.head_dim)
+        self.k_norm = _RmsNorm(self.head_dim)
+        self.attn_dropout = float(dropout)
+        self.proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.proj_dropout = nn.Dropout(dropout)
+
+    def forward(self, value):
+        batch, length, hidden = value.shape
+        qkv = self.qkv(value).reshape(
+            batch, length, 3, self.num_heads, self.head_dim
+        ).permute(2, 0, 3, 1, 4)
+        query, key, val = qkv.unbind(0)
+        query = self.q_norm(query)
+        key = self.k_norm(key)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            val,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch, length, hidden)
+        return self.proj_dropout(self.proj(attended))
+
+
+class _RdtCrossAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads, dropout):
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+        self.num_heads = int(num_heads)
+        self.head_dim = hidden_dim // num_heads
+        self.query = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.key_value = nn.Linear(hidden_dim, hidden_dim * 2, bias=True)
+        self.q_norm = _RmsNorm(self.head_dim)
+        self.k_norm = _RmsNorm(self.head_dim)
+        self.attn_dropout = float(dropout)
+        self.proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.proj_dropout = nn.Dropout(dropout)
+
+    def forward(self, value, condition):
+        batch, length, hidden = value.shape
+        cond_length = condition.shape[1]
+        query = self.query(value).reshape(
+            batch, length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_value = self.key_value(condition).reshape(
+            batch, cond_length, 2, self.num_heads, self.head_dim
+        ).permute(2, 0, 3, 1, 4)
+        key, cond_value = key_value.unbind(0)
+        query = self.q_norm(query)
+        key = self.k_norm(key)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            cond_value,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch, length, hidden)
+        return self.proj_dropout(self.proj(attended))
+
+
+class _RdtFeedForward(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, value):
+        return self.fc2(F.gelu(self.fc1(value), approximate="tanh"))
+
+
+class _RdtBlock(nn.Module):
+    def __init__(self, hidden_dim, num_heads, attention_dropout):
+        super().__init__()
+        self.norm1 = _RmsNorm(hidden_dim)
+        self.self_attention = _RdtSelfAttention(
+            hidden_dim, num_heads, attention_dropout
+        )
+        self.norm2 = _RmsNorm(hidden_dim)
+        self.cross_attention = _RdtCrossAttention(
+            hidden_dim, num_heads, attention_dropout
+        )
+        self.norm3 = _RmsNorm(hidden_dim)
+        self.feed_forward = _RdtFeedForward(hidden_dim)
+
+    def forward(self, value, condition):
+        value = value + self.self_attention(self.norm1(value))
+        value = value + self.cross_attention(self.norm2(value), condition)
+        return value + self.feed_forward(self.norm3(value))
+
+
+class _ActionChunkRdt(nn.Module):
+    """Strict old-SUGAR RDT block layout adapted to CFM action chunks."""
+
+    def __init__(
+        self,
+        action_dim,
+        action_horizon,
+        hidden_dim=512,
+        num_layers=14,
+        num_heads=8,
+        attention_dropout=0.1,
+    ):
+        super().__init__()
+        self.action_dim = int(action_dim)
+        self.action_horizon = int(action_horizon)
+        self.hidden_dim = int(hidden_dim)
+        self.action_embedding = nn.Linear(self.action_dim, self.hidden_dim)
+        self.action_position = nn.Parameter(
+            torch.empty(1, self.action_horizon, self.hidden_dim)
+        )
+        self.time_embedding = _RdtTimestepEmbedder(self.hidden_dim, frequency_dim=256)
+        self.condition_position = nn.Parameter(torch.empty(1, 3, self.hidden_dim))
+        self.blocks = nn.ModuleList(
+            [
+                _RdtBlock(self.hidden_dim, num_heads, attention_dropout)
+                for _ in range(num_layers)
+            ]
+        )
+        self.final_norm = _RmsNorm(self.hidden_dim)
+        self.output = nn.Linear(self.hidden_dim, self.action_dim)
+        self.apply(self._initialize)
+        nn.init.normal_(self.action_position, mean=0.0, std=0.02)
+        nn.init.normal_(self.condition_position, mean=0.0, std=0.02)
+
+    @staticmethod
+    def _initialize(module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, _RmsNorm):
+            nn.init.ones_(module.weight)
+
+    def forward(self, noisy_action, timestep_bucket, observation_tokens):
+        if noisy_action.shape[-2:] != (self.action_horizon, self.action_dim):
+            raise ValueError(
+                "RDT noisy action must end in "
+                f"[{self.action_horizon},{self.action_dim}], got {tuple(noisy_action.shape)}"
+            )
+        prefix = noisy_action.shape[:-2]
+        flat_count = math.prod(prefix) if prefix else 1
+        action = noisy_action.reshape(flat_count, self.action_horizon, self.action_dim)
+        condition = observation_tokens.reshape(flat_count, 2, self.hidden_dim)
+        timestep = timestep_bucket.reshape(flat_count)
+        time_token = self.time_embedding(timestep).unsqueeze(1).to(condition)
+        condition = torch.cat([condition, time_token], dim=1) + self.condition_position
+        value = self.action_embedding(action) + self.action_position
+        for block in self.blocks:
+            value = block(value, condition)
+        output = self.output(self.final_norm(value))
+        return output.reshape(*prefix, self.action_horizon, self.action_dim)
+
+
 def _build_mlp(input_dim, hidden_dims, output_dim, activation_name="SiLU"):
     activation_cls = getattr(nn, activation_name)
     layers = []
@@ -705,6 +908,282 @@ class EncoderVectorDiffusionPolicy(EncoderRgbDiffusionPolicy):
             self._normalize_observation(privileged, "privileged")
         )
         return torch.cat([proprio_feat, privileged_feat], dim=-1)
+
+
+class EncoderVectorTransformerFlowPolicy(EncoderVectorDiffusionPolicy):
+    """Old-SUGAR-style RDT trained with conditional flow matching on action chunks.
+
+    The structured observation encoders and their normalizers intentionally match
+    :class:`EncoderVectorDiffusionPolicy`.  Their two 512-D outputs become distinct
+    condition tokens, while the action horizon remains an explicit tensor axis.
+    """
+
+    is_action_chunk_policy = True
+
+    def __init__(self, *args, **kwargs):
+        module_config_dict = kwargs.get("module_config_dict") or {}
+        if not module_config_dict and len(args) >= 2 and args[1] is not None:
+            module_config_dict = args[1]
+        config = dict(module_config_dict)
+        super().__init__(*args, **kwargs)
+
+        self.action_horizon = int(config.get("action_horizon", 40))
+        hidden_dim = int(config.get("transformer_hidden_dim", 512))
+        num_layers = int(config.get("transformer_num_layers", 14))
+        num_heads = int(config.get("transformer_num_heads", 8))
+        attention_dropout = float(config.get("transformer_attention_dropout", 0.1))
+        if self.action_horizon <= 0:
+            raise ValueError("action_horizon must be positive")
+        if self.proprio_feature_dim != hidden_dim or self.privileged_feature_dim != hidden_dim:
+            raise ValueError(
+                "Transformer condition tokens must match transformer_hidden_dim; got "
+                f"proprio={self.proprio_feature_dim}, privileged={self.privileged_feature_dim}, "
+                f"hidden={hidden_dim}"
+            )
+        if self.diffusion_objective != "flow_matching":
+            raise ValueError(
+                "EncoderVectorTransformerFlowPolicy only supports flow_matching"
+            )
+
+        # Replace the one-step parent's parameterized time/MLP denoiser.  The
+        # inherited normalization buffers and observation MLPs remain unchanged.
+        self.time_encoder = nn.Identity()
+        self.denoiser = nn.Identity()
+        self.rdt = _ActionChunkRdt(
+            action_dim=self.action_dim,
+            action_horizon=self.action_horizon,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            attention_dropout=attention_dropout,
+        )
+
+    def _encode_condition_tokens(self, obs_dict):
+        for key in (self.proprio_key, self.privileged_key):
+            if key not in obs_dict:
+                raise KeyError(
+                    f"EncoderVectorTransformerFlowPolicy requires observation key '{key}'"
+                )
+        proprio = self._flatten_observation(
+            obs_dict[self.proprio_key], self.proprio_input_dim, self.proprio_key
+        )
+        privileged = self._flatten_observation(
+            obs_dict[self.privileged_key], self.privileged_input_dim, self.privileged_key
+        )
+        if proprio.shape[:-1] != privileged.shape[:-1]:
+            raise ValueError(
+                f"Observation batch shape mismatch: {proprio.shape[:-1]} vs "
+                f"{privileged.shape[:-1]}"
+            )
+        proprio_token = self.proprio_encoder(
+            self._normalize_observation(proprio, "proprio")
+        )
+        privileged_token = self.privileged_encoder(
+            self._normalize_observation(privileged, "privileged")
+        )
+        # Match SUGAR's [object, robot] token convention.
+        return torch.stack([privileged_token, proprio_token], dim=-2)
+
+    def _predict_velocity(self, noisy_action, timestep_bucket, condition_tokens):
+        return self.rdt(noisy_action, timestep_bucket, condition_tokens)
+
+    def _sample_flow_time(self, prefix_shape, device, dtype):
+        """Sample GR00T N1.7 flow time, biased toward the noisy endpoint."""
+        prefix_shape = tuple(prefix_shape)
+        flat_count = max(int(math.prod(prefix_shape)), 1)
+        sample = self.beta_dist.sample((flat_count,)).to(device=device, dtype=dtype)
+        return ((1.0 - sample) * self.noise_s).reshape(prefix_shape)
+
+    @staticmethod
+    def _distributed_moments(value, feature_dim, valid_rows=None):
+        flat = value.detach().reshape(-1, feature_dim).float()
+        if valid_rows is not None:
+            mask = valid_rows.detach().reshape(-1).bool()
+            if mask.numel() != flat.shape[0]:
+                raise ValueError(
+                    f"valid mask has {mask.numel()} rows for tensor with {flat.shape[0]} rows"
+                )
+            flat = flat[mask]
+        if flat.numel() == 0:
+            total = torch.zeros(feature_dim, device=value.device, dtype=torch.float32)
+            square_total = torch.zeros_like(total)
+            count = torch.zeros((), device=value.device, dtype=torch.float64)
+        else:
+            total = flat.sum(dim=0)
+            square_total = flat.square().sum(dim=0)
+            count = torch.tensor(float(flat.shape[0]), device=value.device, dtype=torch.float64)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(total)
+            torch.distributed.all_reduce(square_total)
+            torch.distributed.all_reduce(count)
+        if count.item() == 0:
+            return None
+        count_float = count.to(dtype=total.dtype)
+        mean = total / count_float
+        variance = (square_total / count_float - mean.square()).clamp_min(0.0)
+        return mean, variance
+
+    @staticmethod
+    def _apply_ema_moments(mean_buffer, var_buffer, updates_buffer, moments, momentum, eps):
+        if moments is None:
+            return
+        batch_mean, batch_var = moments
+        batch_var = batch_var.clamp_min(eps**2)
+        if int(updates_buffer.item()) == 0:
+            mean_buffer.copy_(batch_mean.to(mean_buffer))
+            var_buffer.copy_(batch_var.to(var_buffer))
+        else:
+            mean_buffer.lerp_(batch_mean.to(mean_buffer), momentum)
+            var_buffer.lerp_(batch_var.to(var_buffer), momentum)
+        updates_buffer.add_(1)
+
+    @torch.no_grad()
+    def update_chunk_normalizers(self, obs_dict, target, valid):
+        """Update observation/target EMA stats once from globally masked moments."""
+        valid = valid.bool()
+        proprio = self._flatten_observation(
+            obs_dict[self.proprio_key], self.proprio_input_dim, self.proprio_key
+        )
+        privileged = self._flatten_observation(
+            obs_dict[self.privileged_key], self.privileged_input_dim, self.privileged_key
+        )
+        self._apply_ema_moments(
+            self.proprio_mean,
+            self.proprio_var,
+            self.proprio_updates,
+            self._distributed_moments(proprio, self.proprio_input_dim, valid),
+            self.proprio_norm_momentum,
+            self.proprio_std_eps,
+        )
+        self._apply_ema_moments(
+            self.privileged_mean,
+            self.privileged_var,
+            self.privileged_updates,
+            self._distributed_moments(privileged, self.privileged_input_dim, valid),
+            self.privileged_norm_momentum,
+            self.privileged_std_eps,
+        )
+        target_valid = valid.unsqueeze(-1).expand(*valid.shape, self.action_horizon)
+        self._apply_ema_moments(
+            self.target_mean,
+            self.target_var,
+            self.target_updates,
+            self._distributed_moments(target, self.action_dim, target_valid),
+            self.target_norm_momentum,
+            self.target_std_eps,
+        )
+
+    def sample_action_chunk(self, obs_dict):
+        condition_tokens = self._encode_condition_tokens(obs_dict)
+        prefix = condition_tokens.shape[:-2]
+        sample = torch.randn(
+            *prefix,
+            self.action_horizon,
+            self.action_dim,
+            device=condition_tokens.device,
+            dtype=condition_tokens.dtype,
+        )
+        step_count = max(int(self.num_inference_steps), 1)
+        dt = 1.0 / step_count
+        for step in range(step_count):
+            bucket = min(
+                int(step / float(step_count) * self.num_timestep_buckets),
+                self.num_timestep_buckets - 1,
+            )
+            timestep = torch.full(prefix, bucket, device=sample.device, dtype=torch.long)
+            sample = sample + dt * self._predict_velocity(
+                sample, timestep, condition_tokens
+            )
+        return self._denormalize_target(sample)
+
+    def forward(self, input, compute_aux_loss=False, **kwargs):
+        if not hasattr(input, "__getitem__"):
+            raise TypeError(
+                "EncoderVectorTransformerFlowPolicy expects an obs_dict-like input"
+            )
+        if not compute_aux_loss:
+            return self.sample_action_chunk(input)
+
+        target = self._extract_target(kwargs)
+        if target is None:
+            raise ValueError(
+                f"{self.__class__.__name__} requires {self.diffusion_target_key}"
+            )
+        condition_tokens = self._encode_condition_tokens(input)
+        target = target.to(device=condition_tokens.device, dtype=condition_tokens.dtype)
+        expected_suffix = (self.action_horizon, self.action_dim)
+        if target.shape[-2:] != expected_suffix:
+            raise ValueError(
+                f"diffusion target must end in {expected_suffix}, got {tuple(target.shape)}"
+            )
+        if target.shape[:-2] != condition_tokens.shape[:-2]:
+            raise ValueError(
+                f"target prefix {target.shape[:-2]} does not match observations "
+                f"{condition_tokens.shape[:-2]}"
+            )
+        valid = kwargs.get("diffusion_target_valid")
+        if valid is None:
+            valid = torch.ones(target.shape[:-2], device=target.device, dtype=torch.bool)
+        else:
+            valid = valid.to(device=target.device, dtype=torch.bool)
+        if valid.shape != target.shape[:-2]:
+            raise ValueError(
+                f"diffusion_target_valid shape {tuple(valid.shape)} must equal "
+                f"{tuple(target.shape[:-2])}"
+            )
+        if kwargs.get("update_running_stats", True):
+            self.update_chunk_normalizers(input, target, valid)
+
+        sanitized_target = torch.nan_to_num(target)
+        normalized_target = self._normalize_target(sanitized_target)
+        noise = torch.randn_like(normalized_target)
+        # One flow time per complete trajectory, shared by all 40 action tokens.
+        flow_time = self._sample_flow_time(
+            normalized_target.shape[:-2],
+            device=target.device,
+            dtype=target.dtype,
+        )
+        broadcast_time = flow_time.unsqueeze(-1).unsqueeze(-1)
+        noisy_action = (
+            (1.0 - broadcast_time) * noise + broadcast_time * normalized_target
+        )
+        velocity = normalized_target - noise
+        timestep = (flow_time * self.num_timestep_buckets).long().clamp(
+            0, self.num_timestep_buckets - 1
+        )
+        predicted = self._predict_velocity(noisy_action, timestep, condition_tokens)
+        per_chunk_sse = (predicted - velocity).square().sum(dim=(-2, -1))
+        valid_float = valid.to(per_chunk_sse.dtype)
+        denominator = valid_float.sum().clamp_min(1.0) * self.action_horizon * self.action_dim
+        flow_loss = (per_chunk_sse * valid_float).sum() / denominator
+
+        valid_targets = sanitized_target[valid]
+        valid_normalized = normalized_target[valid]
+        if valid_targets.numel() == 0:
+            raw_abs_mean = sanitized_target.sum() * 0.0
+            raw_std_mean = raw_abs_mean
+            norm_abs_mean = raw_abs_mean
+            norm_std_mean = raw_abs_mean
+        else:
+            raw_flat = valid_targets.float().reshape(-1, self.action_dim)
+            norm_flat = valid_normalized.float().reshape(-1, self.action_dim)
+            raw_abs_mean = raw_flat.abs().mean()
+            raw_std_mean = raw_flat.std(dim=0, unbiased=False).mean()
+            norm_abs_mean = norm_flat.abs().mean()
+            norm_std_mean = norm_flat.std(dim=0, unbiased=False).mean()
+        return {
+            # Keep the Actor auxiliary-loss protocol 66-D without exposing the
+            # horizon to its Gaussian distribution.
+            "action_mean": sanitized_target[..., 0, :].detach(),
+            "aux_losses": {
+                "diffusion_flow": flow_loss,
+                "diffusion_target/raw_abs_mean": raw_abs_mean,
+                "diffusion_target/raw_std_mean": raw_std_mean,
+                "diffusion_target/norm_abs_mean": norm_abs_mean,
+                "diffusion_target/norm_std_mean": norm_std_mean,
+            },
+            "aux_loss_coef": {"diffusion_flow": self.diffusion_loss_coef},
+        }
 
 
 class EncoderRgbMlpPolicy(EncoderRgbDiffusionPolicy):

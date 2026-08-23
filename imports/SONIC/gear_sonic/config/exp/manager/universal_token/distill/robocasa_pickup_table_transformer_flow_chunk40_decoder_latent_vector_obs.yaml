@@ -1,0 +1,44 @@
+# @package _global_
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_diffusion_decoder_latent_vector_obs
+  - _self_
+
+exp_var: robocasa_pickup_table_transformer_flow_chunk40_decoder_latent_vector_obs
+experiment_name: ${exp_base}_${exp_var}
+
+algo:
+  config:
+    # The delayed action-chunk objective is pure DAgger/CFM.  It must not
+    # instantiate a critic or expose the unused Actor Gaussian std to DDP.
+    distill_only: true
+    freeze_noise_std: true
+    desired_kl: null
+    disable_dropout: false
+    console_loss_keys:
+      - loss/diffusion_flow
+    action_chunk:
+      enabled: true
+      horizon: 40
+      target_offset: 0
+      train_execute_steps: 16
+      eval_execute_steps: 20
+      buffer_capacity: 64
+      target_build_batch_size: 1024
+      num_learning_epochs: 3
+      num_mini_batches: 4
+      replan_on_discontinuity: true
+
+    actor:
+      backbone:
+        _target_: gear_sonic.trl.modules.diffusion_policy_modules.EncoderVectorTransformerFlowPolicy
+        process_output_dim: true
+        module_config_dict:
+          action_horizon: ${algo.config.action_chunk.horizon}
+          transformer_hidden_dim: 512
+          transformer_num_layers: 14
+          transformer_num_heads: 8
+          transformer_attention_dropout: 0.1
+          num_inference_steps: 4
+          num_timestep_buckets: 1000
+          diffusion_objective: flow_matching

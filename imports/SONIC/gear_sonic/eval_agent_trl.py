@@ -50,6 +50,13 @@ import omegaconf
 import yaml
 
 from gear_sonic import train_agent_trl
+from gear_sonic.trl.modules.action_chunk import (
+    ActionChunkExecutor,
+    action_chunk_enabled,
+    get_action_chunk_config,
+    get_motion_metadata,
+    motion_discontinuity,
+)
 from gear_sonic.trl.utils import common as trl_utils_common
 from gear_sonic.trl.utils import scheduler
 from gear_sonic.utils import common as rl_utils_common
@@ -978,19 +985,51 @@ def main(override_config: omegaconf.OmegaConf):
 
         run_once = config.get("run_once", False)
         envs_completed = torch.zeros(config.num_envs, dtype=torch.bool, device=device)
+        chunk_executor = None
+        previous_motion_metadata = None
+        if action_chunk_enabled(config.algo.config):
+            chunk_config = get_action_chunk_config(config.algo.config)
+            chunk_executor = ActionChunkExecutor(
+                policy=model.policy,
+                num_envs=config.num_envs,
+                horizon=int(chunk_config["horizon"]),
+                execute_steps=int(chunk_config["eval_execute_steps"]),
+                action_dim=env.config.robot.actions_dim,
+                device=device,
+            )
+        previous_dones = torch.zeros(config.num_envs, dtype=torch.bool, device=device)
 
         with torch.no_grad():
             while True:
                 policy_model = model.policy
                 value_model = model.value_model
-                policy_model.init_rollout()
 
                 actor_state = {}
-                actions = policy_model.rollout(obs_dict=obs_dict)
+                if chunk_executor is None:
+                    policy_model.init_rollout()
+                    actions = policy_model.rollout(obs_dict=obs_dict)
+                    action_mean = policy_model.action_mean.detach()
+                    decoder_obs_dict = actions["obs_dict"]
+                else:
+                    motion_metadata = get_motion_metadata(env)
+                    discontinuity = motion_discontinuity(
+                        motion_metadata, previous_motion_metadata
+                    )
+                    if not chunk_config.get("replan_on_discontinuity", True):
+                        discontinuity = None
+                    action_mean = chunk_executor.act(
+                        obs_dict,
+                        reset_mask=previous_dones,
+                        discontinuity_mask=discontinuity,
+                    )
+                    previous_motion_metadata = motion_metadata
+                    # A chunk stores actions only.  The decoder must consume the
+                    # observation from the environment step being executed.
+                    decoder_obs_dict = obs_dict
                 capture_camera_rgb(obs_dict)
                 capture_camera_outputs()
-                actor_state["actions"] = policy_model.action_mean.detach()
-                actor_state["obs_dict"] = actions["obs_dict"]
+                actor_state["actions"] = action_mean
+                actor_state["obs_dict"] = decoder_obs_dict
 
                 step_count += 1
 
@@ -1007,6 +1046,7 @@ def main(override_config: omegaconf.OmegaConf):
                     results[2],
                     results[3],
                 )  # noqa: F841
+                previous_dones = dones.to(device=device, dtype=torch.bool).reshape(-1)
                 if eval_step_callbacks:
                     all_want_exit = all(
                         cb.eval_step(env, results) for cb in eval_step_callbacks.values()

@@ -856,6 +856,17 @@ class ManagerEnvWrapper:
                     )
                 obs_dict = obs_dict.copy() if isinstance(obs_dict, dict) else obs_dict
             meta_actions = actions["actions"]
+            configured_action_dim = self.config.get("meta_action_dim", 66)
+            expected_action_dim = int(
+                66 if configured_action_dim is None else configured_action_dim
+            )
+            expected_shape = (self.env.num_envs, expected_action_dim)
+            if tuple(meta_actions.shape) != expected_shape:
+                raise ValueError(
+                    "ManagerEnvWrapper.step expects one meta-action per environment with "
+                    f"shape {expected_shape}, got {tuple(meta_actions.shape)}. "
+                    "Select an action-chunk frame before calling the wrapper."
+                )
             # Determine action mode: "direct_latent", "residual", or "mixed"
             # Priority: 1) explicit action_mode in actions dict, 2) config flag
             # The current student trainer uses the config fallback; mixed/teacher

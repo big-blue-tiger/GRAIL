@@ -11,6 +11,14 @@ import wandb
 from tqdm import tqdm
 from transformers import TrainerCallback
 
+from gear_sonic.trl.modules.action_chunk import (
+    ActionChunkExecutor,
+    action_chunk_enabled,
+    get_action_chunk_config,
+    get_motion_metadata,
+    motion_discontinuity,
+)
+
 
 def create_html_table(metrics_dict):
     """
@@ -191,7 +199,10 @@ class ImEvalCallback(TrainerCallback):
                 self.env.num_envs, self.env.config.robot.actions_dim, device=self.env.device
             )
             actor_state.update({"obs": obs_dict, "actions": init_actions})
-            actor_state = self._pre_eval_env_step(actor_state)
+            # Legacy policies historically performed one unused warm-up query
+            # here.  Do not consume chunk cursor 0 before the first env step.
+            if getattr(self, "_action_chunk_executor", None) is None:
+                actor_state = self._pre_eval_env_step(actor_state)
 
             while not actor_state.get("end_eval", False):
                 self.env.render_results()
@@ -264,6 +275,35 @@ class ImEvalCallback(TrainerCallback):
         self.model.policy.eval()  # switch to evaluation mode (dropout for example)
         if device is not None:
             self.model.policy.to(device)
+        self._action_chunk_executor = None
+        self._action_chunk_previous_motion = None
+        if action_chunk_enabled(self.model.policy):
+            config = get_action_chunk_config(self.model.policy)
+            self._action_chunk_executor = ActionChunkExecutor(
+                policy=self.model.policy,
+                num_envs=self.env.num_envs,
+                horizon=int(config["horizon"]),
+                execute_steps=int(config["eval_execute_steps"]),
+                action_dim=self.env.config.robot.actions_dim,
+                device=self.env.device,
+            )
+
+            def chunk_policy(obs_dict, cur_dones=None, **_kwargs):
+                motion_metadata = get_motion_metadata(self.env)
+                discontinuity = motion_discontinuity(
+                    motion_metadata, self._action_chunk_previous_motion
+                )
+                if not config.get("replan_on_discontinuity", True):
+                    discontinuity = None
+                actions = self._action_chunk_executor.act(
+                    obs_dict,
+                    reset_mask=cur_dones,
+                    discontinuity_mask=discontinuity,
+                )
+                self._action_chunk_previous_motion = motion_metadata
+                return actions
+
+            return chunk_policy
         return self.model.policy.act_inference
 
     def _eval_mode(self):
@@ -436,6 +476,8 @@ class ImEvalCallback(TrainerCallback):
             obs_dict=actor_state["obs"], cur_dones=dones, skip_episode_attnmask=True
         )
         actor_state.update({"actions": actions})
+        if getattr(self, "_action_chunk_executor", None) is not None:
+            actor_state["obs_dict"] = actor_state["obs"]
         return actor_state
 
     def _post_eval_env_step(self, actor_state):
@@ -1023,6 +1065,9 @@ class ImEvalCallback(TrainerCallback):
             fresh_obs = self.env.forward_motion_samples(self.args.global_rank, self.args.world_size)
             actor_state["obs"] = fresh_obs
             self.model.policy.init_rollout()
+            if getattr(self, "_action_chunk_executor", None) is not None:
+                self._action_chunk_executor.reset()
+                self._action_chunk_previous_motion = None
             self.terminate_state = torch.zeros(self.env.num_envs, device=self.device)
             self.progress_state = torch.zeros(self.env.num_envs, device=self.env.device)
             self.terminate_reason = [""] * self.env.num_envs

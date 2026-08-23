@@ -2,13 +2,196 @@
 # https://github.com/NVlabs/ProtoMotions/blob/94059259ba2b596bf908828cc04e8fc6ff901114/phys_anim/agents/utils/data_utils.py
 """Data-management utilities for on-policy PPO rollouts.
 
-Provides :class:`RolloutStorage`, a flexible ``nn.Module``-based buffer that
-stores arbitrary per-transition tensors (observations, actions, rewards,
-values, …) and exposes them as randomised mini-batches for PPO training.
+Provides :class:`RolloutStorage` for on-policy PPO and
+:class:`ActionChunkDaggerBuffer` for delayed, continuous Teacher chunks.
 """
 
 import torch
 from torch import Tensor, nn
+
+
+class ActionChunkDaggerBuffer:
+    """GPU time-major ring for delayed continuous Teacher action chunks."""
+
+    def __init__(
+        self,
+        num_envs,
+        capacity,
+        horizon,
+        rollout_steps,
+        action_dim,
+        observation_shapes,
+        device="cpu",
+    ):
+        self.num_envs = int(num_envs)
+        self.capacity = int(capacity)
+        self.horizon = int(horizon)
+        self.rollout_steps = int(rollout_steps)
+        self.action_dim = int(action_dim)
+        self.device = torch.device(device)
+        if self.capacity <= self.horizon + self.rollout_steps:
+            raise ValueError(
+                "ActionChunkDaggerBuffer capacity must be strictly greater than "
+                f"horizon + rollout_steps ({self.horizon + self.rollout_steps})"
+            )
+        self.observations = {
+            key: torch.zeros(
+                self.capacity,
+                self.num_envs,
+                *tuple(shape),
+                device=self.device,
+            )
+            for key, shape in observation_shapes.items()
+        }
+        self.teacher_target = torch.zeros(
+            self.capacity,
+            self.num_envs,
+            self.action_dim,
+            device=self.device,
+        )
+        metadata_shape = (self.capacity, self.num_envs)
+        self.episode_uid = torch.zeros(metadata_shape, dtype=torch.long, device=self.device)
+        self.motion_id = torch.zeros(metadata_shape, dtype=torch.long, device=self.device)
+        self.reference_frame = torch.zeros(metadata_shape, dtype=torch.long, device=self.device)
+        self.transition_id = torch.full(
+            metadata_shape, -1, dtype=torch.long, device=self.device
+        )
+        self.written_valid = torch.zeros(
+            metadata_shape, dtype=torch.bool, device=self.device
+        )
+        self.frame_finite = torch.zeros(
+            metadata_shape, dtype=torch.bool, device=self.device
+        )
+        self.done_after_action = torch.zeros(
+            metadata_shape, dtype=torch.bool, device=self.device
+        )
+        self.read_pos = 0
+        self.write_pos = 0
+        self.size = 0
+
+    @property
+    def ready(self):
+        return self.size >= self.horizon + self.rollout_steps - 1
+
+    def clear(self):
+        self.read_pos = 0
+        self.write_pos = 0
+        self.size = 0
+        self.written_valid.zero_()
+        self.transition_id.fill_(-1)
+
+    def append(
+        self,
+        observations,
+        teacher_target,
+        episode_uid,
+        motion_id,
+        reference_frame,
+        transition_id,
+        frame_finite,
+        done_after_action,
+    ):
+        """Append a `[steps, envs, ...]` block without reallocating storage."""
+        steps = int(teacher_target.shape[0])
+        expected_prefix = (steps, self.num_envs)
+        if teacher_target.shape != (*expected_prefix, self.action_dim):
+            raise ValueError(
+                f"teacher_target shape {tuple(teacher_target.shape)} does not match "
+                f"{(*expected_prefix, self.action_dim)}"
+            )
+        if self.size + steps > self.capacity:
+            raise RuntimeError(
+                f"Action chunk ring overflow: size={self.size}, append={steps}, "
+                f"capacity={self.capacity}"
+            )
+        indices = (
+            torch.arange(steps, device=self.device, dtype=torch.long) + self.write_pos
+        ) % self.capacity
+        for key, storage in self.observations.items():
+            if key not in observations:
+                raise KeyError(f"Missing action chunk observation '{key}'")
+            source = observations[key]
+            expected_shape = (steps, self.num_envs, *storage.shape[2:])
+            if tuple(source.shape) != expected_shape:
+                raise ValueError(
+                    f"Action chunk observation '{key}' has shape {tuple(source.shape)}, "
+                    f"expected {expected_shape}"
+                )
+            storage.index_copy_(0, indices, source.to(storage))
+        self.teacher_target.index_copy_(0, indices, teacher_target.to(self.teacher_target))
+        for storage, value in (
+            (self.episode_uid, episode_uid),
+            (self.motion_id, motion_id),
+            (self.reference_frame, reference_frame),
+            (self.transition_id, transition_id),
+            (self.frame_finite, frame_finite),
+            (self.done_after_action, done_after_action),
+        ):
+            if value.shape != expected_prefix:
+                raise ValueError(
+                    f"Metadata shape {tuple(value.shape)} does not match {expected_prefix}"
+                )
+            storage.index_copy_(0, indices, value.to(storage))
+        self.written_valid[indices] = True
+        self.write_pos = (self.write_pos + steps) % self.capacity
+        self.size += steps
+
+    def pop(self):
+        """Emit the oldest rollout-sized anchor batch, or ``None`` while warming up."""
+        if not self.ready:
+            return None
+        anchor_offsets = torch.arange(
+            self.rollout_steps, device=self.device, dtype=torch.long
+        )
+        horizon_offsets = torch.arange(
+            self.horizon, device=self.device, dtype=torch.long
+        )
+        anchor_indices = (self.read_pos + anchor_offsets) % self.capacity
+        window_indices = (
+            self.read_pos + anchor_offsets[:, None] + horizon_offsets[None, :]
+        ) % self.capacity
+
+        observations = {
+            key: value[anchor_indices].transpose(0, 1).contiguous()
+            for key, value in self.observations.items()
+        }
+        target = self.teacher_target[window_indices].permute(2, 0, 1, 3).contiguous()
+
+        def gather_metadata(storage):
+            return storage[window_indices].permute(2, 0, 1).contiguous()
+
+        written = gather_metadata(self.written_valid)
+        finite = gather_metadata(self.frame_finite)
+        transition = gather_metadata(self.transition_id)
+        episode = gather_metadata(self.episode_uid)
+        motion = gather_metadata(self.motion_id)
+        frame = gather_metadata(self.reference_frame)
+        expected_transition = transition[..., :1] + horizon_offsets
+        expected_frame = frame[..., :1] + horizon_offsets
+        validity_checks = {
+            "written": written.all(dim=-1),
+            "finite": finite.all(dim=-1),
+            "transition": (transition == expected_transition).all(dim=-1),
+            "episode": (episode == episode[..., :1]).all(dim=-1),
+            "motion": (motion == motion[..., :1]).all(dim=-1),
+            "reference_frame": (frame == expected_frame).all(dim=-1),
+        }
+        valid = torch.ones_like(validity_checks["written"])
+        for check in validity_checks.values():
+            valid &= check
+
+        # These slots are no longer required by any future anchor.
+        self.written_valid[anchor_indices] = False
+        self.transition_id[anchor_indices] = -1
+        self.read_pos = (self.read_pos + self.rollout_steps) % self.capacity
+        self.size -= self.rollout_steps
+        return {
+            "obs_dict": observations,
+            "diffusion_target": target,
+            "diffusion_target_valid": valid,
+            "anchor_transition_id": transition[..., 0],
+            "validity_checks": validity_checks,
+        }
 
 
 class RolloutStorage(nn.Module):
