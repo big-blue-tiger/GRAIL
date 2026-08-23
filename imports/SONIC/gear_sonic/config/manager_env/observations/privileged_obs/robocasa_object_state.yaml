@@ -1,0 +1,14 @@
+# Current-frame privileged task state for the dual-encoder diffusion student.
+# object BPS(10) + table corners(12) + object pose(3+6) + hand/object
+# transform(9) + per-link contact magnitudes(8) = 48D.
+defaults:
+  - ../terms/object_bps@_here_
+  - ../terms/table_corners_b@_here_
+  - ../terms/object_pos_b@_here_
+  - ../terms/object_ori_b_6d@_here_
+  - ../terms/hand_object_transform_6d@_here_
+  - ../terms/hand_object_contact_force_magnitude@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.observations.StudentPrivilegedCfg
+enable_corruption: false
+concatenate_terms: true

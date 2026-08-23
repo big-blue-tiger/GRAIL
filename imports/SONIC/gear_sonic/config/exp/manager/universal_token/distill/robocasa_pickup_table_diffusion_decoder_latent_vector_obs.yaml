@@ -20,6 +20,16 @@ experiment_name: ${exp_base}_${exp_var}
 num_envs: 16
 motion_shard_by_rank: true
 
+algo:
+  config:
+    # Step-level DAgger execution split. Both policies run on the full batch;
+    # this ratio only selects which action is sent to each environment.
+    dagger_rollout_mode: fixed
+    dagger_student_ratio: 0.5
+    # Used only by linear mode: iteration 0 starts at 0% Student, then grows
+    # by this amount per iteration until dagger_student_ratio is reached.
+    dagger_student_ratio_increment: 0.05
+
 manager_env:
   config:
     object_usd_path: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd

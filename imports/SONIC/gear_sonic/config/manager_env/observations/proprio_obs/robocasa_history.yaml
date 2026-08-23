@@ -1,0 +1,18 @@
+# Five-frame proprioceptive/action history for the dual-encoder diffusion student.
+# Per frame: joint_pos(43) + joint_vel(43) + gravity(3) + angular velocity(3)
+# + linear velocity(3) + previous meta action(66) = 161D. Keeping each term's
+# history dimension lets Isaac Lab concatenate to [B, 5, 161]; the policy then
+# flattens the final two dimensions to 805D.
+defaults:
+  - ../terms/joint_pos@_here_
+  - ../terms/joint_vel@_here_
+  - ../terms/projected_gravity@_here_
+  - ../terms/base_ang_vel@_here_
+  - ../terms/base_lin_vel@_here_
+  - ../terms/last_meta_action@_here_
+
+_target_: gear_sonic.envs.manager_env.mdp.observations.StudentProprioCfg
+enable_corruption: false
+concatenate_terms: true
+history_length: 5
+flatten_history_dim: false

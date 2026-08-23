@@ -1,0 +1,3 @@
+last_meta_action:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:last_meta_action

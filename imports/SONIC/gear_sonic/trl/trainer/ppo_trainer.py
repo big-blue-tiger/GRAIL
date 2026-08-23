@@ -801,6 +801,57 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 f"got {self.diffusion_hand_target_source!r}"
             )
 
+        # Step-level DAgger mixing is opt-in so legacy DAgger experiments that
+        # do not use the residual/direct-latent wrapper keep their old rollout.
+        self.dagger_mixed_rollout = bool(
+            self.config.get("use_dagger", False) and "dagger_rollout_mode" in self.config
+        )
+        self.dagger_rollout_mode = self.config.get("dagger_rollout_mode", "fixed")
+        self.dagger_student_ratio = float(self.config.get("dagger_student_ratio", 0.5))
+        self.dagger_student_ratio_increment = float(
+            self.config.get("dagger_student_ratio_increment", 0.05)
+        )
+        if self.dagger_rollout_mode not in {"fixed", "linear"}:
+            raise ValueError(
+                "dagger_rollout_mode must be 'fixed' or 'linear', "
+                f"got {self.dagger_rollout_mode!r}"
+            )
+        if not 0.0 <= self.dagger_student_ratio <= 1.0:
+            raise ValueError(
+                "dagger_student_ratio must be in [0, 1], "
+                f"got {self.dagger_student_ratio}"
+            )
+        if self.dagger_student_ratio_increment < 0.0:
+            raise ValueError(
+                "dagger_student_ratio_increment must be non-negative, "
+                f"got {self.dagger_student_ratio_increment}"
+            )
+        if self.dagger_mixed_rollout:
+            if self.ref_model is None:
+                raise ValueError("Step-level mixed DAgger rollout requires a frozen ref_model")
+            if getattr(self.env, "action_transform_module", None) is None:
+                raise ValueError(
+                    "Step-level mixed DAgger rollout requires env.action_transform_module"
+                )
+
+        # A reference policy is never trainable and must never enter the
+        # student/value optimizer, regardless of how it was constructed.
+        if self.ref_model is not None:
+            self.ref_model.requires_grad_(False)
+            self.ref_model.eval()
+            optimizer_param_ids = {
+                id(param)
+                for group in self.optimizer.param_groups
+                for param in group.get("params", [])
+            }
+            teacher_param_ids = {id(param) for param in self.ref_model.parameters()}
+            if optimizer_param_ids & teacher_param_ids:
+                raise RuntimeError("Frozen Teacher parameters must not be in the optimizer")
+
+        self._last_dagger_student_ratio = 1.0
+        self._last_dagger_num_student = self.num_envs
+        self._last_dagger_num_teacher = 0
+
     def _setup_storage(self):
         """Allocate rollout storage buffers and episode tracking accumulators.
 
@@ -1055,6 +1106,62 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 self.storage.register_key(clean_key, shape=value.shape[1:], dtype=value.dtype)
             self.storage.update_key(clean_key, value)
 
+    def _get_dagger_student_ratio(self, iteration=None):
+        """Return the Student execution ratio for one rollout iteration."""
+        if self.dagger_rollout_mode == "fixed":
+            return self.dagger_student_ratio
+        if iteration is None:
+            iteration = self.state.global_step
+        return min(
+            self.dagger_student_ratio,
+            max(0, int(iteration)) * self.dagger_student_ratio_increment,
+        )
+
+    @staticmethod
+    def _sample_dagger_teacher_mask(num_envs, student_ratio, device):
+        """Sample an exact-size per-step split (``True`` means Teacher)."""
+        if num_envs <= 0:
+            raise ValueError(f"num_envs must be positive, got {num_envs}")
+        if not 0.0 <= student_ratio <= 1.0:
+            raise ValueError(f"student_ratio must be in [0, 1], got {student_ratio}")
+
+        # Ratios that cannot be represented exactly by num_envs use the nearest
+        # integer, with .5 rounded upward. randperm changes membership every
+        # timestep while the number of Student environments stays exact.
+        num_student = min(num_envs, int(math.floor(num_envs * student_ratio + 0.5)))
+        permutation = torch.randperm(num_envs, device=device)
+        is_teacher_env = torch.ones(num_envs, device=device, dtype=torch.bool)
+        is_teacher_env[permutation[:num_student]] = False
+        return is_teacher_env
+
+    @staticmethod
+    def _build_mixed_rollout_actions(student_state, teacher_state, is_teacher_env):
+        """Build an env-step-only action dict without changing stored Student state."""
+        student_actions = student_state["actions"]
+        teacher_actions = teacher_state["actions"]
+        if student_actions.shape != teacher_actions.shape:
+            raise RuntimeError(
+                "Student and Teacher rollout actions must have the same shape; "
+                f"got {tuple(student_actions.shape)} and {tuple(teacher_actions.shape)}"
+            )
+        if is_teacher_env.shape != student_actions.shape[:1]:
+            raise RuntimeError(
+                "DAgger environment mask shape must match the action batch; "
+                f"got {tuple(is_teacher_env.shape)} for {tuple(student_actions.shape)}"
+            )
+
+        executed_actions = student_actions.detach().clone()
+        executed_actions[is_teacher_env] = teacher_actions.detach()[is_teacher_env]
+        # Actor.rollout returns a TensorDict, which cannot hold the string
+        # action_mode. Convert only the temporary env-step container to a plain
+        # dict; the original TensorDict remains the object written to storage.
+        env_step_state = dict(student_state.items())
+        env_step_state["actions"] = executed_actions
+        env_step_state["executed_actions"] = executed_actions
+        env_step_state["action_mode"] = "mixed"
+        env_step_state["is_teacher_env"] = is_teacher_env
+        return env_step_state
+
     def _rollout_step(self, model, obs_dict):
         """Collect a full rollout of ``num_steps_per_env`` transitions and compute returns.
 
@@ -1076,6 +1183,13 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         policy_model = model.policy
         value_model = model.value_model
         policy_model.init_rollout()
+        teacher_model = None
+        student_ratio = 1.0
+        if self.dagger_mixed_rollout:
+            teacher_model = self.ref_model
+            teacher_model.eval()
+            teacher_model.init_rollout()
+            student_ratio = self._get_dagger_student_ratio()
         self.storage.clear()
 
         dones = torch.zeros(self.env.num_envs, device=device)
@@ -1086,6 +1200,37 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 policy_state_dict = self.policy_step(policy_model, obs_dict, cur_dones=dones)
 
                 clean_obs_dict = self._compute_clean_obs_dict(obs_dict)
+                env_step_state = policy_state_dict
+                if teacher_model is not None:
+                    if clean_obs_dict is None:
+                        raise RuntimeError(
+                            "Step-level mixed DAgger requires clean Teacher observations"
+                        )
+                    teacher_obs_dict = obs_dict.copy()
+                    teacher_obs_dict.update(
+                        {
+                            key: value
+                            for key, value in clean_obs_dict.items()
+                            if key != "reference_hand_actions"
+                        }
+                    )
+                    # Both policies see the complete batch every timestep. This
+                    # keeps recurrent/history state valid when membership in the
+                    # execution mask changes at the next environment step.
+                    teacher_state_dict = self.policy_step(
+                        teacher_model, teacher_obs_dict, cur_dones=dones
+                    )
+                    is_teacher_env = self._sample_dagger_teacher_mask(
+                        self.num_envs, student_ratio, device
+                    )
+                    env_step_state = self._build_mixed_rollout_actions(
+                        policy_state_dict, teacher_state_dict, is_teacher_env
+                    )
+                    self._last_dagger_student_ratio = student_ratio
+                    self._last_dagger_num_teacher = int(is_teacher_env.sum().item())
+                    self._last_dagger_num_student = (
+                        self.num_envs - self._last_dagger_num_teacher
+                    )
 
                 # Append states to storage
                 for key, value in obs_dict.items():
@@ -1112,10 +1257,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 # Step the environment
                 if self.use_symmetry:
                     obs_dict, rewards, dones, infos, termination_ids, termination_observations = (
-                        self.env.step(policy_state_dict)
+                        self.env.step(env_step_state)
                     )
                 else:
-                    obs_dict, rewards, dones, infos = self.env.step(policy_state_dict)
+                    obs_dict, rewards, dones, infos = self.env.step(env_step_state)
                 for obs_key in obs_dict.keys():  # noqa: SIM118
                     obs_dict[obs_key] = obs_dict[obs_key].to(device)
                     if obs_key == "critic_obs" and self.use_symmetry:
@@ -1147,6 +1292,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 self.cur_episode_length[new_ids] = 0
 
             policy_model.clear_rollout()
+            if teacher_model is not None:
+                teacher_model.clear_rollout()
             # gc.collect()
             # torch.cuda.empty_cache()
 
@@ -1244,6 +1391,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 entries for metric tracking.
         """
         self.policy_model.reset(dones)
+        if self.dagger_mixed_rollout:
+            self.ref_model.reset(dones)
         if self.value_model is not None:
             self.value_model.reset(dones)
         self.episode_env_tensors.add(infos["to_log"])
@@ -2332,7 +2481,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
 
     def append_to_log_dict(self, log_dict):
         """Hook for subclasses to inject additional entries into the per-iteration log dict."""
-        pass
+        if self.dagger_mixed_rollout:
+            log_dict["dagger/student_ratio"] = self._last_dagger_student_ratio
+            log_dict["dagger/num_student_envs"] = self._last_dagger_num_student
+            log_dict["dagger/num_teacher_envs"] = self._last_dagger_num_teacher
 
     def _eval_mode(self):
         """Switch models and environment to evaluation mode."""

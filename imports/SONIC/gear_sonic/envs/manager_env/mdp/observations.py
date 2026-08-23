@@ -162,8 +162,32 @@ class PolicyCfg(ObsGroup):
 
 
 @configclass
+class StudentProprioCfg(ObsGroup):
+    """Five-frame robot-state and previous-meta-action history for the vector student."""
+
+    joint_pos = None
+    joint_vel = None
+    projected_gravity = None
+    base_ang_vel = None
+    base_lin_vel = None
+    last_meta_action = None
+
+
+@configclass
+class StudentPrivilegedCfg(ObsGroup):
+    """Current-frame object, table, and contact state for the vector student."""
+
+    object_bps = None
+    table_corners_b = None
+    object_pos_b = None
+    object_ori_b_6d = None
+    hand_object_transform_6d = None
+    hand_object_contact_force_magnitude = None
+
+
+@configclass
 class StudentVectorCfg(ObsGroup):
-    """Single-frame structured observation group for the vector student.
+    """Legacy single-frame structured observation group for the vector student.
 
     The declaration order is part of the student input ABI.  Keep it aligned
     with the corresponding Hydra observation configuration and the 138-dim
@@ -518,6 +542,8 @@ class ObservationsCfg:
     teacher: TeacherCfg = None  # Teacher observations for distillation
     camera_rgb: CameraRGBCfg = None  # Separate vision observation group
     state_token: PolicyCfg = None  # Current joint position + projected gravity token input
+    proprio_obs: StudentProprioCfg = None  # Five-frame robot/action history (805D)
+    privileged_obs: StudentPrivilegedCfg = None  # Current task state (48D)
     student_obs: StudentVectorCfg = None  # Structured non-visual diffusion-student input
     residual_action: ResidualAction = None
 
@@ -1437,6 +1463,50 @@ def table_geometry(
     mins = xy.amin(dim=1)
     maxs = xy.amax(dim=1)
     return torch.cat([mins[:, 0:1], maxs[:, 0:1], mins[:, 1:2], maxs[:, 1:2]], dim=-1)
+
+
+def table_corners_b(
+    env: ManagerBasedEnv, command_name: str, table_size: tuple[float, float, float]
+) -> torch.Tensor:
+    """Return all four table-top corners in the current pelvis frame.
+
+    Corner order in the table-local frame is ``(-x,-y)``, ``(-x,+y)``,
+    ``(+x,-y)``, ``(+x,+y)``. The xyz coordinates are flattened to 12D in
+    that order. ``table_size`` is ``[width, depth, thickness]``.
+    """
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+
+    if "table" not in env.scene.rigid_objects:
+        return torch.zeros(env.num_envs, 12, device=env.device)
+
+    table = env.scene["table"]
+    table_pos_w = table.data.root_pos_w
+    table_quat_w = table.data.root_quat_w
+    size = torch.as_tensor(table_size, device=env.device, dtype=table_pos_w.dtype)
+    if size.numel() != 3:
+        raise ValueError(f"table_size must contain [width, depth, thickness], got {table_size}")
+    half_width, half_depth, half_thickness = (size.reshape(3) * 0.5).unbind()
+    local_corners = torch.stack(
+        [
+            torch.stack([-half_width, -half_depth, half_thickness]),
+            torch.stack([-half_width, half_depth, half_thickness]),
+            torch.stack([half_width, -half_depth, half_thickness]),
+            torch.stack([half_width, half_depth, half_thickness]),
+        ]
+    )
+
+    corners_w = quat_apply(
+        table_quat_w[:, None, :].expand(-1, 4, -1).reshape(-1, 4),
+        local_corners[None, :, :].expand(env.num_envs, -1, -1).reshape(-1, 3),
+    ).reshape(env.num_envs, 4, 3) + table_pos_w[:, None, :]
+
+    pelvis_pos_w = command.robot.data.body_pos_w[:, command.robot_anchor_body_index]
+    pelvis_quat_w = command.robot.data.body_quat_w[:, command.robot_anchor_body_index]
+    corners_b = quat_apply(
+        quat_inv(pelvis_quat_w)[:, None, :].expand(-1, 4, -1).reshape(-1, 4),
+        (corners_w - pelvis_pos_w[:, None, :]).reshape(-1, 3),
+    )
+    return corners_b.reshape(env.num_envs, 12)
 
 
 def table_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

@@ -91,14 +91,7 @@ scheduler.update_scheduled_params(...)
 ```python
 self.scheduled_params_dict
 ```
-
-它主要用于当前 iteration 的环境行为和日志。
-
----
-
-### 2. `_rollout_step(model, obs_dict)`
-
-位置：[ppo_trainer.py](/home/tide/robot/GRAIL/imports/SONIC/gear_sonic/trl/trainer/ppo_trainer.py:1019)
+for i in range(num_steps_per_env): 
 
 目标：
 
