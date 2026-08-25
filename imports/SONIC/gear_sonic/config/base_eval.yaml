@@ -7,6 +7,14 @@ defaults:
 
 checkpoint: ???
 
+# Applied after loading a checkpoint's saved training config, so legacy
+# checkpoints also use the relaxed play threshold unless explicitly overridden.
+object_pos_deviation_threshold: 0.25
+log_reset_reasons: true
+# A run-once play only consumes one motion per environment. Cap the paired
+# motion/USD library before scene construction instead of indexing everything.
+load_only_num_envs_motions: true
+
 algo:
   config:
     eval:

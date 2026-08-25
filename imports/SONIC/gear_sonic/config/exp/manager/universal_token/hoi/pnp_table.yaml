@@ -233,7 +233,7 @@ manager_env:
       func: gear_sonic.envs.manager_env.mdp:object_pos_deviation
       params:
         command_name: "motion"
-        threshold: 0.1
+        threshold: 0.25
     hand_table_contact_termination:
       _target_: isaaclab.managers.TerminationTermCfg
       func: gear_sonic.envs.manager_env.mdp:hand_table_contact_termination

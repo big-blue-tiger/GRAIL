@@ -1,16 +1,18 @@
 # @package _global_
+#
+# Single-step transformer-flow comparison.  Horizon one still uses the pure
+# chunk CFM trainer: labels mature immediately, while training stays bounded
+# by an explicit micro-batch and avoids the unused PPO critic/Gaussian path.
 
 defaults:
   - /exp/manager/universal_token/distill/robocasa_pickup_table_diffusion_decoder_latent_vector_obs
   - _self_
 
-exp_var: robocasa_pickup_table_transformer_flow_chunk40_decoder_latent_vector_obs
+exp_var: robocasa_pickup_table_transformer_flow_chunk1_decoder_latent_vector_obs
 experiment_name: ${exp_base}_${exp_var}
 
 algo:
   config:
-    # The delayed action-chunk objective is pure DAgger/CFM.  It must not
-    # instantiate a critic or expose the unused Actor Gaussian std to DDP.
     distill_only: true
     freeze_noise_std: true
     desired_kl: null
@@ -19,14 +21,12 @@ algo:
       - loss/diffusion_flow
     action_chunk:
       enabled: true
-      horizon: 40
+      horizon: 1
       target_offset: 0
-      train_execute_steps: 16
-      eval_execute_steps: 20
-      buffer_capacity: 64
+      train_execute_steps: 1
+      eval_execute_steps: 1
+      buffer_capacity: 32
       target_build_batch_size: 1024
-      # 2048 envs produce 8192 anchors per logical minibatch. Keep the
-      # optimizer schedule fixed while bounding each FP32 RDT forward.
       train_micro_batch_size: 128
       num_learning_epochs: 3
       num_mini_batches: 4
@@ -37,7 +37,7 @@ algo:
         _target_: gear_sonic.trl.modules.diffusion_policy_modules.EncoderVectorTransformerFlowPolicy
         process_output_dim: true
         module_config_dict:
-          action_horizon: ${algo.config.action_chunk.horizon}
+          action_horizon: 1
           transformer_hidden_dim: 512
           transformer_num_layers: 14
           transformer_num_heads: 8

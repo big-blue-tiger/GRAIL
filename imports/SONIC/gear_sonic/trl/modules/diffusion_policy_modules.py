@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from torch.distributions import Beta
 import torch.nn.functional as F
+from torch.utils import checkpoint as checkpoint_utils
 from torchvision import models
 
 
@@ -183,11 +184,13 @@ class _ActionChunkRdt(nn.Module):
         num_layers=14,
         num_heads=8,
         attention_dropout=0.1,
+        gradient_checkpointing=False,
     ):
         super().__init__()
         self.action_dim = int(action_dim)
         self.action_horizon = int(action_horizon)
         self.hidden_dim = int(hidden_dim)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.action_embedding = nn.Linear(self.action_dim, self.hidden_dim)
         self.action_position = nn.Parameter(
             torch.empty(1, self.action_horizon, self.hidden_dim)
@@ -230,7 +233,15 @@ class _ActionChunkRdt(nn.Module):
         condition = torch.cat([condition, time_token], dim=1) + self.condition_position
         value = self.action_embedding(action) + self.action_position
         for block in self.blocks:
-            value = block(value, condition)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                value = checkpoint_utils.checkpoint(
+                    block,
+                    value,
+                    condition,
+                    use_reentrant=False,
+                )
+            else:
+                value = block(value, condition)
         output = self.output(self.final_norm(value))
         return output.reshape(*prefix, self.action_horizon, self.action_dim)
 
@@ -932,6 +943,9 @@ class EncoderVectorTransformerFlowPolicy(EncoderVectorDiffusionPolicy):
         num_layers = int(config.get("transformer_num_layers", 14))
         num_heads = int(config.get("transformer_num_heads", 8))
         attention_dropout = float(config.get("transformer_attention_dropout", 0.1))
+        gradient_checkpointing = bool(
+            config.get("transformer_gradient_checkpointing", False)
+        )
         if self.action_horizon <= 0:
             raise ValueError("action_horizon must be positive")
         if self.proprio_feature_dim != hidden_dim or self.privileged_feature_dim != hidden_dim:
@@ -956,6 +970,7 @@ class EncoderVectorTransformerFlowPolicy(EncoderVectorDiffusionPolicy):
             num_layers=num_layers,
             num_heads=num_heads,
             attention_dropout=attention_dropout,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
     def _encode_condition_tokens(self, obs_dict):
@@ -1184,6 +1199,39 @@ class EncoderVectorTransformerFlowPolicy(EncoderVectorDiffusionPolicy):
             },
             "aux_loss_coef": {"diffusion_flow": self.diffusion_loss_coef},
         }
+
+
+class EncoderVectorSingleStepTransformerFlowPolicy(
+    EncoderVectorTransformerFlowPolicy
+):
+    """One-step RDT/flow policy trained by the standard DAgger path.
+
+    The action-chunk trainer needs a delayed target buffer when the horizon is
+    greater than one.  At horizon one there is no delayed label, so this
+    adapter exposes the transformer as an ordinary 66-D policy: rollout
+    samples have their singleton horizon removed and regular DAgger targets
+    gain that axis only while the flow-matching loss is evaluated.
+    """
+
+    is_action_chunk_policy = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.action_horizon != 1:
+            raise ValueError(
+                "EncoderVectorSingleStepTransformerFlowPolicy requires "
+                f"action_horizon=1, got {self.action_horizon}"
+            )
+
+    def forward(self, input, compute_aux_loss=False, **kwargs):
+        if not compute_aux_loss:
+            return super().forward(input, compute_aux_loss=False, **kwargs).squeeze(-2)
+
+        target = self._extract_target(kwargs)
+        if target is not None:
+            kwargs = dict(kwargs)
+            kwargs[self.diffusion_target_key] = target.unsqueeze(-2)
+        return super().forward(input, compute_aux_loss=True, **kwargs)
 
 
 class EncoderRgbMlpPolicy(EncoderRgbDiffusionPolicy):

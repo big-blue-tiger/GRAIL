@@ -381,13 +381,36 @@ class MotionLibBase:
         bps_dir = motion_lib_cfg.get("bps_dir", None)
         if bps_dir is not None and osp.isdir(bps_dir):
             import numpy as _bps_np  # noqa: PLC0415
-            npy_files = sorted(f for f in os.listdir(bps_dir) if f.endswith(".npy") and not f.startswith("_"))
+
+            all_npy_files = sorted(
+                f
+                for f in os.listdir(bps_dir)
+                if f.endswith(".npy") and not f.startswith("_")
+            )
+            selected_stems = {
+                osp.basename(str(key)) for key in self._motion_data_keys
+            }
+            npy_files = [
+                fname
+                for fname in all_npy_files
+                if osp.splitext(fname)[0] in selected_stems
+            ]
             for fname in npy_files:
                 stem = osp.splitext(fname)[0]
                 self._bps_lookup[stem] = _bps_np.load(osp.join(bps_dir, fname))
             if self._bps_lookup:
                 self._bps_dim = next(iter(self._bps_lookup.values())).shape[0]
-            logger.info(f"[BPS] Loaded {len(self._bps_lookup)} objects, dim={self._bps_dim} from {bps_dir}/")
+            elif all_npy_files:
+                # Preserve the configured observation width even when a
+                # selected motion has no matching BPS file; its value remains
+                # the same zero fallback used previously.
+                self._bps_dim = _bps_np.load(
+                    osp.join(bps_dir, all_npy_files[0]), mmap_mode="r"
+                ).shape[0]
+            logger.info(
+                f"[BPS] Loaded {len(self._bps_lookup)}/{len(all_npy_files)} "
+                f"selected objects, dim={self._bps_dim} from {bps_dir}/"
+            )
         elif bps_dir is not None:
             logger.warning(f"[BPS] bps_dir not found: {bps_dir} — BPS obs will be zeros")
         self._motion_object_bps = None

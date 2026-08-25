@@ -1,0 +1,18 @@
+# @package _global_
+#
+# Chunk-40 comparison with a slow Teacher-to-Student rollout curriculum.
+# Iteration 0 executes only Teacher actions.  The Student fraction increases
+# linearly to 0.5 at iteration 3000 and remains at a 1:1 split afterwards.
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_transformer_flow_chunk40_decoder_latent_vector_obs
+  - _self_
+
+exp_var: robocasa_pickup_table_transformer_flow_chunk40_decoder_latent_vector_obs_linear_dagger
+experiment_name: ${exp_base}_${exp_var}
+
+algo:
+  config:
+    dagger_rollout_mode: linear
+    dagger_student_ratio: 0.5
+    dagger_student_ratio_increment: 0.00016666666666666666

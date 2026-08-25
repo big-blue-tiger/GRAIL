@@ -3,6 +3,7 @@
 import gc  # noqa: F401
 import math
 import os
+from contextlib import nullcontext
 
 import accelerate
 from accelerate import utils as accelerate_utils
@@ -780,6 +781,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.num_act = self.policy_model.num_actions
 
         self.num_steps_per_env = self.config.num_steps_per_env
+        self.rollout_storage_obs_shapes = (
+            self.config.get("rollout_storage_obs_shapes", {}) or {}
+        )
         self.action_chunk_config = self.config.get("action_chunk", {}) or {}
         self.action_chunk_enabled = bool(self.action_chunk_config.get("enabled", False))
         self.action_chunk_horizon = int(self.action_chunk_config.get("horizon", 1))
@@ -802,17 +806,20 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.action_chunk_num_minibatches = int(
             self.action_chunk_config.get("num_mini_batches", 4)
         )
+        action_chunk_train_micro_batch_size = self.action_chunk_config.get(
+            "train_micro_batch_size"
+        )
+        self.action_chunk_train_micro_batch_size = (
+            None
+            if action_chunk_train_micro_batch_size is None
+            else int(action_chunk_train_micro_batch_size)
+        )
         self.action_chunk_replan_on_discontinuity = bool(
             self.action_chunk_config.get("replan_on_discontinuity", True)
         )
         if self.action_chunk_enabled:
             if self.action_chunk_target_offset != 0:
                 raise ValueError("Only s_t -> [a_t,...,a_t+H-1] target_offset=0 is supported")
-            if self.action_chunk_train_execute_steps != self.num_steps_per_env:
-                raise ValueError(
-                    "action_chunk.train_execute_steps must equal num_steps_per_env; got "
-                    f"{self.action_chunk_train_execute_steps} and {self.num_steps_per_env}"
-                )
             if not 0 < self.action_chunk_train_execute_steps <= self.action_chunk_horizon:
                 raise ValueError("Invalid action chunk train execution length")
             if not 0 < self.action_chunk_eval_execute_steps <= self.action_chunk_horizon:
@@ -828,6 +835,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 raise ValueError("action_chunk.target_build_batch_size must be positive")
             if self.action_chunk_num_epochs <= 0 or self.action_chunk_num_minibatches <= 0:
                 raise ValueError("action chunk epoch/minibatch counts must be positive")
+            if (
+                self.action_chunk_train_micro_batch_size is not None
+                and self.action_chunk_train_micro_batch_size <= 0
+            ):
+                raise ValueError("action_chunk.train_micro_batch_size must be positive")
             if self.args.gradient_accumulation_steps != 1:
                 raise ValueError(
                     "action-chunk CFM currently requires gradient_accumulation_steps=1"
@@ -973,7 +985,21 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         )
         ## Register obs keys
         for obs_key, obs_dim in self.algo_obs_dim_dict.items():
-            obs_shape = (obs_dim,) if isinstance(obs_dim, int) else tuple(obs_dim)
+            storage_shape = self.rollout_storage_obs_shapes.get(obs_key)
+            if storage_shape is None:
+                obs_shape = (obs_dim,) if isinstance(obs_dim, int) else tuple(obs_dim)
+            else:
+                obs_shape = tuple(int(dim) for dim in storage_shape)
+                if not obs_shape or any(dim <= 0 for dim in obs_shape):
+                    raise ValueError(
+                        f"Invalid rollout storage shape for {obs_key!r}: {obs_shape}"
+                    )
+                configured_size = obs_dim if isinstance(obs_dim, int) else math.prod(obs_dim)
+                if math.prod(obs_shape) != configured_size:
+                    raise ValueError(
+                        f"Rollout storage shape for {obs_key!r} has "
+                        f"{math.prod(obs_shape)} values, expected {configured_size}"
+                    )
             if obs_key in ["vision_obs", "camera_rgb"]:
                 # Vision observations are stored as [H, W, C] image, not flattened
                 self.storage.register_key(
@@ -2499,8 +2525,15 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             torch.distributed.all_reduce(count)
         return count
 
+    @staticmethod
+    def _all_reduce_max_count(count):
+        count = count.clone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX)
+        return count
+
     def _train_action_chunk_batch(self, model, batch):
-        """Run the fixed 3x4 globally weighted masked-CFM update schedule."""
+        """Run globally weighted masked-CFM with one step per logical minibatch."""
         if batch is None:
             return {"optimizer_steps": 0, "loss": 0.0, "global_valid": 0}
         obs_dict = batch["obs_dict"]
@@ -2551,41 +2584,103 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 global_count = self._all_reduce_count(local_count)
                 if global_count.item() == 0:
                     continue
-                if indices.numel() == 0:
-                    mb_obs = {
-                        key: torch.zeros_like(value[:1]) for key, value in flat_obs.items()
-                    }
-                    mb_target = torch.zeros_like(flat_target[:1])
-                    mb_valid = torch.zeros(1, dtype=torch.bool, device=flat_target.device)
+
+                if self.action_chunk_train_micro_batch_size is None:
+                    local_micro_steps = 1
                 else:
-                    mb_obs = {
-                        key: value.index_select(0, indices) for key, value in flat_obs.items()
-                    }
-                    mb_target = flat_target.index_select(0, indices)
-                    mb_valid = torch.ones(
-                        indices.numel(), dtype=torch.bool, device=flat_target.device
+                    local_micro_steps = math.ceil(
+                        indices.numel() / self.action_chunk_train_micro_batch_size
+                    )
+                micro_steps_tensor = torch.tensor(
+                    local_micro_steps,
+                    device=self.accelerator.device,
+                    dtype=torch.long,
+                )
+                num_micro_steps = int(
+                    self._all_reduce_max_count(micro_steps_tensor).item()
+                )
+                if num_micro_steps <= 0:
+                    raise RuntimeError(
+                        "Global action-chunk minibatch is non-empty but has no microbatches"
                     )
 
-                results = model.forward(
-                    modes=["policy_chunk_distill"],
-                    input_kwargs={
-                        "policy_chunk_distill": {
-                            "obs_dict": mb_obs,
-                            "diffusion_target": mb_target,
-                            "diffusion_target_valid": mb_valid,
-                            "update_running_stats": False,
+                self.optimizer.zero_grad()
+                logical_loss_sum = 0.0
+                for micro_step in range(num_micro_steps):
+                    if self.action_chunk_train_micro_batch_size is None:
+                        micro_indices = indices if micro_step == 0 else indices[:0]
+                    else:
+                        start = micro_step * self.action_chunk_train_micro_batch_size
+                        end = min(
+                            start + self.action_chunk_train_micro_batch_size,
+                            indices.numel(),
+                        )
+                        micro_indices = indices[start:end]
+
+                    sync_gradients = micro_step == num_micro_steps - 1
+                    # no_sync microsteps perform no collective, so a rank with fewer
+                    # local samples can skip them. Every rank still performs the final
+                    # dummy backward to reduce any accumulated gradients.
+                    if micro_indices.numel() == 0 and not sync_gradients:
+                        continue
+                    if micro_indices.numel() == 0:
+                        mb_obs = {
+                            key: torch.zeros_like(value[:1])
+                            for key, value in flat_obs.items()
                         }
-                    },
-                )["policy_chunk_distill"]
-                local_loss = results["aux_losses"]["diffusion_flow"]
-                loss_coef = results["aux_loss_coef"].get("diffusion_flow", 1.0)
-                scale = (
-                    world_size
-                    * float(indices.numel())
-                    / float(global_count.item())
-                )
-                loss = local_loss * loss_coef * self.config.get("aux_loss_scale", 1.0) * scale
-                self.accelerator.backward(loss)
+                        mb_target = torch.zeros_like(flat_target[:1])
+                        mb_valid = torch.zeros(
+                            1, dtype=torch.bool, device=flat_target.device
+                        )
+                    else:
+                        mb_obs = {
+                            key: value.index_select(0, micro_indices)
+                            for key, value in flat_obs.items()
+                        }
+                        mb_target = flat_target.index_select(0, micro_indices)
+                        mb_valid = torch.ones(
+                            micro_indices.numel(),
+                            dtype=torch.bool,
+                            device=flat_target.device,
+                        )
+
+                    sync_context = (
+                        nullcontext()
+                        if sync_gradients
+                        else self.accelerator.no_sync(model)
+                    )
+                    with sync_context:
+                        results = model.forward(
+                            modes=["policy_chunk_distill"],
+                            input_kwargs={
+                                "policy_chunk_distill": {
+                                    "obs_dict": mb_obs,
+                                    "diffusion_target": mb_target,
+                                    "diffusion_target_valid": mb_valid,
+                                    "update_running_stats": False,
+                                }
+                            },
+                        )["policy_chunk_distill"]
+                        local_loss = results["aux_losses"]["diffusion_flow"]
+                        loss_coef = results["aux_loss_coef"].get(
+                            "diffusion_flow", 1.0
+                        )
+                        scale = (
+                            world_size
+                            * float(micro_indices.numel())
+                            / float(global_count.item())
+                        )
+                        loss = (
+                            local_loss
+                            * loss_coef
+                            * self.config.get("aux_loss_scale", 1.0)
+                            * scale
+                        )
+                        self.accelerator.backward(loss)
+                    logical_loss_sum += (
+                        float(local_loss.detach().item()) * micro_indices.numel()
+                    )
+
                 grad_norm = self._gradient_clipping()
                 if grad_norm is not None:
                     self.optimizer.step()
@@ -2593,11 +2688,33 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 else:
                     print("NaN in action-chunk gradient; optimizer step skipped")  # noqa: T201
                 self.optimizer.zero_grad()
-                losses.append(float(local_loss.detach().item()))
+                if indices.numel() > 0:
+                    losses.append(logical_loss_sum / indices.numel())
         return {
             "optimizer_steps": optimizer_steps,
             "loss": float(np.mean(losses)) if losses else 0.0,
             "global_valid": int(global_valid_total.item()),
+        }
+
+    def _reset_cuda_peak_memory(self):
+        device = torch.device(self.accelerator.device)
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device)
+
+    def _cuda_memory_metrics(self, phase):
+        device = torch.device(self.accelerator.device)
+        if device.type != "cuda" or not torch.cuda.is_available():
+            return {}
+        bytes_per_gib = float(1024**3)
+        return {
+            f"memory/{phase}_allocated_gib": torch.cuda.memory_allocated(device)
+            / bytes_per_gib,
+            f"memory/{phase}_reserved_gib": torch.cuda.memory_reserved(device)
+            / bytes_per_gib,
+            f"memory/{phase}_peak_allocated_gib": torch.cuda.max_memory_allocated(device)
+            / bytes_per_gib,
+            f"memory/{phase}_peak_reserved_gib": torch.cuda.max_memory_reserved(device)
+            / bytes_per_gib,
         }
 
     def _train_action_chunk(self):
@@ -2662,6 +2779,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                     self.cur_reward_sum.zero_()
                     self.cur_episode_length.zero_()
 
+            self._reset_cuda_peak_memory()
             with torch.no_grad():
                 with models_utils.unwrap_model_for_generation(
                     self.model,
@@ -2671,10 +2789,17 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                     obs_dict = self._rollout_step_action_chunk(rollout_model, obs_dict)
             end_collection = time.time()
             collection_time = end_collection - batch_start
-            update_metrics = self._train_action_chunk_batch(
-                model, self._chunk_latest_batch
-            )
+            memory_metrics = self._cuda_memory_metrics("collection")
+
+            self._reset_cuda_peak_memory()
+            chunk_batch = self._chunk_latest_batch
+            self._chunk_latest_batch = None
+            try:
+                update_metrics = self._train_action_chunk_batch(model, chunk_batch)
+            finally:
+                del chunk_batch
             learn_time = time.time() - end_collection
+            memory_metrics.update(self._cuda_memory_metrics("train"))
 
             if update_metrics["optimizer_steps"] > 0:
                 self.lr_scheduler.step()
@@ -2704,6 +2829,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                     "batch_idx": batch_idx,
                     "num_total_batches": args.num_total_batches,
                 }
+                log_dict.update(memory_metrics)
                 if self.state.rewbuffer:
                     reward_values = np.asarray(self.state.rewbuffer)
                     log_dict["objective/rewards"] = float(
@@ -2943,6 +3069,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                                                 forward_results,
                                                 mb_rollout_data,
                                             )
+                                    # The regular Actor path caches its latest
+                                    # Normal and auxiliary losses.  With the
+                                    # checkpointed RDT those values retain the
+                                    # full autograd graph; chunk training does
+                                    # not use this state, hence its stable VRAM.
+                                    self.policy_model.clear_forward_state()
                                     del loss_dict, forward_results, mb_rollout_data
                                     microbatch_idx += 1
                         minibatch_idx += 1  # noqa: SIM113

@@ -109,6 +109,79 @@ VISUAL_DR_PROFILES = {
 }
 
 
+def _manager_env(env):
+    """Return the underlying IsaacLab manager environment."""
+    return getattr(env, "env", env)
+
+
+def _evaluation_motion_keys(env, num_envs):
+    """Snapshot the motion key assigned to every evaluation environment."""
+    command = getattr(env, "motion_command", None)
+    if command is None:
+        manager_env = _manager_env(env)
+        command_manager = getattr(manager_env, "command_manager", None)
+        if command_manager is not None:
+            try:
+                command = command_manager.get_term("motion")
+            except Exception:  # noqa: BLE001
+                command = None
+    if command is None or not hasattr(command, "motion_ids"):
+        return [f"env_{env_id}" for env_id in range(num_envs)]
+
+    motion_ids = command.motion_ids.detach().cpu().tolist()
+    motion_lib = getattr(command, "motion_lib", getattr(env, "_motion_lib", None))
+    current_keys = getattr(motion_lib, "curr_motion_keys", None)
+    all_keys = getattr(motion_lib, "motion_keys", None)
+    keys = []
+    for env_id in range(num_envs):
+        motion_id = int(motion_ids[env_id])
+        if current_keys is not None and motion_id < len(current_keys):
+            keys.append(str(current_keys[motion_id]))
+        elif all_keys is not None and motion_id < len(all_keys):
+            keys.append(str(all_keys[motion_id]))
+        else:
+            keys.append(f"motion_{motion_id}")
+    return keys
+
+
+def _evaluation_reset_reasons(env, env_id):
+    """Return all termination terms that fired for one environment."""
+    termination_manager = getattr(_manager_env(env), "termination_manager", None)
+    if termination_manager is None:
+        return ["unknown"]
+    reasons = []
+    for term_name in termination_manager.active_terms:
+        term_value = termination_manager.get_term(term_name)
+        if bool(term_value[env_id].item()):
+            reasons.append(str(term_name))
+    return reasons or ["unknown"]
+
+
+def _evaluation_step_dt(env):
+    """Return one policy/environment step duration in seconds."""
+    step_dt = getattr(_manager_env(env), "step_dt", None)
+    return float(step_dt) if step_dt is not None else 1.0 / 50.0
+
+
+def _apply_run_once_motion_cap(config):
+    """Cap paired data before scene construction for one-episode play."""
+    if not config.get("run_once", False) or not config.get(
+        "load_only_num_envs_motions", True
+    ):
+        return None
+    motion_lib_cfg = config.manager_env.commands.motion.motion_lib_cfg
+    requested_cap = int(config.num_envs)
+    existing_cap = motion_lib_cfg.get("max_unique_motions", None)
+    effective_cap = (
+        requested_cap
+        if existing_cap is None
+        else min(int(existing_cap), requested_cap)
+    )
+    with omegaconf.open_dict(motion_lib_cfg):
+        motion_lib_cfg.max_unique_motions = effective_cap
+    return effective_cap
+
+
 def _visual_dr_get(config, key, default=None):
     if config is None:
         return default
@@ -304,6 +377,36 @@ def main(override_config: omegaconf.OmegaConf):
         for termination in config.manager_env.config.get("train_only_terminations", []):
             if termination in config.manager_env.terminations:
                 config.manager_env.terminations.pop(termination)
+
+        # Checkpoints embed their original environment config, so changing the
+        # source YAML alone would leave old checkpoints at 0.10 m during play.
+        # Apply the new evaluation default after merging the checkpoint config;
+        # users can still override it with
+        # ++object_pos_deviation_threshold=<meters>.
+        object_pos_term = config.manager_env.terminations.get(
+            "object_pos_deviation", None
+        )
+        if object_pos_term is not None:
+            object_pos_threshold = float(
+                config.get("object_pos_deviation_threshold", 25) # set to 25 彻底关闭此终止条件
+            )
+            object_pos_term.params.threshold = object_pos_threshold
+            logger.info(
+                "Evaluation object_pos_deviation threshold: "
+                f"{object_pos_threshold:.3f} m"
+            )
+
+        # Paired-motion scene construction consumes the motion library config
+        # before the command starts loading clips.  Cap it here so run-once
+        # play creates only num_envs paired USDs and deserializes only those
+        # robot/object motions.  Applying this after env creation is too late:
+        # MultiUsdFileCfg would already contain the entire dataset.
+        effective_cap = _apply_run_once_motion_cap(config)
+        if effective_cap is not None:
+            logger.info(
+                "Run-once fast loading enabled: limiting paired motion/object/USD "
+                f"data to {effective_cap} entries before environment creation"
+            )
 
     use_encoder = config.get("use_encoder", None)
     if use_encoder is not None:
@@ -569,6 +672,11 @@ def main(override_config: omegaconf.OmegaConf):
         _resolve=False,
     ).to(device)
 
+    # Distillation-only policies (for example action-chunk CFM models) do not
+    # have or need a critic during evaluation.  Keep the wrapper interface
+    # consistent while avoiding an unbound local when critic construction is
+    # intentionally skipped.
+    value_model = None
     if not getattr(config.algo.config, "distill_only", False):
         value_model = trl_utils_common.custom_instantiate(
             config.algo.config.critic,
@@ -985,6 +1093,12 @@ def main(override_config: omegaconf.OmegaConf):
 
         run_once = config.get("run_once", False)
         envs_completed = torch.zeros(config.num_envs, dtype=torch.bool, device=device)
+        episode_steps = torch.zeros(
+            config.num_envs, dtype=torch.long, device=device
+        )
+        episode_motion_keys = _evaluation_motion_keys(env, config.num_envs)
+        eval_step_dt = _evaluation_step_dt(env)
+        log_reset_reasons = bool(config.get("log_reset_reasons", True))
         chunk_executor = None
         previous_motion_metadata = None
         if action_chunk_enabled(config.algo.config):
@@ -1047,6 +1161,8 @@ def main(override_config: omegaconf.OmegaConf):
                     results[3],
                 )  # noqa: F841
                 previous_dones = dones.to(device=device, dtype=torch.bool).reshape(-1)
+                if run_once:
+                    episode_steps[~envs_completed] += 1
                 if eval_step_callbacks:
                     all_want_exit = all(
                         cb.eval_step(env, results) for cb in eval_step_callbacks.values()
@@ -1056,13 +1172,35 @@ def main(override_config: omegaconf.OmegaConf):
                         break
 
                 if run_once:
-                    envs_completed = (
-                        envs_completed | dones.squeeze(-1)
-                        if dones.dim() > 1
-                        else envs_completed | dones
-                    )
+                    done_mask = dones.to(device=device, dtype=torch.bool).reshape(-1)
+                    newly_completed = done_mask & ~envs_completed
+                    if log_reset_reasons:
+                        for env_id in newly_completed.nonzero(
+                            as_tuple=False
+                        ).squeeze(-1).tolist():
+                            reasons = _evaluation_reset_reasons(env, env_id)
+                            displayed_reasons = [
+                                (
+                                    f"{reason}(参考/真实物体位置偏差 > "
+                                    f"{config.object_pos_deviation_threshold:.3f} m)"
+                                    if reason == "object_pos_deviation"
+                                    else reason
+                                )
+                                for reason in reasons
+                            ]
+                            reset_time = float(episode_steps[env_id].item()) * eval_step_dt
+                            logger.info(
+                                f"第 {env_id + 1} 条数据 "
+                                f"({episode_motion_keys[env_id]}) 因为 "
+                                f"{', '.join(displayed_reasons)} "
+                                f"在第 {reset_time:.2f} 秒 reset"
+                            )
+                    envs_completed |= done_mask
                     if envs_completed.all():
-                        logger.info("All environments completed one episode. Exiting (run_once=True).")
+                        logger.info(
+                            f"全部 {config.num_envs} 条数据均已完成一次 episode；"
+                            "退出评估 (run_once=True)。"
+                        )
                         if hasattr(env, "end_render_results"):
                             env.end_render_results()
                         break
