@@ -43,6 +43,53 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         self.aux_loss_scale = self.config.get("aux_loss_scale", 1.0)
         self.compute_aux_loss = self.config.get("compute_aux_loss", True)
 
+        schedule_cfg = self.config.get("ppo_bc_loss_schedule", {})
+        self.ppo_bc_loss_schedule_enabled = bool(schedule_cfg.get("enabled", False))
+        self.ppo_bc_min_coef = float(schedule_cfg.get("bc_min_coef", 0.1))
+        self.ppo_bc_decay_fraction = float(schedule_cfg.get("bc_decay_fraction", 0.5))
+        self.ppo_bc_end_iteration = schedule_cfg.get("end_iteration", None)
+        if self.ppo_bc_end_iteration is not None:
+            self.ppo_bc_end_iteration = float(self.ppo_bc_end_iteration)
+        if not 0.0 <= self.ppo_bc_min_coef <= 1.0:
+            raise ValueError("ppo_bc_loss_schedule.bc_min_coef must be in [0, 1]")
+        if not 0.0 < self.ppo_bc_decay_fraction <= 1.0:
+            raise ValueError("ppo_bc_loss_schedule.bc_decay_fraction must be in (0, 1]")
+        if self.ppo_bc_end_iteration is not None and self.ppo_bc_end_iteration <= 0:
+            raise ValueError("ppo_bc_loss_schedule.end_iteration must be positive")
+
+    def _get_ppo_bc_loss_coefs(self):
+        """Return the complementary PPO/BC coefficients for the current iteration.
+
+        With the schedule enabled this implements
+
+            lambda_bc(k) = max(bc_min_coef, 1 - k / (K * bc_decay_fraction))
+            lambda_ppo(k) = 1 - lambda_bc(k)
+
+        By default ``K * bc_decay_fraction`` defines the decay duration.  An
+        explicit ``end_iteration`` overrides that duration, which is useful
+        when reproducing a fixed curriculum from a paper.  Otherwise the
+        existing static coefficients are returned.
+        """
+        if not self.ppo_bc_loss_schedule_enabled:
+            return float(self.config.get("ppo_loss_coef", 1.0)), float(self.aux_loss_scale)
+
+        iteration = float(self.state.global_step)
+        if self.ppo_bc_end_iteration is not None:
+            decay_iterations = self.ppo_bc_end_iteration
+        else:
+            total_iterations = float(self.args.num_total_batches)
+            if total_iterations <= 0:
+                raise ValueError("num_total_batches must be positive for PPO/BC loss scheduling")
+            decay_iterations = total_iterations * self.ppo_bc_decay_fraction
+        bc_coef = max(self.ppo_bc_min_coef, 1.0 - iteration / decay_iterations)
+        ppo_coef = 1.0 - bc_coef
+        return ppo_coef, bc_coef
+
+    def _get_ppo_loss_coef(self):
+        """Return the scheduled PPO coefficient used by the base trainer."""
+        ppo_coef, _ = self._get_ppo_bc_loss_coefs()
+        return ppo_coef
+
     def _register_stats_buffer(self):
         """Allocate per-step statistics tensors for auxiliary losses.
 
@@ -145,8 +192,9 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             coef = aux_loss_coef.get(loss_name, 0.0)
             total_aux_loss_unscaled += coef * loss_value
 
-        # Apply overall scale
-        total_aux_loss = total_aux_loss_unscaled * self.aux_loss_scale
+        # Apply either the static auxiliary scale or the scheduled BC weight.
+        _, bc_coef = self._get_ppo_bc_loss_coefs()
+        total_aux_loss = total_aux_loss_unscaled * bc_coef
 
         return {
             "aux_losses_dict": aux_losses_dict,
@@ -302,5 +350,9 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                 self.accelerator.gather_for_metrics(self.total_aux_loss_stats).mean().item()
             )
             metrics["aux_loss_scale"] = self.aux_loss_scale
+
+        ppo_coef, bc_coef = self._get_ppo_bc_loss_coefs()
+        metrics["loss/lambda_ppo"] = ppo_coef
+        metrics["loss/lambda_bc"] = bc_coef
 
         return metrics

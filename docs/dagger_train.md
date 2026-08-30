@@ -5,7 +5,7 @@
 cd /home/tide/robot/GRAIL/imports/SONIC
 
 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_diffusion_decoder_latent_vector_obs \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
   headless=False \
   num_envs=8
 
@@ -33,30 +33,31 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt 
 
 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_transformer_flow_chunk40_decoder_latent_vector_obs \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
   headless=True \
   num_envs=1024 \
-  experiment_name=chunk40_baseline \
+  experiment_name=mlp_bc1_ppo1 \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
   manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.action_chunk.train_micro_batch_size=64
+  algo.config.num_learning_iterations=7500 \
+  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt 
 
 CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_transformer_flow_chunk40_decoder_latent_vector_obs_linear_dagger \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
   headless=True \
   num_envs=1024 \
-  experiment_name=chunk40_linear_dagger \
+  experiment_name=mlp_bc1_ppo1_studentonly \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
   manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  algo.config.num_learning_iterations=7500 \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.action_chunk.train_micro_batch_size=64
+  algo.config.dagger_student_ratio=1.0
 
 CUDA_VISIBLE_DEVICES=2 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_transformer_flow_chunk1_decoder_latent_vector_obs \
@@ -95,19 +96,20 @@ python gear_sonic/eval_agent_trl.py \
 ## 服务器端play
 ```bash
 python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/manager/universal_token/distill/0821_teacher_student_rollout/last.pt \
+  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/mlp_bc1_ppo1_studentonly-20260828_161529/last.pt \
   +headless=True \
-  ++num_envs=4 \
+  ++num_envs=24 \
   +run_once=True \
   ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/0821_teacher_student_rollout \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/mlp_bc1_ppo1_studentonly-20260828_161529 \
   "~manager_env/recorders=empty" \
   "+manager_env/recorders=render" \
   ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd \
   ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot \
   ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
   ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
-  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/
+  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  ++object_pos_deviation_threshold=25.0
 
 python gear_sonic/eval_agent_trl.py \
   +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/chunk40_baseline-20260823_182155/last.pt \
@@ -125,22 +127,6 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/
 
 
-
-  python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/chunk40_linear_dagger-20260823_183856/last.pt \
-  +headless=True \
-  ++num_envs=16 \
-  +run_once=True \
-  ++object_pos_deviation_threshold=25.0 \
-  ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/chunk40_linear_dagger-20260823_183856 \
-  "~manager_env/recorders=empty" \
-  "+manager_env/recorders=render" \
-  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd \
-  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot \
-  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
-  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
-  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/
 
     python gear_sonic/eval_agent_trl.py \
   +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/chunk1-20260823_173553/last.pt \
@@ -168,9 +154,10 @@ rsync -aP \
 
   rsync -aP \
   --no-owner --no-group \
-  -e "ssh -p 9991 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
-  /home/tide/robot/GRAIL/imports/ \
-  ygc@202.120.37.249:/home/ygc/data0/GRAIL/imports/
+  --exclude='data/' \
+  -e "ssh -p 9989 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
+  /home/tide/robot/GRAIL/ \
+  cuixinru@202.120.37.249:/home/cuixinru/data0/GRAIL/
 ```
 
  proprio_obs [B,5,161]

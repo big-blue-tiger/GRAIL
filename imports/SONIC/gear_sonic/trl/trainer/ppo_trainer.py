@@ -864,6 +864,15 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
 
         self.entropy_coef = self.config.entropy_coef
         self.desired_kl = self.config.desired_kl
+        ppo_bc_schedule = self.config.get("ppo_bc_loss_schedule", {})
+        self.adaptive_kl_start_iteration = int(
+            ppo_bc_schedule.get(
+                "adaptive_after_iteration",
+                self.config.get("adaptive_kl_start_iteration", 0),
+            )
+        )
+        if self.adaptive_kl_start_iteration < 0:
+            raise ValueError("adaptive_kl_start_iteration must be non-negative")
         self.gamma = self.args.gamma
         self.lam = self.args.lam
         self.adaptive_lr_min = self.config.get("adaptive_lr_min", 1e-5)
@@ -2149,6 +2158,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             full_latent = full_latent.reshape(*batch_shape, self.diffusion_latent_dim)
         return torch.cat([full_latent.detach(), hand_action], dim=-1)
 
+    def _get_ppo_loss_coef(self):
+        """Return the effective coefficient applied to the PPO objective."""
+        return float(self.config.get("ppo_loss_coef", 1.0))
+
     def _compute_loss(self, forward_results, mb_rollout_data):
         """Compute the total loss as a weighted sum of PPO and optional auxiliary losses.
 
@@ -2162,7 +2175,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         """
         ppo_loss_dict = self._compute_ppo_loss(forward_results, mb_rollout_data)
 
-        loss = ppo_loss_dict["ppo_loss"] * self.config.get("ppo_loss_coef", 1.0)
+        loss = ppo_loss_dict["ppo_loss"] * self._get_ppo_loss_coef()
 
         ret_dict = {
             "ppo_loss_dict": ppo_loss_dict,
@@ -2387,8 +2400,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         pg_loss = loss_dict["ppo_loss_dict"]["pg_loss"]
         vf_loss = loss_dict["ppo_loss_dict"]["vf_loss"]
         entropy_loss = loss_dict["ppo_loss_dict"]["entropy_loss"]
-        weighted_ppo_loss = loss_dict["ppo_loss_dict"]["ppo_loss"] * self.config.get(
-            "ppo_loss_coef", 1.0
+        weighted_ppo_loss = (
+            loss_dict["ppo_loss_dict"]["ppo_loss"] * self._get_ppo_loss_coef()
         )
         ratio = loss_dict["ppo_loss_dict"]["ratio"]
         vf_clipfrac = loss_dict["ppo_loss_dict"]["vf_clipfrac"]
@@ -3423,6 +3436,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             optimizer (torch.optim.Optimizer): The optimizer to update.
         """
         if self.desired_kl is None:
+            return
+        if self.state.global_step < self.adaptive_kl_start_iteration:
             return
 
         if kl_mean > self.desired_kl * 2.0:

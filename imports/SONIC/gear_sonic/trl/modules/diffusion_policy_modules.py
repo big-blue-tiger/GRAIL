@@ -921,6 +921,89 @@ class EncoderVectorDiffusionPolicy(EncoderRgbDiffusionPolicy):
         return torch.cat([proprio_feat, privileged_feat], dim=-1)
 
 
+class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
+    """Direct behavior-cloning policy for structured observations.
+
+    This variant reuses :class:`EncoderVectorDiffusionPolicy`'s observation
+    flattening and normalization, but replaces the diffusion path with an
+    independent MLP action head.  The head consumes only the fused condition
+    and predicts the complete decoder action (64 latent values plus 2 hand
+    values) in the normalized target space.
+    """
+
+    def __init__(self, *args, **kwargs):
+        module_config_dict = kwargs.get("module_config_dict") or {}
+        if not module_config_dict and len(args) >= 2 and args[1] is not None:
+            module_config_dict = args[1]
+        module_config_dict = dict(module_config_dict)
+
+        super().__init__(*args, **kwargs)
+
+        activation = module_config_dict.get("activation", "SiLU")
+        self.bc_loss_coef = float(module_config_dict.get("bc_loss_coef", 1.0))
+        self.action_head = _build_mlp(
+            self.cond_dim,
+            module_config_dict.get("mlp_hidden_dims", [1024, 1024, 512]),
+            self.action_dim,
+            activation,
+        )
+
+        # The parent owns the shared condition encoders and target
+        # normalization helpers.  The direct-BC policy must not retain the
+        # diffusion-only trainable branches in its optimizer or state dict.
+        del self.time_encoder
+        del self.denoiser
+
+    def forward(self, input, compute_aux_loss=False, **kwargs):
+        if not hasattr(input, "__getitem__"):
+            raise TypeError("EncoderVectorMlpPolicy expects an obs_dict-like input")
+
+        cond = self._encode_condition(input, update_state_stats=compute_aux_loss)
+        pred_normalized = self.action_head(cond)
+        pred_action = self._denormalize_target(pred_normalized)
+
+        if not compute_aux_loss:
+            return pred_action
+
+        target = self._extract_target(kwargs)
+        if target is None:
+            raise ValueError(
+                f"{self.__class__.__name__} requires {self.diffusion_target_key} "
+                "when compute_aux_loss=True"
+            )
+        target = target.to(device=cond.device, dtype=cond.dtype)
+        if target.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"BC target dim mismatch: got {target.shape[-1]}, expected {self.action_dim}"
+            )
+        if target.shape[:-1] != cond.shape[:-1]:
+            raise ValueError(
+                "BC target batch shape must match encoded condition batch shape: "
+                f"got {tuple(target.shape[:-1])}, expected {tuple(cond.shape[:-1])}"
+            )
+
+        with torch.no_grad():
+            self._update_target_stats(target)
+        normalized_target = self._normalize_target(target)
+        bc_loss = F.mse_loss(pred_normalized, normalized_target)
+
+        target_flat = target.detach().float().reshape(-1, self.action_dim)
+        norm_flat = normalized_target.detach().float().reshape(-1, self.action_dim)
+        pred_flat = pred_action.detach().float().reshape(-1, self.action_dim)
+        return {
+            "action_mean": pred_action,
+            "aux_losses": {
+                "latent_bc_mse": bc_loss,
+                "bc_target/raw_abs_mean": target_flat.abs().mean(),
+                "bc_target/raw_std_mean": target_flat.std(dim=0, unbiased=False).mean(),
+                "bc_target/norm_abs_mean": norm_flat.abs().mean(),
+                "bc_target/norm_std_mean": norm_flat.std(dim=0, unbiased=False).mean(),
+                "bc_pred/raw_abs_mean": pred_flat.abs().mean(),
+            },
+            "aux_loss_coef": {"latent_bc_mse": self.bc_loss_coef},
+        }
+
+
 class EncoderVectorTransformerFlowPolicy(EncoderVectorDiffusionPolicy):
     """Old-SUGAR-style RDT trained with conditional flow matching on action chunks.
 

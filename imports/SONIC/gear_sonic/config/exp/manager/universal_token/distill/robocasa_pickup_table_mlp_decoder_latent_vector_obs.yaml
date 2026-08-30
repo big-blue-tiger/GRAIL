@@ -1,0 +1,73 @@
+# @package _global_
+#
+# Direct behavior-cloning student for the complete pickup_table motion set.
+# The condition encoders are shared with the vector diffusion experiment, but
+# the student predicts the decoder action directly with an independent MLP
+# action head.
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_diffusion_decoder_latent_vector_obs
+  - _self_
+
+exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs
+experiment_name: ${exp_base}_${exp_var}
+
+algo:
+  config:
+    # Parameterize policy noise as log(std), ensuring std = exp(log_std) > 0.
+    use_log_std: true
+    # Complementary PPO + behavior-cloning objective:
+    #   lambda_bc(k)  = max(0.1, 1 - k / 10000)
+    #   lambda_ppo(k) = 1 - lambda_bc(k)
+    # The static coefficients below are replaced while this schedule is enabled.
+    ppo_loss_coef: 0.0
+    distill_teacher_loss_coef: 0.0
+    compute_aux_loss: true
+    aux_loss_scale: 1.0
+    gamma: 0.99
+    lam: 0.95
+    num_steps_per_env: 24
+    actor_learning_rate: 3.0e-4
+    entropy_coef: 0.001
+    desired_kl: 0.01
+    init_noise_std: 0.01
+    ppo_bc_loss_schedule:
+      enabled: true
+      bc_min_coef: 0.1
+      # lambda_bc(k) = max(0.1, 1 - k / 10000)
+      end_iteration: 10000
+      # Keep LR fixed before this iteration, then enable desired-KL adaptation.
+      adaptive_after_iteration: 1000
+    # Match the transformer-flow linear DAgger curriculum: start with all
+    # Teacher environments, linearly grow the Student share to 0.5 at
+    # iteration 3000, then keep a 1:1 Student/Teacher rollout split.
+    dagger_rollout_mode: fixed
+    dagger_student_ratio: 0.5
+    dagger_student_ratio_increment: 0.00016666666666666666
+    diffusion_decoder_distill: true
+    # These keys only control the terminal table. All metrics are still sent
+    # to the configured experiment tracker regardless of this allowlist.
+    console_loss_keys:
+      - loss/weighted_ppo_loss_avg
+      - loss/policy_avg
+      - loss/value_avg
+      - loss/entropy_avg
+      - loss/aux_latent_bc_mse_avg
+      - loss/total_aux_loss_avg
+      - loss/lambda_ppo
+      - loss/lambda_bc
+    # The environment deliberately preserves the five-frame proprio history as
+    # [B, 5, 161]. The regular PPO rollout storage otherwise allocates this
+    # group from its flattened metadata (805), which cannot store that tensor.
+    rollout_storage_obs_shapes:
+      proprio_obs: [5, 161]
+    actor:
+      backbone:
+        _target_: gear_sonic.trl.modules.diffusion_policy_modules.EncoderVectorMlpPolicy
+        process_output_dim: true
+        module_config_dict:
+          # Marker only; EncoderVectorMlpPolicy does not use diffusion sampling.
+          diffusion_objective: bc_mse
+          mlp_hidden_dims: [2048, 1024, 512]
+          # Paper's DAgger imitation-loss coefficient.
+          bc_loss_coef: 10.0
