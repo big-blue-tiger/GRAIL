@@ -15,15 +15,16 @@
 # Renders into <motion_lib>/vis/ (kept separate from the release `video/` dir
 # which holds the original 2D HOI render).
 #
-# Uses a single IsaacSim session via grail/visualization/batch_render_replay.py
-# instead of spawning one process per motion.
+# Uses one IsaacSim session per render worker via
+# grail/visualization/batch_render_replay.py.
 #
-# Usage: ./visualize.sh <motion_lib_path> [max_videos] [cam_offset_x,cam_offset_y,cam_offset_z] [quat_convention]
+# Usage: ./visualize.sh <motion_lib_path> [max_videos] [cam_offset] [quat_convention] [runtime] [parallel_jobs]
 # Example:
 #   ./visualize.sh data/release/dataset/pickup_table
 #   ./visualize.sh data/release/dataset/pickup_table 0          # render all motions
 #   ./visualize.sh /abs/path/to/motion_lib 16 -3.5,0.0,1.2 xyzw
 #   QUAT_CONVENTION=wxyz ./visualize.sh data/motion_lib/<name> 16
+#   ./visualize.sh data/motion_lib/pickup_table 16 1.5,-1.5,1.0 wxyz server 3
 #
 # Arguments:
 #   motion_lib_path  Full path (absolute or repo-relative) to the motion library dir.
@@ -36,6 +37,12 @@
 #                    Pass 'wxyz' for retargeting output (data/motion_lib/<name>/),
 #                    or 'auto' for magnitude-based detection (may mis-classify
 #                    motions that don't start near-upright).
+#   runtime          Python environment: auto|local|server (default=auto).
+#                    'server' uses Isaac Lab's bundled Python at
+#                    /workspace/isaaclab/_isaac_sim/python.sh. 'auto' selects
+#                    it when present, otherwise uses python from PATH.
+#   parallel_jobs    Concurrent IsaacSim render workers (default=1). Workers
+#                    are distributed round-robin over visible GPUs.
 #
 # Hand DOFs: the renderer drives the gripper from the per-motion (T, 14)
 # hand_dof_pos array when present in the robot pkl (data-export pipeline
@@ -49,11 +56,44 @@ MOTION_LIB_ARG="${1:?Error: Please provide motion library path as argument}"
 MAX_VIDEOS="${2:-16}"
 CAM_OFFSET="${3:-1.5,-1.5,1.0}"
 QUAT_CONVENTION="${4:-${QUAT_CONVENTION:-xyzw}}"
+RUNTIME="${5:-auto}"
+PARALLEL_JOBS="${6:-1}"
 
 case "${QUAT_CONVENTION}" in
     auto|wxyz|xyzw) ;;
     *) echo "Error: quat_convention must be auto|wxyz|xyzw (got '${QUAT_CONVENTION}')"; exit 1;;
 esac
+
+case "${RUNTIME}" in
+    auto|local|server) ;;
+    *) echo "Error: runtime must be auto|local|server (got '${RUNTIME}')"; exit 1;;
+esac
+
+if ! [[ "${MAX_VIDEOS}" =~ ^[0-9]+$ ]]; then
+    echo "Error: max_videos must be a non-negative integer (got '${MAX_VIDEOS}')"
+    exit 1
+fi
+if ! [[ "${PARALLEL_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: parallel_jobs must be a positive integer (got '${PARALLEL_JOBS}')"
+    exit 1
+fi
+
+SERVER_PYTHON="/workspace/isaaclab/_isaac_sim/python.sh"
+if [ "${RUNTIME}" = server ] || { [ "${RUNTIME}" = auto ] && [ -x "${SERVER_PYTHON}" ]; }; then
+    if [ ! -x "${SERVER_PYTHON}" ]; then
+        echo "Error: server Python not found or not executable: ${SERVER_PYTHON}"
+        exit 1
+    fi
+    PYTHON_CMD=("${SERVER_PYTHON}")
+    RESOLVED_RUNTIME=server
+else
+    if ! command -v python >/dev/null 2>&1; then
+        echo "Error: python not found in PATH; use runtime 'server' in the Isaac Lab container"
+        exit 1
+    fi
+    PYTHON_CMD=(python)
+    RESOLVED_RUNTIME=local
+fi
 
 MOTION_LIB="$(realpath "${MOTION_LIB_ARG}")"
 if [ ! -d "${MOTION_LIB}" ]; then
@@ -79,16 +119,14 @@ KEY="$(basename "${MOTION_LIB}")"
 VIDEO_DIR="${MOTION_LIB}/vis"
 SHARD_DIR="/tmp/vis_shard_${KEY}"
 
-# Activate sonic conda environment (needed for IsaacSim/IsaacLab)
-eval "$(conda shell.bash hook)"
-conda activate sonic
-
 echo "Generating visualization videos"
 echo "  Motion library:   ${MOTION_LIB}"
 echo "  Video output:     ${VIDEO_DIR}"
 echo "  Max videos:       ${MAX_VIDEOS} (0=all, skips grid/combined)"
 echo "  Camera offset:    ${CAM_OFFSET}"
 echo "  Quat convention:  ${QUAT_CONVENTION}"
+echo "  Runtime:          ${RESOLVED_RUNTIME} (${PYTHON_CMD[*]})"
+echo "  Parallel jobs:    ${PARALLEL_JOBS}"
 echo ""
 
 cd "${REPO_ROOT}"
@@ -97,7 +135,7 @@ cd "${REPO_ROOT}"
 TOTAL_STEPS=$( [ "${SKIP_POSTPROCESS}" = true ] && echo 2 || echo 3 )
 echo "[Step 1/${TOTAL_STEPS}] Preparing trajectory data..."
 
-python -m grail.visualization.prepare_vis_shard \
+"${PYTHON_CMD[@]}" -m grail.visualization.prepare_vis_shard \
     --data_dir "${MOTION_LIB}" \
     --shard_dir "${SHARD_DIR}" \
     --max_motions "${MAX_VIDEOS}" \
@@ -105,23 +143,60 @@ python -m grail.visualization.prepare_vis_shard \
 
 echo ""
 
-# --- Step 2: Render with batch_render_replay (single IsaacSim session) ---
-echo "[Step 2/${TOTAL_STEPS}] Rendering videos (single IsaacSim session)..."
+# --- Step 2: Render with one batch_render_replay process per worker ---
+echo "[Step 2/${TOTAL_STEPS}] Rendering videos (${PARALLEL_JOBS} IsaacSim worker(s))..."
 
 IFS=',' read -r CAM_X CAM_Y CAM_Z <<< "${CAM_OFFSET}"
 
 mkdir -p "${VIDEO_DIR}"
 
-python -u -m grail.visualization.batch_render_replay \
-    --shard_dir "${SHARD_DIR}" \
-    --traj_dir "${SHARD_DIR}/trajectories" \
-    --object_usd_dir "${MOTION_LIB}/object_usd" \
-    --output_dir "${VIDEO_DIR}" \
-    --camera_offset ${CAM_X} ${CAM_Y} ${CAM_Z} \
-    --camera_target 0.0 0.0 0.8 \
-    --skip_existing \
-    --start_frame_skip 0 \
-    --headless
+RENDER_GPUS=()
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -r -a RENDER_GPUS <<< "${CUDA_VISIBLE_DEVICES}"
+elif command -v nvidia-smi >/dev/null 2>&1; then
+    while IFS= read -r gpu_index; do
+        RENDER_GPUS+=("${gpu_index}")
+    done < <(nvidia-smi --query-gpu=index --format=csv,noheader,nounits)
+fi
+
+render_pids=()
+for ((worker_index = 0; worker_index < PARALLEL_JOBS; worker_index++)); do
+    render_cmd=(
+        "${PYTHON_CMD[@]}" -u -m grail.visualization.batch_render_replay
+        --shard_dir "${SHARD_DIR}"
+        --traj_dir "${SHARD_DIR}/trajectories"
+        --object_usd_dir "${MOTION_LIB}/object_usd"
+        --output_dir "${VIDEO_DIR}"
+        --camera_offset "${CAM_X}" "${CAM_Y}" "${CAM_Z}"
+        --camera_target 0.0 0.0 0.8
+        --skip_existing
+        --start_frame_skip 0
+        --num_workers "${PARALLEL_JOBS}"
+        --worker_index "${worker_index}"
+        --headless
+    )
+
+    if [ "${#RENDER_GPUS[@]}" -gt 0 ]; then
+        gpu="${RENDER_GPUS[$((worker_index % ${#RENDER_GPUS[@]}))]}"
+        echo "  Worker $((worker_index + 1))/${PARALLEL_JOBS}: GPU ${gpu}"
+        CUDA_VISIBLE_DEVICES="${gpu}" "${render_cmd[@]}" &
+    else
+        echo "  Worker $((worker_index + 1))/${PARALLEL_JOBS}: no GPU binding"
+        "${render_cmd[@]}" &
+    fi
+    render_pids+=("$!")
+done
+
+render_failed=0
+for pid in "${render_pids[@]}"; do
+    if ! wait "${pid}"; then
+        render_failed=1
+    fi
+done
+if [ "${render_failed}" -ne 0 ]; then
+    echo "Error: one or more render workers failed"
+    exit 1
+fi
 
 echo ""
 

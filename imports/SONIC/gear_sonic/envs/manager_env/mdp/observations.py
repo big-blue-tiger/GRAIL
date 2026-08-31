@@ -8,6 +8,7 @@ import torch
 from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.envs.manager_env.mdp import commands, utils
 from gear_sonic.trl.utils import torch_transform
+from gear_sonic.utils.action_history import zero_actions_at_episode_start
 from isaaclab.utils.math import (
     matrix_from_quat,
     quat_apply,
@@ -2529,11 +2530,21 @@ def last_meta_action(env: ManagerBasedEnv) -> torch.Tensor:
     on reset.
     """
     if hasattr(env, "_last_meta_action"):
-        return env._last_meta_action  # noqa: SLF001
+        action = env._last_meta_action  # noqa: SLF001
     else:
-        # Fallback: return zeros if buffer not initialized (shouldn't happen)
+        # Fallback: return zeros if buffer is not initialized yet.
         meta_action_dim = 66  # Default: 64 latent + 2 primitives
-        return torch.zeros(env.num_envs, meta_action_dim, dtype=torch.float32, device=env.device)
+        action = torch.zeros(
+            env.num_envs, meta_action_dim, dtype=torch.float32, device=env.device
+        )
+
+    # ManagerBasedRLEnv resets its observation-history buffers and
+    # episode_length_buf before computing the first observation of a new
+    # episode. ManagerEnvWrapper clears this wrapper-owned action buffer only
+    # after env.step() returns, so mask it here to prevent the terminal action
+    # from being replicated across the freshly reset history.
+    episode_length_buf = getattr(env, "episode_length_buf", None)
+    return zero_actions_at_episode_start(action, episode_length_buf)
 
 
 def ref_root_pos_future_b(env, command_name: str, flatten: bool = False) -> torch.Tensor:

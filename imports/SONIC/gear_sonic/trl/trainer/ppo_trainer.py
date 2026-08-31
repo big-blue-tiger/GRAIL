@@ -262,7 +262,7 @@ class PrinterHVCallback(TrainerCallback):  # noqa: F405
             if "Policy/mean_noise_std" in logs:
                 log_string += (
                     f"{'Mean action noise std:':>{pad}} "
-                    f"{logs['Policy/mean_noise_std']:.2f}\n"
+                    f"{logs['Policy/mean_noise_std']:.6f}\n"
                 )
 
             for k, v in logs.items():
@@ -1082,7 +1082,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.state.eval_step = 0
         self.state.eval_render_step = 0
 
-    def policy_step(self, policy_model, obs_dict, cur_dones=None):
+    def policy_step(self, policy_model, obs_dict, cur_dones=None, use_action_mean=None):
         """Run the policy model for one rollout step, returning actions and log-probs.
 
         Constructs an episode attention mask from the done history in storage
@@ -1093,6 +1093,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             obs_dict: Current observations, each value ``(num_envs, obs_dim)``.
             cur_dones: Current done flags ``(num_envs,)``.  If None, the mask
                 is built from the full storage done history.
+            use_action_mean: Whether to replace the sampled action with the
+                policy mean. If ``None``, use ``distill_rollout_with_action_mean``
+                from the experiment config. Teacher callers pass ``True`` so
+                Student PPO rollouts can remain stochastic without adding
+                exploration noise to Teacher-controlled environments.
 
         Returns:
             Dict containing ``"actions"`` ``(num_envs, act_dim)``,
@@ -1115,11 +1120,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         policy_state_dict = policy_model.rollout(
             obs_dict=actor_obs_dict, episode_attnmask=episode_attnmask, cur_dones=cur_dones
         )
-        distill_with_mean = self.config.get(
-            "distill_rollout_with_action_mean",
-            self.config.get("use_dagger", False) and self.distill_teacher_loss_coef > 0.0,
-        )
-        if distill_with_mean:
+        if use_action_mean is None:
+            use_action_mean = self.config.get(
+                "distill_rollout_with_action_mean",
+                self.config.get("use_dagger", False) and self.distill_teacher_loss_coef > 0.0,
+            )
+        if use_action_mean:
             policy_state_dict["actions"] = policy_state_dict["action_mean"].detach()
 
         actions = policy_state_dict["actions"]
@@ -1461,7 +1467,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                         if key != "reference_hand_actions"
                     }
                 )
-                teacher_state = self.policy_step(teacher, teacher_obs, cur_dones=dones)
+                teacher_state = self.policy_step(
+                    teacher, teacher_obs, cur_dones=dones, use_action_mean=True
+                )
                 executed = student_action.clone()
                 executed[is_teacher_env] = teacher_state["actions"].detach()[is_teacher_env]
                 env_step_state = {
@@ -1622,7 +1630,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                     # their recurrent/history state remains valid throughout
                     # the rollout.
                     teacher_state_dict = self.policy_step(
-                        teacher_model, teacher_obs_dict, cur_dones=dones
+                        teacher_model,
+                        teacher_obs_dict,
+                        cur_dones=dones,
+                        use_action_mean=True,
                     )
                     env_step_state = self._build_mixed_rollout_actions(
                         policy_state_dict, teacher_state_dict, is_teacher_env
@@ -3178,8 +3189,18 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 for param_name, param_value in self.scheduled_params_dict.items():
                     log_dict[f"scheduled_params/{param_name}"] = param_value
 
-                if hasattr(self.policy_model, "std"):
-                    metrics["Policy/mean_noise_std"] = self.policy_model.std.mean().item()
+                # Actor supports both legacy direct-std and numerically stable
+                # log-std parameterizations. Reading only ``.std`` makes every
+                # log-std experiment report a misleading hard-coded zero.
+                if hasattr(self.policy_model, "get_std"):
+                    with torch.no_grad():
+                        current_std = self.policy_model.get_std
+                        metrics["Policy/mean_noise_std"] = current_std.detach().mean().item()
+                elif hasattr(self.policy_model, "std"):
+                    with torch.no_grad():
+                        metrics["Policy/mean_noise_std"] = (
+                            self.policy_model.std.detach().mean().item()
+                        )
                 else:
                     metrics["Policy/mean_noise_std"] = 0.0
                 self.append_to_log_dict(log_dict)

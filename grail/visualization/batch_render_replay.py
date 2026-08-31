@@ -743,8 +743,25 @@ def main():
     parser.add_argument(
         "--dry_run", action="store_true", help="Print render plan without executing"
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="Split the render plan across this many workers (default: 1)",
+    )
+    parser.add_argument(
+        "--worker_index",
+        type=int,
+        default=0,
+        help="Zero-based worker index used with --num_workers (default: 0)",
+    )
     parser.add_argument("--headless", action="store_true", default=True)
     args = parser.parse_args()
+
+    if args.num_workers < 1:
+        parser.error("--num_workers must be at least 1")
+    if not 0 <= args.worker_index < args.num_workers:
+        parser.error("--worker_index must be in [0, --num_workers)")
 
     plan, stats, n_total, n_success = build_render_plan(
         args.shard_dir,
@@ -755,9 +772,18 @@ def main():
     )
     w, h = map(int, args.resolution.split("x"))
 
+    # Keep worker assignment deterministic and disjoint. Round-robin slicing
+    # distributes long/short trajectories more evenly than contiguous chunks.
+    plan.sort(key=lambda x: (x[3] or "", x[1]))
+    full_plan_size = len(plan)
+    plan = plan[args.worker_index :: args.num_workers]
+
     print(f"Shard: {args.shard_dir}")
     print(f"Filter keys: {n_total} total, {n_success} successful")
-    print(f"Render plan: {len(plan)} trajectories")
+    print(
+        f"Render plan: worker {args.worker_index + 1}/{args.num_workers} has "
+        f"{len(plan)}/{full_plan_size} trajectories"
+    )
     for k, v in stats.items():
         if v:
             print(f"  {k}: {v}")
@@ -772,9 +798,6 @@ def main():
     if not plan:
         print("Nothing to render.")
         return
-
-    # Sort by object USD path to minimize USD swapping
-    plan.sort(key=lambda x: (x[3] or "", x[1]))
 
     render_all(
         plan,

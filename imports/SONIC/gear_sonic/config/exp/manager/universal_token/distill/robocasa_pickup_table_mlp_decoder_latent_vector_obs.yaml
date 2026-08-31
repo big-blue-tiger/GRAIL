@@ -11,7 +11,9 @@ defaults:
 
 exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs
 experiment_name: ${exp_base}_${exp_var}
-
+manager_env:
+  config:
+    gpu_collision_stack_size_exp: 30
 algo:
   config:
     # Parameterize policy noise as log(std), ensuring std = exp(log_std) > 0.
@@ -31,19 +33,25 @@ algo:
     entropy_coef: 0.001
     desired_kl: 0.01
     init_noise_std: 0.01
+    # PPO must execute actions sampled from the Student's Gaussian policy.
+    # The inherited diffusion-distillation config replaces sampled actions with
+    # the mean, which makes the rollout distribution inconsistent with the
+    # Gaussian log-probabilities used by PPO. Teacher rollouts remain
+    # deterministic via an explicit override in the trainer.
+    distill_rollout_with_action_mean: false
     ppo_bc_loss_schedule:
       enabled: true
       bc_min_coef: 0.1
       # lambda_bc(k) = max(0.1, 1 - k / 10000)
-      end_iteration: 10000
+      end_iteration: 5000
       # Keep LR fixed before this iteration, then enable desired-KL adaptation.
       adaptive_after_iteration: 1000
     # Match the transformer-flow linear DAgger curriculum: start with all
     # Teacher environments, linearly grow the Student share to 0.5 at
     # iteration 3000, then keep a 1:1 Student/Teacher rollout split.
     dagger_rollout_mode: fixed
-    dagger_student_ratio: 0.5
-    dagger_student_ratio_increment: 0.00016666666666666666
+    dagger_student_ratio: 1
+    dagger_student_ratio_increment: 0.0
     diffusion_decoder_distill: true
     # These keys only control the terminal table. All metrics are still sent
     # to the configured experiment tracker regardless of this allowlist.

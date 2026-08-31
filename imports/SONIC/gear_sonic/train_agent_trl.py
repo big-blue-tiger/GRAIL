@@ -458,10 +458,18 @@ def main(config: OmegaConf):
         if getattr(config.algo.config, "use_dagger", False):
             # Get teacher input key from config or default to "teacher"
             teacher_input_key = config.algo.config.get("teacher_input_key", "teacher")
+            # ``use_log_std`` configures the trainable student policy.  Legacy
+            # teacher checkpoints store a direct ``std`` parameter and the
+            # frozen reference actor must retain that parameterization.  Use a
+            # non-mutating config overlay so the student remains on log(std).
+            teacher_algo_config = OmegaConf.merge(
+                config.algo.config,
+                {"use_log_std": False},
+            )
             ref_model = custom_instantiate(
                 config.algo.config.teacher_actor,
                 env_config=env.config,
-                algo_config=config.algo.config,
+                algo_config=teacher_algo_config,
                 module_dim_dict=module_dim_dict,
                 _resolve=False,
                 input_key=teacher_input_key,

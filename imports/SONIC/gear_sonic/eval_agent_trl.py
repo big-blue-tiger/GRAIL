@@ -157,6 +157,116 @@ def _evaluation_reset_reasons(env, env_id):
     return reasons or ["unknown"]
 
 
+def _evaluation_timeout_term_names(env):
+    """Return termination terms configured as normal episode timeouts."""
+    termination_manager = getattr(_manager_env(env), "termination_manager", None)
+    if termination_manager is None:
+        return {"time_out"}
+
+    active_terms = list(getattr(termination_manager, "active_terms", []))
+    term_cfgs = getattr(termination_manager, "_term_cfgs", None)
+    timeout_terms = set()
+    if isinstance(term_cfgs, dict):
+        cfg_items = term_cfgs.items()
+    elif isinstance(term_cfgs, (list, tuple)):
+        cfg_items = zip(active_terms, term_cfgs)
+    else:
+        cfg_items = ()
+    for term_name, term_cfg in cfg_items:
+        is_timeout = (
+            term_cfg.get("time_out", False)
+            if isinstance(term_cfg, dict)
+            else getattr(term_cfg, "time_out", False)
+        )
+        if bool(is_timeout):
+            timeout_terms.add(str(term_name))
+
+    # ``time_out`` is the canonical SONIC term. Keep it as a compatibility
+    # fallback for IsaacLab versions that do not expose ``_term_cfgs``.
+    timeout_terms.add("time_out")
+    for term_name in active_terms:
+        normalized = str(term_name).lower().replace("_", "")
+        if normalized in {"timeout", "motiontimeout"}:
+            timeout_terms.add(str(term_name))
+    return timeout_terms
+
+
+def _evaluation_info_timed_out(infos, env_id):
+    """Read the per-environment truncated flag returned by the env wrapper."""
+    if not isinstance(infos, dict):
+        return False
+    time_outs = infos.get("time_outs", None)
+    if time_outs is None:
+        return False
+    try:
+        value = time_outs[env_id]
+        return bool(value.item() if hasattr(value, "item") else value)
+    except (IndexError, KeyError, TypeError):
+        return False
+
+
+def _evaluation_run_once_result(
+    *, env_id, motion_key, episode_steps, step_dt, reasons, timeout_terms, info_timed_out
+):
+    """Build one teacher-cleaning result from the first completed episode."""
+    reasons = [str(reason) for reason in reasons] or ["unknown"]
+    non_timeout_reasons = [
+        reason
+        for reason in reasons
+        if reason not in timeout_terms
+        and not (reason == "unknown" and bool(info_timed_out))
+    ]
+    timed_out = bool(info_timed_out or any(reason in timeout_terms for reason in reasons))
+    accepted = timed_out and not non_timeout_reasons
+    return {
+        "env_id": int(env_id),
+        "motion_key": str(motion_key),
+        "episode_steps": int(episode_steps),
+        "elapsed_seconds": float(episode_steps) * float(step_dt),
+        "termination_reasons": reasons,
+        "timed_out": timed_out,
+        "status": "accepted" if accepted else "early_terminated",
+    }
+
+
+def _atomic_write_json(path, payload):
+    """Atomically replace a JSON file so batch cleaners never read a partial report."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    with open(temporary, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, ensure_ascii=False)
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temporary, destination)
+
+
+def _write_run_once_report(path, checkpoint, results, num_envs):
+    """Write the current run-once result set and return whether it is complete."""
+    completed_results = [result for result in results if result is not None]
+    accepted = sum(result["status"] == "accepted" for result in completed_results)
+    rejected = sum(
+        result["status"] == "early_terminated" for result in completed_results
+    )
+    complete = len(completed_results) == int(num_envs)
+    payload = {
+        "format_version": 1,
+        "checkpoint": str(Path(checkpoint).resolve()),
+        "complete": complete,
+        "expected_motions": int(num_envs),
+        "results": completed_results,
+        "summary": {
+            "completed": len(completed_results),
+            "accepted": accepted,
+            "early_terminated": rejected,
+            "missing": int(num_envs) - len(completed_results),
+        },
+    }
+    _atomic_write_json(path, payload)
+    return complete
+
+
 def _evaluation_step_dt(env):
     """Return one policy/environment step duration in seconds."""
     step_dt = getattr(_manager_env(env), "step_dt", None)
@@ -857,6 +967,9 @@ def main(override_config: omegaconf.OmegaConf):
 
     camera_rgb_writer = None
     camera_output_writers = {}
+    run_once = bool(config.get("run_once", False))
+    run_once_report_path = config.get("run_once_report_path", None)
+    run_once_results = [None] * int(config.num_envs)
     if config.get("run_eval_loop", True):
         env.set_is_evaluating(True)
         obs_dict = env.reset_all()
@@ -1091,13 +1204,13 @@ def main(override_config: omegaconf.OmegaConf):
                 writer.append_data(frame_np)
             camera_output_frames += 1
 
-        run_once = config.get("run_once", False)
         envs_completed = torch.zeros(config.num_envs, dtype=torch.bool, device=device)
         episode_steps = torch.zeros(
             config.num_envs, dtype=torch.long, device=device
         )
         episode_motion_keys = _evaluation_motion_keys(env, config.num_envs)
         eval_step_dt = _evaluation_step_dt(env)
+        timeout_term_names = _evaluation_timeout_term_names(env)
         log_reset_reasons = bool(config.get("log_reset_reasons", True))
         chunk_executor = None
         previous_motion_metadata = None
@@ -1174,11 +1287,28 @@ def main(override_config: omegaconf.OmegaConf):
                 if run_once:
                     done_mask = dones.to(device=device, dtype=torch.bool).reshape(-1)
                     newly_completed = done_mask & ~envs_completed
-                    if log_reset_reasons:
-                        for env_id in newly_completed.nonzero(
-                            as_tuple=False
-                        ).squeeze(-1).tolist():
-                            reasons = _evaluation_reset_reasons(env, env_id)
+                    for env_id in newly_completed.nonzero(
+                        as_tuple=False
+                    ).squeeze(-1).tolist():
+                        reasons = _evaluation_reset_reasons(env, env_id)
+                        result = _evaluation_run_once_result(
+                            env_id=env_id,
+                            motion_key=episode_motion_keys[env_id],
+                            episode_steps=episode_steps[env_id].item(),
+                            step_dt=eval_step_dt,
+                            reasons=reasons,
+                            timeout_terms=timeout_term_names,
+                            info_timed_out=_evaluation_info_timed_out(infos, env_id),
+                        )
+                        run_once_results[env_id] = result
+                        if run_once_report_path is not None:
+                            _write_run_once_report(
+                                run_once_report_path,
+                                config.checkpoint,
+                                run_once_results,
+                                config.num_envs,
+                            )
+                        if log_reset_reasons:
                             displayed_reasons = [
                                 (
                                     f"{reason}(参考/真实物体位置偏差 > "
@@ -1188,12 +1318,12 @@ def main(override_config: omegaconf.OmegaConf):
                                 )
                                 for reason in reasons
                             ]
-                            reset_time = float(episode_steps[env_id].item()) * eval_step_dt
                             logger.info(
                                 f"第 {env_id + 1} 条数据 "
                                 f"({episode_motion_keys[env_id]}) 因为 "
                                 f"{', '.join(displayed_reasons)} "
-                                f"在第 {reset_time:.2f} 秒 reset"
+                                f"在第 {result['elapsed_seconds']:.2f} 秒 reset；"
+                                f"清理状态={result['status']}"
                             )
                     envs_completed |= done_mask
                     if envs_completed.all():
@@ -1212,6 +1342,19 @@ def main(override_config: omegaconf.OmegaConf):
         camera_rgb_writer.close()
     for writer in camera_output_writers.values():
         writer.close()
+
+    if run_once and run_once_report_path is not None:
+        report_complete = _write_run_once_report(
+            run_once_report_path,
+            config.checkpoint,
+            run_once_results,
+            config.num_envs,
+        )
+        if not report_complete:
+            logger.error(
+                "Run-once report is incomplete: "
+                f"{sum(result is not None for result in run_once_results)}/{config.num_envs}"
+            )
 
     if simulator_type == "IsaacSim":
         os._exit(0)

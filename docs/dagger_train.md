@@ -1,3 +1,22 @@
+### 数据清晰
+*检测穿模*
+```bash
+python -u -m grail.datatool.batch_render_replay_clip \
+  --data_dir data/hf_dataset/data_update/data/pickup_table \
+  --output_dir data/hf_dataset/data_update/data/pickup_table_cleaned \
+  --quat_convention xyzw \
+  --no_record_video
+```
+
+*检测是否成功*
+```bash
+python -u -m grail.datatool.batch_filter_teacher_policy \
+  --data_dir data/hf_dataset/data_update/data/pickup_table_cleaned \
+  --output_dir data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded \
+  --teacher_checkpoint imports/SONIC/models/pnp_table/last.pt \
+  --num_envs 512 \
+  --no_record_video
+```
 
 ### 在本地训练
 
@@ -6,7 +25,7 @@ cd /home/tide/robot/GRAIL/imports/SONIC
 
 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
-  headless=False \
+  headless=True \
   num_envs=8
 
 
@@ -21,17 +40,6 @@ python gear_sonic/train_agent_trl.py \
 ```bash
 cd /home/GRAIL/imports/SONIC
 
-CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_diffusion_decoder_latent_vector_obs \
-  headless=True \
-  num_envs=1024 \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
-  manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt 
-
 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
   headless=True \
@@ -42,20 +50,20 @@ python gear_sonic/train_agent_trl.py \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
   manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.num_learning_iterations=7500 \
+  algo.config.num_learning_iterations=10000 \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt 
 
 CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
   headless=True \
-  num_envs=1024 \
+  num_envs=4096 \
   experiment_name=mlp_bc1_ppo1_studentonly \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
   manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.num_learning_iterations=7500 \
+  algo.config.num_learning_iterations=10000 \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   algo.config.dagger_student_ratio=1.0
 
@@ -155,88 +163,87 @@ rsync -aP \
   rsync -aP \
   --no-owner --no-group \
   --exclude='data/' \
+  --exclude='imports/blender/' \
+  --exclude='outputs/' \
   -e "ssh -p 9989 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
   /home/tide/robot/GRAIL/ \
   cuixinru@202.120.37.249:/home/cuixinru/data0/GRAIL/
 ```
 
- proprio_obs [B,5,161]
-          │
-        Flatten
-          │
-       [B,805]
-          │
-   Linear 805→1024
-          │
-         SiLU
-          │
-   Linear 1024→512
-          │
-          └──────────────────────────────► ROBOT TOKEN ───────┐
-                                                              │
- privileged_obs [B,48]                                        │
-          │                                                   │
-    Linear 48→512                                             │
-          │                                                   │
-         SiLU                                                 │
-          │                                                   │
-    Linear 512→512                                            │
-          │                                                   │
-          └─────────────────────────────► OBJECT TOKEN ────────┤
-                                                              │
- flow timestep t                                              │
-          │                                                   │
-  Sin/Cos Embedding 256D                                      │
-          │                                                   │
-    Linear 256→512                                            │
-          │                                                   │
-         SiLU                                                 │
-          │                                                   │
-    Linear 512→512                                            │
-          │                                                   │
-          └──────────────────────────────► TIME TOKEN ─────────┤
-                                                              │
-                                                              ▼
-                                                    [OBJECT, ROBOT, TIME]
-                                                         [B,3,512]
-                                                              │
-                                                              │
- noisy action chunk [B,40,66]                                 │
-          │                                                   │
-    Linear 66→512                                             │
-          │                                                   │
-    + Action Position                                         │
-          │                                                   │
-          ▼                                                   │
-      [B,40,512]                                              │
-          │                                                   │
-          ├───────────────────────────────────────────────────┘
-          │
-          ▼
- ╔══════════════════════════════════════════════════════════════╗
- ║                     RDT BLOCK × 14                         ║
- ║                                                              ║
- ║  RMSNorm                                                     ║
- ║     ↓                                                        ║
- ║  8-head Self-Attention          40 action tokens ↔ 40        ║
- ║     ↓ + residual                                             ║
- ║  RMSNorm                                                     ║
- ║     ↓                                                        ║
- ║  8-head Cross-Attention         40 action tokens → 3 cond    ║
- ║     ↓ + residual                                             ║
- ║  RMSNorm                                                     ║
- ║     ↓                                                        ║
- ║  FFN 512 → 512 → 512                                        ║
- ║     ↓ + residual                                             ║
- ╚══════════════════════════════╤═══════════════════════════════╝
-                                │
-                                ▼
-                          [B,40,512]
-                                │
-                             RMSNorm
-                                │
-                         Linear 512→66
-                                │
-                                ▼
-                    predicted velocity [B,40,66]
+B = rollout 时 4096；训练时 B 为 minibatch 大小
+┌────────────────────────────────── STUDENT ACTOR ──────────────────────────────────┐
+│                                                                                    │
+│  proprio_obs[t-4:t] : [B,5,161]                                                    │
+│  每帧 161D                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐  │
+│  │ joint_pos 43 │ joint_vel 43 │ gravity 3 │ ωbase 3 │ vbase 3 │ prev_action 66 │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                 │ Flatten history                                                   │
+│                 ▼                                                                   │
+│              [B,805]                                                                │
+│                 │ EMA Standardize: (x-μp)/√(σp²+1e-4²), clip[-5,5], momentum=.05    │
+│                 ▼                                                                   │
+│      Linear(805→1024) + SiLU                  参数: 825,344                          │
+│                 │                                                                   │
+│      Linear(1024→512), no activation          参数: 524,800                          │
+│                 │                                                                   │
+│                 └──────────────────────► proprio_feature [B,512] ───────────┐        │
+│                                                                            │        │
+│  privileged_obs[t] : [B,48]                                                │        │
+│  ┌───────────────────────────────────────────────────────────────────────┐ │        │
+│  │ object BPS 10 │ table corners 12 │ object pose 3+6 │ hand↔object 9   │ │        │
+│  │ contact-force magnitudes 8                                           │ │        │
+│  └───────────────────────────────────────────────────────────────────────┘ │        │
+│                 │ EMA Standardize, clip[-5,5], momentum=.05                │        │
+│                 ▼                                                          │        │
+│       Linear(48→512) + SiLU                   参数: 25,088                  │        │
+│                 │                                                          │        │
+│       Linear(512→512), no activation          参数: 262,656                 │        │
+│                 │                                                          │        │
+│                 └────────────────────► privileged_feature [B,512] ─────────┤        │
+│                                                                            ▼        │
+│                                                        Concat [512‖512] = [B,1024]   │
+│                                                                            │        │
+│                                      ┌─────────────────────────────────────┘        │
+│                                      ▼                                              │
+│                            Linear(1024→2048) + SiLU       参数: 2,099,200            │
+│                                      │                                              │
+│                            Linear(2048→1024) + SiLU       参数: 2,098,176            │
+│                                      │                                              │
+│                            Linear(1024→512)  + SiLU       参数:   524,800            │
+│                                      │                                              │
+│                            Linear(512→66), no activation  参数:    33,858            │
+│                                      │                                              │
+│                                      ▼                                              │
+│                         normalized prediction â_norm [B,66]                          │
+│                                      │                                              │
+│             target EMA de-normalization: μ = â_norm·√var_action + mean_action       │
+│                                      │                                              │
+│                    ┌─────────────────┴──────────────────┐                           │
+│                    │                                    │                           │
+│                    ▼                                    ▼                           │
+│          μlatent [B,64]                         μhand [B,2]                          │
+│      full pre-quantization latent          left/right primitive mean                │
+│                    └─────────────────┬──────────────────┘                           │
+│                                      │                                              │
+│           trainable state-independent log_std[66], init log(0.01)                   │
+│                                      │ exp                                           │
+│                                      ▼                                              │
+│                  πstudent(a|s)=Normal(μ(s), diag(σ²)),  σ∈R66                       │
+│                                      │                                              │
+│                  rollout: sample a [B,66]   evaluation: usually μ                   │
+│                                                                                    │
+│  ───────────────────────────── TRAINING-ONLY PATH ───────────────────────────────  │
+│                                                                                    │
+│  external label a* [B,66] ──► action EMA standardize ──► a*norm                    │
+│                                                          │                         │
+│  â_norm ─────────────────────────────────────────────────┼─► MSE(â_norm,a*norm)     │
+│                                                          │       × bc_loss_coef=10  │
+│                                                          └───────× λBC(k)           │
+│                                                                                    │
+│  sampled action/logπ/advantage ─────────────────────────────────► λPPO(k)·L_PPO     │
+└────────────────────────────────────────────────────────────────────────────────────┘
 
+策略边界之外的执行语义：
+  action[:64] ─► ATM/VQ quantize ─► frozen decoder ─► 29-DOF body action sequence
+  action[64:] ─► threshold/primitive map           ─► left/right finger targets

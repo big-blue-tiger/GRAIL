@@ -2,8 +2,9 @@
 
 Render kinematic-replay MP4s of any GRAIL motion-library directory — works
 on the retargeting output, the data-export process, and the public-release
-layout. Single IsaacSim session per batch, so an N-motion render is much
-faster than spawning a full training process per clip.
+layout. Each worker reuses one IsaacSim session for its share of the batch,
+so an N-motion render is much faster than spawning a full training process
+per clip and can optionally use multiple GPUs in parallel.
 
 The visualization subpackage lives at
 {src}`grail/visualization/`.
@@ -16,8 +17,8 @@ Two CLI wrappers cover the common cases:
 
 Underneath, both call the same two Python modules:
 `grail.visualization.prepare_vis_shard` (motion-lib → trajectory shard) and
-`grail.visualization.batch_render_replay` (single IsaacSim session, one MP4
-per motion).
+`grail.visualization.batch_render_replay` (one IsaacSim session per worker,
+one MP4 per motion).
 
 ## Input layout
 
@@ -64,7 +65,12 @@ export DISPLAY=:1
 
 # Retargeting output — root_rot is wxyz, must override
 QUAT_CONVENTION=wxyz bash grail/visualization/scripts/visualize.sh \
-    data/motion_lib/pickup_table
+    data/hf_dataset/data_update/data/pickup_table
+
+# Isaac Lab server container, three parallel render workers
+bash grail/visualization/scripts/visualize.sh \
+    data/hf_dataset/data_update/data/pickup_table \
+    32 1.5,-1.5,1.0 wxyz server 3
 
 # Data-export dir — defaults match (xyzw)
 bash grail/visualization/scripts/visualize.sh \
@@ -78,7 +84,7 @@ bash grail/visualization/scripts/visualize.sh \
 Positional arguments (all but the first are optional):
 
 ```
-visualize.sh <motion_lib_path> [max_videos] [cam_offset_x,y,z] [quat_convention]
+visualize.sh <motion_lib_path> [max_videos] [cam_offset_x,y,z] [quat_convention] [runtime] [parallel_jobs]
 ```
 
 | Arg | Default | Notes |
@@ -87,6 +93,8 @@ visualize.sh <motion_lib_path> [max_videos] [cam_offset_x,y,z] [quat_convention]
 | `max_videos` | `16` | Cap on number of motions rendered. Pass `0` to render all motions; `0` also skips the post-processing concat / grid. |
 | `cam_offset` | `1.5,-1.5,1.0` | Camera position relative to the motion centroid. Comma-separated, no spaces. |
 | `quat_convention` | `xyzw` | One of `auto`, `wxyz`, `xyzw`. See [Quaternion convention](#quaternion-convention). |
+| `runtime` | `auto` | `auto`, `local`, or `server`. Server mode uses `/workspace/isaaclab/_isaac_sim/python.sh`; auto mode selects it when present. |
+| `parallel_jobs` | `1` | Number of concurrent render workers. Workers are assigned round-robin to the GPUs in `CUDA_VISIBLE_DEVICES`, or to all detected GPUs. |
 
 Env-var fallbacks: `QUAT_CONVENTION` (default `xyzw`).
 
@@ -148,7 +156,8 @@ hand DOFs from hand_dof_pos: 16 / 16
 ```
 1. prepare_vis_shard.py   motion_lib/{robot,objects,meta} → /tmp/vis_shard_<key>/
                           (per-motion trajectory.pkl + synthetic metrics_eval.json)
-2. batch_render_replay.py one IsaacSim session, hot-swap object USDs between motions
+2. batch_render_replay.py one IsaacSim session per worker; split the plan and
+                          hot-swap object USDs between that worker's motions
                           → <motion_lib>/vis/<seq>.mp4
 3. (optional) ffmpeg      add per-clip labels, concat into all_motions_combined.mp4,
                           build 4×4 (or 2×2 if fewer than 16) examples_grid.mp4
@@ -184,6 +193,7 @@ at the same motion library.
 
 | Symptom | Likely cause / fix |
 |---|---|
+| `python: command not found` in the Isaac Lab server container | Pass `server` as the fifth argument (or leave the default `auto`); the wrapper will use `/workspace/isaaclab/_isaac_sim/python.sh` directly. |
 | Robot is rotated horizontally / lying on its side | Wrong `quat_convention`. Retarget pkls are `wxyz`; data-export and release pkls are `xyzw`. Match it explicitly instead of relying on `auto`. |
 | Gripper stays open even at the grasp moment | `robot/<seq>.pkl` lacks `hand_dof_pos`. Re-run the data-export step with the post-2026-06-01 code (it persists the full 14-DOF hand trajectory alongside the scalar averages). |
 | `Error: required subdir missing: <path>/object_usd` | The directory isn't a motion-library layout. Verify `robot/`, `objects/`, `object_usd/` all exist; `meta/` is optional. |
