@@ -124,7 +124,7 @@ algo:
   config:
     num_steps_per_env: 16
     num_learning_iterations: 30000
-    num_learning_epochs: 3
+    num_learning_epochs: 2
     num_mini_batches: 4
     actor_learning_rate: 2e-4
     ppo_loss_coef: 0.0

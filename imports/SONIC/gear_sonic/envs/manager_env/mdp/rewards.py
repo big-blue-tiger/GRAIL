@@ -1581,9 +1581,9 @@ def meta_action_rate_l2(
 ) -> torch.Tensor:
     """Penalize the rate of change of meta actions (token + residual) via L2-squared.
 
-    The meta action is the policy's raw output: latent residual (e.g., 64 dims)
-    + finger primitives (e.g., 2 dims). Encourages smooth token trajectories in
-    latent space, reducing jitter in the decoded joint-level actions.
+    The meta action is the policy-space command: a latent residual/absolute
+    action for legacy experiments, or the effective delta command for the
+    opt-in delta-action student.  The final two dimensions are hand primitives.
 
     Since full_token = encoded_token + scaled_residual and encoded_token is constant
     for the same proprioception, penalizing the residual rate effectively penalizes

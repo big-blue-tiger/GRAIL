@@ -1,0 +1,32 @@
+# @package _global_
+#
+# Opt-in VIRAL-style delta-command variant of the privileged-history MLP
+# student.  The policy still emits 64 latent values plus two hand primitives,
+# but they are accumulated into the direct decoder command before execution.
+# The parent absolute-action experiment remains unchanged.
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_privileged_history
+  - _self_
+
+exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_privileged_history_delta_action
+experiment_name: ${exp_base}_${exp_var}
+
+manager_env:
+  config:
+    student_delta_action: true
+    delta_action_hand_bounds: [-1.0, 1.0]
+
+algo:
+  config:
+    actor:
+      backbone:
+        module_config_dict:
+          # The actor distribution remains in delta space.  BC reconstructs
+          # the absolute command and applies raw MSE against the Teacher target.
+          student_delta_action: true
+          delta_latent_dim: 64
+          delta_hand_min: -1.0
+          delta_hand_max: 1.0
+          previous_absolute_action_key: previous_absolute_meta_action
+          target_normalization: none

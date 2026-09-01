@@ -182,6 +182,7 @@ class UniversalTokenModule(nn.Module):
         # These are populated during forward() and can be read afterwards
         self._last_encoded_tokens = None  # dict[encoder_name -> Tensor]
         self._last_encoded_latents = None  # dict[encoder_name -> Tensor] (pre-quantization)
+        self._last_full_latent_pre_quant_flat = None
 
         self.env_config = env_config
         self.algo_config = algo_config
@@ -985,6 +986,10 @@ class UniversalTokenModule(nn.Module):
         encoder_masks = self.create_encoder_masks(tokenizer_obs)
         encoded_tokens = {}
         encoded_latents = {}
+        # Exact continuous values presented to FSQ, assembled below in batch
+        # order.  This differs from encoded_latents when an adapter modifies the
+        # encoder output before quantization.
+        pre_quantized_latents = {}
         height_adapter_feat = None  # populated by height adapter (pre or post quantization)
         if latent_residual is not None and latent_residual_mode in [
             "pre_quantization",
@@ -1033,6 +1038,7 @@ class UniversalTokenModule(nn.Module):
                 else:
                     encoded_tokens[encoder_name] = latent
                 encoded_latents[encoder_name] = latent
+                pre_quantized_latents[encoder_name] = latent
         else:
             # STANDARD MODE: encode normally
             height_adapter_active = (
@@ -1078,6 +1084,7 @@ class UniversalTokenModule(nn.Module):
                         encoded_tokens[encoder_name] = quantized_codes.contiguous()
                     else:
                         encoded_tokens[encoder_name] = latent
+                    pre_quantized_latents[encoder_name] = latent
             else:
                 for encoder_name in self.encoders_to_iterate:
                     encoded_tokens[encoder_name], encoded_latents[encoder_name] = self.encode(
@@ -1088,6 +1095,10 @@ class UniversalTokenModule(nn.Module):
                         frame_mask=frame_mask,
                         extra_obs=input_data,
                     )
+                    pre_quantized_latents[encoder_name] = encoded_latents[encoder_name]
+        all_pre_quantized_latents = self.assemble_all_tokens(
+            pre_quantized_latents, encoder_masks, batch_size, seq_len
+        )
         all_tokens = self.assemble_all_tokens(encoded_tokens, encoder_masks, batch_size, seq_len)
 
         # POST-QUANTIZATION MODE: add residual after FSQ tokens (default)
@@ -1101,6 +1112,9 @@ class UniversalTokenModule(nn.Module):
         # Cache flattened full latent on device for reward computation (token smoothness)
         # all_tokens is the post-quantization token that gets sent to decoder
         # Shape: (batch, seq, num_tokens, token_dim) -> (batch, seq, latent_dim)
+        self._last_full_latent_pre_quant_flat = all_pre_quantized_latents.detach().view(
+            *all_pre_quantized_latents.shape[:-2], -1
+        )
         self._last_full_latent_flat = all_tokens.detach().view(*all_tokens.shape[:-2], -1)
 
         # Detach from encoder graph when frozen (save backward memory)

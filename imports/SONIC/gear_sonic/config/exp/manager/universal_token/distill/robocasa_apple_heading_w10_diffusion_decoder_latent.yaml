@@ -20,9 +20,9 @@ algo:
     use_dagger: true
     ppo_loss_coef: 0.0
     distill_teacher_loss_coef: 0.0
-    diffusion_decoder_distill: true
+    decoder_distill: true
     diffusion_target_key: diffusion_target
-    diffusion_target_latent_mode: decoder_input
+    target_latent_mode: decoder_input
     diffusion_latent_dim: 64
     diffusion_hand_dim: 2
     # Teacher execution uses motion primitives, so supervise the student's two

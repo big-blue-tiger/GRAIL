@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 # Import joint index functions (single source of truth)
 from gear_sonic.envs.env_utils.joint_utils import get_body_joint_indices, get_hand_joint_indices
+from gear_sonic.utils.delta_action import accumulate_delta_meta_action
 from gear_sonic.utils.runtime_debug import (
     log_invalid_stats,
     tensor_batch_invalid_stats,
@@ -119,6 +120,25 @@ class ManagerEnvWrapper:
         # directly, bypassing the ATM encoder entirely at inference time.
         # The 64-dim output goes directly to ATM decoder (no encoding step).
         self._use_student_direct_latent = self.config.get("use_student_direct_latent", False)
+        self._student_delta_action = bool(self.config.get("student_delta_action", False))
+        delta_hand_bounds = self.config.get("delta_action_hand_bounds", [-1.0, 1.0])
+        if len(delta_hand_bounds) != 2:
+            raise ValueError("delta_action_hand_bounds must contain [min, max]")
+        self._delta_hand_min = float(delta_hand_bounds[0])
+        self._delta_hand_max = float(delta_hand_bounds[1])
+        if self._student_delta_action:
+            if not self._use_student_direct_latent:
+                raise ValueError("student_delta_action requires use_student_direct_latent=true")
+            if self._delta_hand_min >= self._delta_hand_max:
+                raise ValueError("delta action hand minimum must be smaller than its maximum")
+            meta_action_dim = int(self.config.get("meta_action_dim", 66))
+            tokenizer_action_dim = int(self.config.get("tokenizer_action_dim", 64))
+            if meta_action_dim != 66 or tokenizer_action_dim != 64:
+                raise ValueError(
+                    "student_delta_action requires a 64D latent plus two hand primitives; "
+                    f"got meta_action_dim={meta_action_dim}, "
+                    f"tokenizer_action_dim={tokenizer_action_dim}"
+                )
 
         # Hand-action source can differ between teacher and student execution.
         # Fall back to the legacy flag so existing experiments keep their old behavior.
@@ -140,6 +160,12 @@ class ManagerEnvWrapper:
             logger.info(
                 "Student direct latent mode enabled: policy output goes directly to ATM decoder "
                 "(no encoding step)"
+            )
+
+        if self._student_delta_action:
+            logger.info(
+                "Student delta action enabled: accumulate direct latent and clamp hand "
+                f"primitives to [{self._delta_hand_min}, {self._delta_hand_max}]"
             )
 
         # Camera extrinsics randomization state
@@ -395,6 +421,15 @@ class ManagerEnvWrapper:
     def reset_all(self, global_rank=0):  # noqa: ARG002
         return self.reset()
 
+    def get_previous_absolute_meta_action(self) -> torch.Tensor:
+        """Return the command that the next student delta will accumulate onto."""
+        if not self._student_delta_action:
+            raise RuntimeError("previous absolute meta action is only defined in delta mode")
+        action = getattr(self.env, "_absolute_meta_action", None)
+        if action is None:
+            raise RuntimeError("reset the environment before requesting the delta action reference")
+        return action.detach().clone()
+
     @staticmethod
     def _tensor_bad_env_ids(tensor, abs_limit=None):
         return tensor_bad_env_ids(tensor, abs_limit=abs_limit)
@@ -449,6 +484,8 @@ class ManagerEnvWrapper:
             self.env._last_meta_action[env_ids] = 0.0
             self.env._prev_full_latent[env_ids] = 0.0
             self.env._full_latent[env_ids] = 0.0
+        if hasattr(self.env, "_absolute_meta_action"):
+            self.env._absolute_meta_action[env_ids] = 0.0
         if hasattr(self.env, "success_lift"):
             self.env.success_lift[env_ids] = False
 
@@ -604,6 +641,13 @@ class ManagerEnvWrapper:
             self.env._prev_full_latent = torch.zeros(  # noqa: SLF001
                 self.env.num_envs, tokenizer_action_dim, dtype=torch.float32, device=self.env.device
             )
+            if self._student_delta_action:
+                self.env._absolute_meta_action = torch.zeros(  # noqa: SLF001
+                    self.env.num_envs,
+                    meta_action_dim,
+                    dtype=torch.float32,
+                    device=self.env.device,
+                )
 
             # Apply camera extrinsics randomization on every reset
             self.apply_random_camera_extrinsics()
@@ -752,7 +796,7 @@ class ManagerEnvWrapper:
         # Mark as initialized (for print suppression)
         self._camera_extrinsics_randomized = True
 
-    def _decode_direct_latent(self, full_latent, atm_obs_dict):
+    def _decode_direct_latent(self, full_latent, atm_obs_dict, return_full_latent=False):
         """Decode full latent directly using ATM decoder (skip encoder).
         Used for student rollout where policy outputs full latent.
 
@@ -774,9 +818,16 @@ class ManagerEnvWrapper:
             proprioception = proprioception.unsqueeze(1)
 
         atm = self.action_transform_module.actor_module
-        return self._decode_direct_latent_batch(full_latent, proprioception, atm)
+        return self._decode_direct_latent_batch(
+            full_latent,
+            proprioception,
+            atm,
+            return_full_latent=return_full_latent,
+        )
 
-    def _decode_direct_latent_batch(self, full_latent, proprioception, atm):
+    def _decode_direct_latent_batch(
+        self, full_latent, proprioception, atm, return_full_latent=False
+    ):
         """Decode a batch of full latents directly using ATM decoder.
 
         The student policy outputs pre-quantization values (latent + residual).
@@ -827,6 +878,8 @@ class ManagerEnvWrapper:
                 f"Decoder output missing 'action' or 'meta_action'. Keys: {decoded_output.keys()}"
             )
 
+        if return_full_latent:
+            return body_actions, tokens_for_decode.view(batch_size, -1)
         return body_actions
 
     def get_reference_hand_actions(self) -> torch.Tensor:
@@ -897,17 +950,55 @@ class ManagerEnvWrapper:
                         f"got shape {tuple(is_teacher_env.shape)} for {meta_actions.shape[0]} envs"
                     )
 
-            # Shift meta action buffers for meta_action_rate_l2 reward (token smoothness)
-            self.env._prev_meta_action = self.env._last_meta_action.clone()  # noqa: SLF001
-            # Store meta action for observation (last policy output)
-            self.env._last_meta_action = meta_actions.clone()  # noqa: SLF001
+            previous_absolute_meta_action = None
+            absolute_meta_actions = None
+            if self._student_delta_action:
+                if not hasattr(self.env, "_absolute_meta_action"):
+                    raise RuntimeError(
+                        "student delta action accumulator is unavailable; reset the environment "
+                        "before stepping"
+                    )
+                previous_absolute_meta_action = (  # noqa: SLF001
+                    self.env._absolute_meta_action.clone()
+                )
+                self.env._prev_meta_action = (  # noqa: SLF001
+                    self.env._last_meta_action.clone()
+                )
+                execution_meta_actions = meta_actions.clone()
+                if action_mode == "direct_latent":
+                    absolute_meta_actions, _ = accumulate_delta_meta_action(
+                        previous_absolute_meta_action,
+                        meta_actions,
+                        latent_dim=int(self.config.get("tokenizer_action_dim", 64)),
+                        hand_min=self._delta_hand_min,
+                        hand_max=self._delta_hand_max,
+                    )
+                    execution_meta_actions = absolute_meta_actions
+                elif action_mode == "mixed":
+                    proposed_absolute, _ = accumulate_delta_meta_action(
+                        previous_absolute_meta_action,
+                        meta_actions,
+                        latent_dim=int(self.config.get("tokenizer_action_dim", 64)),
+                        hand_min=self._delta_hand_min,
+                        hand_max=self._delta_hand_max,
+                    )
+                    execution_meta_actions[~is_teacher_env] = proposed_absolute[~is_teacher_env]
+                    absolute_meta_actions = proposed_absolute
+                elif action_mode != "residual":
+                    raise ValueError(f"Unsupported delta action mode: {action_mode}")
+            else:
+                execution_meta_actions = meta_actions
+                # Shift meta action buffers for meta_action_rate_l2 reward.
+                self.env._prev_meta_action = self.env._last_meta_action.clone()  # noqa: SLF001
+                # Legacy configs observe the raw absolute/residual policy output.
+                self.env._last_meta_action = meta_actions.clone()  # noqa: SLF001
 
             atm_obs_dict = self._prepare_obs_for_action_transform_module(obs_dict)
 
             # Split actions: first tokenizer_action_dim for tokenizer, rest for hands
             tokenizer_action_dim = self.config.get("tokenizer_action_dim")
-            tokenizer_meta_actions = meta_actions[:, :tokenizer_action_dim]
-            hand_actions_raw = meta_actions[:, tokenizer_action_dim:]
+            tokenizer_meta_actions = execution_meta_actions[:, :tokenizer_action_dim]
+            hand_actions_raw = execution_meta_actions[:, tokenizer_action_dim:]
 
             # Teacher/residual execution may use reference hands while the
             # student/direct-latent policy executes its own two hand primitives.
@@ -946,7 +1037,18 @@ class ManagerEnvWrapper:
 
             # Action history and action-based rewards must reflect the primitives
             # that are actually sent to the environment after source selection.
-            self.env._last_meta_action[:, tokenizer_action_dim:] = hand_actions_raw  # noqa: SLF001
+            if not self._student_delta_action:
+                self.env._last_meta_action[:, tokenizer_action_dim:] = (  # noqa: SLF001
+                    hand_actions_raw
+                )
+            elif action_mode == "direct_latent":
+                absolute_meta_actions = absolute_meta_actions.clone()
+                absolute_meta_actions[:, tokenizer_action_dim:] = hand_actions_raw
+            elif action_mode == "mixed":
+                absolute_meta_actions = absolute_meta_actions.clone()
+                absolute_meta_actions[~is_teacher_env, tokenizer_action_dim:] = hand_actions_raw[
+                    ~is_teacher_env
+                ]
 
             # Convert primitive actions to finger joint targets if enabled
             if self._use_finger_primitive and self._finger_primitive_map:
@@ -958,9 +1060,18 @@ class ManagerEnvWrapper:
                 hand_actions = hand_actions_raw
 
             if action_mode == "direct_latent":
-                # Student direct latent mode: policy outputs FULL latent, not residual
-                # Skip ATM encoder entirely - go directly to decoder
-                body_actions = self._decode_direct_latent(tokenizer_meta_actions, atm_obs_dict)
+                # Direct-latent execution skips the ATM encoder.  Delta mode
+                # has already accumulated the model output above.
+                if self._student_delta_action:
+                    body_actions, executed_full_latent = self._decode_direct_latent(
+                        tokenizer_meta_actions,
+                        atm_obs_dict,
+                        return_full_latent=True,
+                    )
+                else:
+                    body_actions = self._decode_direct_latent(
+                        tokenizer_meta_actions, atm_obs_dict
+                    )
 
             elif action_mode == "residual":
                 # Teacher/residual mode: policy outputs residual that's added to ATM encoded tokens
@@ -972,10 +1083,28 @@ class ManagerEnvWrapper:
                     latent_residual=scaled_residual,
                     latent_residual_mode=self._latent_residual_mode,
                 )
+                if self._student_delta_action:
+                    atm_module = self.action_transform_module.actor_module
+                    full_latent = atm_module._last_full_latent_flat  # noqa: SLF001
+                    executed_full_latent = (
+                        full_latent[:, -1] if full_latent.dim() == 3 else full_latent
+                    ).to(self.env.device)
+                    pre_quant_latent = getattr(
+                        atm_module, "_last_full_latent_pre_quant_flat", None
+                    )
+                    if pre_quant_latent is None:
+                        raise RuntimeError(
+                            "ATM did not expose _last_full_latent_pre_quant_flat"
+                        )
+                    absolute_reference_latent = (
+                        pre_quant_latent[:, -1]
+                        if pre_quant_latent.dim() == 3
+                        else pre_quant_latent
+                    ).to(self.env.device)
 
             elif action_mode == "mixed":
                 # Mixed rollout: some envs use teacher (residual), some use student (direct_latent)
-                # is_teacher_env is a boolean mask: True = teacher/residual, False = student/direct_latent
+                # True selects teacher/residual; False selects student/direct-latent.
                 num_envs = tokenizer_meta_actions.shape[0]
                 atm = self.action_transform_module.actor_module
 
@@ -997,6 +1126,9 @@ class ManagerEnvWrapper:
                 student_indices = None
                 teacher_body_actions = None
                 student_body_actions = None
+                teacher_full_latent = None
+                teacher_pre_quant_latent = None
+                student_full_latent = None
 
                 # Process teacher envs (residual mode) if any
                 if num_teacher > 0:
@@ -1017,6 +1149,23 @@ class ManagerEnvWrapper:
                         latent_residual=scaled_residual,
                         latent_residual_mode=self._latent_residual_mode,
                     )
+                    if self._student_delta_action:
+                        teacher_full_latent = atm._last_full_latent_flat  # noqa: SLF001
+                        if teacher_full_latent.dim() == 3:
+                            teacher_full_latent = teacher_full_latent[:, -1]
+                        teacher_full_latent = teacher_full_latent.to(self.env.device)
+                        teacher_pre_quant_latent = getattr(
+                            atm, "_last_full_latent_pre_quant_flat", None
+                        )
+                        if teacher_pre_quant_latent is None:
+                            raise RuntimeError(
+                                "ATM did not expose _last_full_latent_pre_quant_flat"
+                            )
+                        if teacher_pre_quant_latent.dim() == 3:
+                            teacher_pre_quant_latent = teacher_pre_quant_latent[:, -1]
+                        teacher_pre_quant_latent = teacher_pre_quant_latent.to(
+                            self.env.device
+                        )
 
                 # Process student envs (direct_latent mode) if any
                 if num_student > 0:
@@ -1024,9 +1173,19 @@ class ManagerEnvWrapper:
                     student_latent = tokenizer_meta_actions[student_indices]
                     student_proprio = proprioception[student_indices]
 
-                    student_body_actions = self._decode_direct_latent_batch(
-                        student_latent, student_proprio, atm
-                    )
+                    if self._student_delta_action:
+                        student_body_actions, student_full_latent = (
+                            self._decode_direct_latent_batch(
+                                student_latent,
+                                student_proprio,
+                                atm,
+                                return_full_latent=True,
+                            )
+                        )
+                    else:
+                        student_body_actions = self._decode_direct_latent_batch(
+                            student_latent, student_proprio, atm
+                        )
 
                 # Merge results - determine output shape from whichever mode ran
                 if teacher_body_actions is not None:
@@ -1049,16 +1208,54 @@ class ManagerEnvWrapper:
                 if student_body_actions is not None and student_indices is not None:
                     body_actions[student_indices] = student_body_actions
 
+                if self._student_delta_action:
+                    executed_full_latent = torch.zeros(
+                        num_envs,
+                        tokenizer_action_dim,
+                        device=self.env.device,
+                        dtype=body_actions.dtype,
+                    )
+                    if teacher_indices is not None:
+                        executed_full_latent[teacher_indices] = teacher_full_latent
+                    if student_indices is not None:
+                        executed_full_latent[student_indices] = student_full_latent
+
             else:
                 raise ValueError(
                     f"Unknown action_mode: {action_mode}. "
                     f"Valid modes are 'direct_latent', 'residual', or 'mixed'."
                 )
 
+            if self._student_delta_action:
+                if action_mode == "direct_latent":
+                    new_absolute_meta_action = absolute_meta_actions
+                elif action_mode == "residual":
+                    new_absolute_meta_action = torch.cat(
+                        [absolute_reference_latent, hand_actions_raw], dim=-1
+                    )
+                else:
+                    new_absolute_meta_action = absolute_meta_actions.clone()
+                    if teacher_indices is not None:
+                        new_absolute_meta_action[
+                            teacher_indices, :tokenizer_action_dim
+                        ] = teacher_pre_quant_latent
+                        new_absolute_meta_action[
+                            teacher_indices, tokenizer_action_dim:
+                        ] = hand_actions_raw[teacher_indices]
+
+                self.env._last_meta_action = (  # noqa: SLF001
+                    new_absolute_meta_action - previous_absolute_meta_action
+                )
+                self.env._absolute_meta_action = (  # noqa: SLF001
+                    new_absolute_meta_action.detach().clone()
+                )
+                self.env._prev_full_latent = self.env._full_latent.clone()  # noqa: SLF001
+                self.env._full_latent = executed_full_latent.detach().clone()  # noqa: SLF001
+
             # Store full latent (decoder input) for full_latent_rate_l2 reward
             # Only needed for residual mode (teacher RL training); student modes
             # (direct_latent, mixed) use L2 distillation loss, not RL rewards.
-            if action_mode == "residual":
+            if action_mode == "residual" and not self._student_delta_action:
                 self.env._prev_full_latent = self.env._full_latent.clone()  # noqa: SLF001
                 atm_module = self.action_transform_module.actor_module
                 if (
@@ -1127,6 +1324,8 @@ class ManagerEnvWrapper:
             self.env._last_meta_action[reset_mask] = 0.0  # noqa: SLF001
             self.env._prev_full_latent[reset_mask] = 0.0  # noqa: SLF001
             self.env._full_latent[reset_mask] = 0.0  # noqa: SLF001
+            if hasattr(self.env, "_absolute_meta_action"):
+                self.env._absolute_meta_action[reset_mask] = 0.0  # noqa: SLF001
 
         # Compute success_lift metric: check if object has no contact with table (lifted)
         # Skip frames before first contact (from contact label data)

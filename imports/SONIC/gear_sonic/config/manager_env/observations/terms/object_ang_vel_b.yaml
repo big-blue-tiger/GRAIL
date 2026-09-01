@@ -1,0 +1,5 @@
+object_ang_vel_b:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:object_ang_vel_b
+  params:
+    command_name: motion

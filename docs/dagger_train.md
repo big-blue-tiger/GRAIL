@@ -24,7 +24,7 @@ python -u -m grail.datatool.batch_filter_teacher_policy \
 cd /home/tide/robot/GRAIL/imports/SONIC
 
 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_privileged_history \
   headless=True \
   num_envs=8
 
@@ -41,14 +41,14 @@ python gear_sonic/train_agent_trl.py \
 cd /home/GRAIL/imports/SONIC
 
 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_privileged_history \
   headless=True \
-  num_envs=1024 \
-  experiment_name=mlp_bc1_ppo1 \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
+  num_envs=4096 \
+  experiment_name=mlp_bc1_ppo1_studentonly_cleandata_prihistory \
+  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
+  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
+  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
+  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   algo.config.num_learning_iterations=10000 \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt 
@@ -67,16 +67,24 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   algo.config.dagger_student_ratio=1.0
 
-CUDA_VISIBLE_DEVICES=2 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_transformer_flow_chunk1_decoder_latent_vector_obs \
+cd /home/GRAIL/imports/SONIC
+
+CUDA_VISIBLE_DEVICES=0,1,2 \
+python -m torch.distributed.run \
+  --standalone \
+  --nnodes=1 \
+  --nproc_per_node=3 \
+  gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_privileged_history \
   headless=True \
-  num_envs=1024 \
-  experiment_name=chunk1 \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps \
+  num_envs=2400 \
+  experiment_name=mlp_bc1_ppo1_studentonly_cleandata_prihistory \
+  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
+  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
+  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
+  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  algo.config.num_learning_iterations=10000 \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt
 
 ```

@@ -26,6 +26,7 @@ algo:
     distill_teacher_loss_coef: 0.0
     compute_aux_loss: true
     aux_loss_scale: 1.0
+    num_learning_epochs: 2
     gamma: 0.99
     lam: 0.95
     num_steps_per_env: 24
@@ -52,7 +53,11 @@ algo:
     dagger_rollout_mode: fixed
     dagger_student_ratio: 1
     dagger_student_ratio_increment: 0.0
-    diffusion_decoder_distill: true
+    decoder_distill: true
+    # Supervise the direct-latent MLP in the same continuous space in which it
+    # executes and, for delta variants, accumulates commands.  The Teacher
+    # target is encoder latent + scaled residual immediately before FSQ.
+    target_latent_mode: pre_quantization
     # These keys only control the terminal table. All metrics are still sent
     # to the configured experiment tracker regardless of this allowlist.
     console_loss_keys:

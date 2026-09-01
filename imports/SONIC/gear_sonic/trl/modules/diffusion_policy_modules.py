@@ -16,6 +16,8 @@ import torch.nn.functional as F
 from torch.utils import checkpoint as checkpoint_utils
 from torchvision import models
 
+from gear_sonic.utils.delta_action import accumulate_delta_meta_action
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -941,6 +943,26 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
 
         activation = module_config_dict.get("activation", "SiLU")
         self.bc_loss_coef = float(module_config_dict.get("bc_loss_coef", 1.0))
+        self.student_delta_action = bool(
+            module_config_dict.get("student_delta_action", False)
+        )
+        self.delta_latent_dim = int(module_config_dict.get("delta_latent_dim", 64))
+        self.delta_hand_min = float(module_config_dict.get("delta_hand_min", -1.0))
+        self.delta_hand_max = float(module_config_dict.get("delta_hand_max", 1.0))
+        self.previous_absolute_action_key = module_config_dict.get(
+            "previous_absolute_action_key", "previous_absolute_meta_action"
+        )
+        if self.student_delta_action:
+            if self.action_dim != self.delta_latent_dim + 2:
+                raise ValueError(
+                    "student_delta_action requires a latent plus exactly two hand primitives; "
+                    f"got action_dim={self.action_dim}, latent_dim={self.delta_latent_dim}"
+                )
+            if self.target_normalization != "none":
+                raise ValueError(
+                    "student_delta_action with raw absolute BC requires "
+                    "target_normalization='none'"
+                )
         self.action_head = _build_mlp(
             self.cond_dim,
             module_config_dict.get("mlp_hidden_dims", [1024, 1024, 512]),
@@ -982,24 +1004,65 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
                 f"got {tuple(target.shape[:-1])}, expected {tuple(cond.shape[:-1])}"
             )
 
-        with torch.no_grad():
-            self._update_target_stats(target)
-        normalized_target = self._normalize_target(target)
-        bc_loss = F.mse_loss(pred_normalized, normalized_target)
+        if self.student_delta_action:
+            previous_absolute_action = kwargs.get(self.previous_absolute_action_key)
+            if previous_absolute_action is None:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires "
+                    f"{self.previous_absolute_action_key} when student_delta_action=True"
+                )
+            previous_absolute_action = previous_absolute_action.to(
+                device=cond.device, dtype=cond.dtype
+            )
+            if previous_absolute_action.shape != target.shape:
+                raise ValueError(
+                    "previous absolute action shape must match the teacher target; "
+                    f"got {tuple(previous_absolute_action.shape)} and {tuple(target.shape)}"
+                )
+            reconstructed_absolute, _ = accumulate_delta_meta_action(
+                previous_absolute_action,
+                pred_action,
+                latent_dim=self.delta_latent_dim,
+                hand_min=self.delta_hand_min,
+                hand_max=self.delta_hand_max,
+            )
+            bc_loss = F.mse_loss(reconstructed_absolute, target)
+            normalized_target = target
+        else:
+            with torch.no_grad():
+                self._update_target_stats(target)
+            normalized_target = self._normalize_target(target)
+            bc_loss = F.mse_loss(pred_normalized, normalized_target)
 
         target_flat = target.detach().float().reshape(-1, self.action_dim)
         norm_flat = normalized_target.detach().float().reshape(-1, self.action_dim)
         pred_flat = pred_action.detach().float().reshape(-1, self.action_dim)
+        aux_losses = {
+            "latent_bc_mse": bc_loss,
+            "bc_target/raw_abs_mean": target_flat.abs().mean(),
+            "bc_target/raw_std_mean": target_flat.std(dim=0, unbiased=False).mean(),
+            "bc_target/norm_abs_mean": norm_flat.abs().mean(),
+            "bc_target/norm_std_mean": norm_flat.std(dim=0, unbiased=False).mean(),
+            "bc_pred/raw_abs_mean": pred_flat.abs().mean(),
+        }
+        if self.student_delta_action:
+            raw_absolute = previous_absolute_action + pred_action
+            raw_hand = raw_absolute[..., self.delta_latent_dim :]
+            clipped = (raw_hand < self.delta_hand_min) | (raw_hand > self.delta_hand_max)
+            aux_losses.update(
+                {
+                    "bc_pred_delta/raw_abs_mean": pred_action.detach().float().abs().mean(),
+                    "bc_reconstructed_abs/raw_abs_mean": reconstructed_absolute.detach()
+                    .float()
+                    .abs()
+                    .mean(),
+                    "bc_teacher_abs/raw_abs_mean": target.detach().float().abs().mean(),
+                    "bc_hand_clip_fraction": clipped.detach().float().mean(),
+                }
+            )
         return {
             "action_mean": pred_action,
-            "aux_losses": {
-                "latent_bc_mse": bc_loss,
-                "bc_target/raw_abs_mean": target_flat.abs().mean(),
-                "bc_target/raw_std_mean": target_flat.std(dim=0, unbiased=False).mean(),
-                "bc_target/norm_abs_mean": norm_flat.abs().mean(),
-                "bc_target/norm_std_mean": norm_flat.std(dim=0, unbiased=False).mean(),
-                "bc_pred/raw_abs_mean": pred_flat.abs().mean(),
-            },
+            "aux_losses": aux_losses,
             "aux_loss_coef": {"latent_bc_mse": self.bc_loss_coef},
         }
 

@@ -890,27 +890,66 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             self.distill_teacher_loss_coef > 0.0 and self.ref_model is not None
         )
         self.distill_teacher_loss_fn = torch.nn.MSELoss()
-        self.diffusion_decoder_distill = (
-            self.config.get("diffusion_decoder_distill", False) and self.ref_model is not None
+        # ``decoder_distill`` is the generic decoder-target path used by both
+        # diffusion and direct-MLP students. Keep the old names as read-only
+        # fallbacks for historical experiment configs.
+        self.decoder_distill = (
+            self.config.get(
+                "decoder_distill", self.config.get("diffusion_decoder_distill", False)
+            )
+            and self.ref_model is not None
         )
-        if self.action_chunk_enabled and not self.diffusion_decoder_distill:
+        if self.action_chunk_enabled and not self.decoder_distill:
             raise ValueError(
-                "action-chunk CFM requires diffusion_decoder_distill and a frozen Teacher"
+                "action-chunk CFM requires decoder_distill and a frozen Teacher"
             )
         self.diffusion_latent_dim = int(self.config.get("diffusion_latent_dim", 64))
         self.diffusion_hand_dim = int(self.config.get("diffusion_hand_dim", 2))
         self.diffusion_target_key = self.config.get("diffusion_target_key", "diffusion_target")
-        self.diffusion_target_latent_mode = self.config.get(
-            "diffusion_target_latent_mode", "decoder_input"
+        self.target_latent_mode = self.config.get(
+            "target_latent_mode",
+            self.config.get("diffusion_target_latent_mode", "decoder_input"),
         )
+        valid_target_latent_modes = {
+            "decoder_input",
+            "pre_quantization",
+            "teacher_residual",
+        }
+        if self.target_latent_mode not in valid_target_latent_modes:
+            raise ValueError(
+                "target_latent_mode must be one of "
+                f"{sorted(valid_target_latent_modes)}, got "
+                f"{self.target_latent_mode!r}"
+            )
         self.diffusion_hand_target_source = self.config.get(
             "diffusion_hand_target_source", "teacher_policy"
         )
+        self.student_delta_action = bool(self.env.config.get("student_delta_action", False))
+        self.previous_absolute_action_key = "previous_absolute_meta_action"
         if self.diffusion_hand_target_source not in {"teacher_policy", "reference_motion"}:
             raise ValueError(
                 "diffusion_hand_target_source must be 'teacher_policy' or 'reference_motion', "
                 f"got {self.diffusion_hand_target_source!r}"
             )
+        if self.student_delta_action:
+            if not self.decoder_distill:
+                raise ValueError("student_delta_action requires decoder_distill=true")
+            if not self.env.config.get("use_student_direct_latent", False):
+                raise ValueError("student_delta_action requires use_student_direct_latent=true")
+            if self.num_act != self.diffusion_latent_dim + self.diffusion_hand_dim:
+                raise ValueError(
+                    "student_delta_action dimensions must match latent plus hand dimensions; "
+                    f"got {self.num_act}, {self.diffusion_latent_dim}, {self.diffusion_hand_dim}"
+                )
+            actor_module = getattr(self.policy_model, "actor_module", None)
+            if not getattr(actor_module, "student_delta_action", False):
+                raise ValueError(
+                    "student_delta_action requires an opt-in delta-aware policy backbone"
+                )
+            if getattr(actor_module, "target_normalization", None) != "none":
+                raise ValueError(
+                    "student_delta_action raw absolute BC requires target_normalization='none'"
+                )
 
         # Iteration-level DAgger mixing is opt-in so legacy DAgger experiments that
         # do not use the residual/direct-latent wrapper keep their old rollout.
@@ -1030,6 +1069,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.storage.register_key("actions_log_prob", shape=(1,), dtype=torch.float)
         self.storage.register_key("action_mean", shape=(self.num_act,), dtype=torch.float)
         self.storage.register_key("action_sigma", shape=(self.num_act,), dtype=torch.float)
+        if getattr(self, "student_delta_action", False):
+            self.storage.register_key(
+                self.previous_absolute_action_key,
+                shape=(self.num_act,),
+                dtype=torch.float,
+            )
 
         if self.learn_normalized_actions:
             self.storage.register_key(
@@ -1265,7 +1310,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         # per-timestep values as the student's hand-action supervision.  Querying
         # them later during minibatch updates would use the wrong motion frame.
         if (
-            self.diffusion_decoder_distill
+            self.decoder_distill
             and self.diffusion_hand_target_source == "reference_motion"
         ):
             get_reference_hands = getattr(self.env, "get_reference_hand_actions", None)
@@ -1607,6 +1652,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         dones = torch.zeros(self.env.num_envs, device=device)
         with torch.no_grad():
             for i in range(self.num_steps_per_env):  # noqa: B007
+                previous_absolute_meta_action = None
+                if getattr(self, "student_delta_action", False):
+                    previous_absolute_meta_action = (
+                        self.env.get_previous_absolute_meta_action().to(device)
+                    )
                 # Compute the actions and values
                 # TODO: 1: unsqueeze to [B, 1, ...]  # noqa: TD002, TD003
                 policy_state_dict = self.policy_step(policy_model, obs_dict, cur_dones=dones)
@@ -1656,6 +1706,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                             self.storage.register_key(key, shape=value.shape[1:], dtype=torch.float)
                     self.storage.update_key(key, value)
                 self._store_clean_teacher_obs(clean_obs_dict)
+                if previous_absolute_meta_action is not None:
+                    self.storage.update_key(
+                        self.previous_absolute_action_key,
+                        previous_absolute_meta_action,
+                    )
                 for key, value in policy_state_dict.items():
                     if key == "obs_dict":
                         continue
@@ -1948,6 +2003,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             "padding_mask": padding_mask,
             "padding_mask_p1": padding_mask_p1,
         }
+        if getattr(self, "student_delta_action", False):
+            rollout_data[self.previous_absolute_action_key] = self.storage.query_key(
+                self.previous_absolute_action_key
+            ).transpose(0, 1).to(device)
         if self.use_symmetry:
             rollout_data["next_critic_obs"] = next_critic_obs
         return rollout_data
@@ -2001,6 +2060,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             "mb_padding_mask_p1": mb_padding_mask_p1,
             "episode_attnmask": episode_attnmask,
         }
+        if getattr(self, "student_delta_action", False):
+            mb_rollout_data[self.previous_absolute_action_key] = rollout_data[
+                self.previous_absolute_action_key
+            ][micro_batch_inds]
         if self.use_symmetry:
             mb_next_critic_obs = rollout_data["next_critic_obs"][micro_batch_inds]
             mb_rollout_data["mb_next_critic_obs"] = mb_next_critic_obs
@@ -2025,7 +2088,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         episode_attnmask = mb_rollout_data["episode_attnmask"]
         teacher_results = None
         diffusion_target = None
-        needs_teacher = self.compute_distill_teacher_loss or self.diffusion_decoder_distill
+        needs_teacher = self.compute_distill_teacher_loss or self.decoder_distill
         if needs_teacher:
             self.ref_model.eval()
             with torch.no_grad():
@@ -2037,7 +2100,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 teacher_results = self.ref_model.act(
                     obs_dict=teacher_model_obs_dict, episode_attnmask=episode_attnmask
                 )
-                if self.diffusion_decoder_distill:
+                if self.decoder_distill:
                     diffusion_target = self._build_diffusion_decoder_target(
                         mb_teacher_obs_dict, teacher_results["action_mean"]
                     )
@@ -2051,6 +2114,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             }
             if diffusion_target is not None:
                 policy_kwargs[self.diffusion_target_key] = diffusion_target
+            if getattr(self, "student_delta_action", False):
+                policy_kwargs[self.previous_absolute_action_key] = mb_rollout_data[
+                    self.previous_absolute_action_key
+                ]
             results = model.forward(
                 modes=["policy_w_and_wo_imgaug", "value"],
                 input_kwargs={
@@ -2068,6 +2135,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 }
                 if diffusion_target is not None:
                     policy_kwargs[self.diffusion_target_key] = diffusion_target
+                if getattr(self, "student_delta_action", False):
+                    policy_kwargs[self.previous_absolute_action_key] = mb_rollout_data[
+                        self.previous_absolute_action_key
+                    ]
                 results = model.forward(
                     modes=["policy", "value"],
                     input_kwargs={
@@ -2085,13 +2156,13 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         return ret
 
     def _build_diffusion_decoder_target(self, obs_dict, teacher_action_mean):
-        """Build the diffusion target: decoder-input latent plus hand action.
+        """Build the configured Teacher latent target plus hand action.
 
         The HOI teacher predicts a latent residual.  The environment applies
         that residual to the frozen action-transform module's encoder output
-        before decoding.  For diffusion distillation we supervise the student on
-        the actual flattened decoder token instead of the residual, so inference
-        can run in direct-latent mode.
+        before decoding. ``decoder_input`` selects the post-FSQ token, while
+        ``pre_quantization`` selects encoder latent + scaled residual immediately
+        before FSQ.  Both allow inference to run in direct-latent mode.
         """
         latent_residual = teacher_action_mean[..., : self.diffusion_latent_dim].detach()
         if self.diffusion_hand_target_source == "reference_motion":
@@ -2114,13 +2185,13 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             hand_action = teacher_action_mean[
                 ..., self.diffusion_latent_dim : self.diffusion_latent_dim + self.diffusion_hand_dim
             ].detach()
-        if self.diffusion_target_latent_mode == "teacher_residual":
+        if self.target_latent_mode == "teacher_residual":
             return torch.cat([latent_residual, hand_action], dim=-1)
 
         action_transform_module = getattr(self.env, "action_transform_module", None)
         if action_transform_module is None:
             raise RuntimeError(
-                "diffusion_decoder_distill=True requires env.action_transform_module"
+                "decoder_distill=True requires env.action_transform_module"
             )
 
         batch_shape = latent_residual.shape[:-1]
@@ -2151,6 +2222,14 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
 
         latent_scale = float(getattr(self.env, "_latent_residual_scale", 1.0))
         latent_mode = getattr(self.env, "_latent_residual_mode", "pre_quantization")
+        if self.target_latent_mode == "pre_quantization" and latent_mode not in {
+            "pre_quantization",
+            "pre_quantization_replace",
+        }:
+            raise RuntimeError(
+                "pre_quantization Teacher targets require the Teacher residual to be "
+                "applied before FSQ; got latent_residual_mode=" + repr(latent_mode)
+            )
         scaled_residual = latent_residual.reshape(-1, self.diffusion_latent_dim) * latent_scale
         action_transform_module.eval()
         with torch.no_grad():
@@ -2160,14 +2239,21 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 latent_residual_mode=latent_mode,
             )
             atm_module = action_transform_module.actor_module
-            full_latent = getattr(atm_module, "_last_full_latent_flat", None)
-            if full_latent is None:
-                raise RuntimeError("ATM did not expose _last_full_latent_flat")
-            full_latent = full_latent.to(latent_residual.device)
-            if full_latent.dim() == 3:
-                full_latent = full_latent[:, -1]
-            full_latent = full_latent.reshape(*batch_shape, self.diffusion_latent_dim)
-        return torch.cat([full_latent.detach(), hand_action], dim=-1)
+            cache_name = (
+                "_last_full_latent_pre_quant_flat"
+                if self.target_latent_mode == "pre_quantization"
+                else "_last_full_latent_flat"
+            )
+            target_latent = getattr(atm_module, cache_name, None)
+            if target_latent is None:
+                raise RuntimeError(f"ATM did not expose {cache_name}")
+            target_latent = target_latent.to(latent_residual.device)
+            if target_latent.dim() == 3:
+                target_latent = target_latent[:, -1]
+            target_latent = target_latent.reshape(
+                *batch_shape, self.diffusion_latent_dim
+            )
+        return torch.cat([target_latent.detach(), hand_action], dim=-1)
 
     def _get_ppo_loss_coef(self):
         """Return the effective coefficient applied to the PPO objective."""

@@ -1,0 +1,9 @@
+object_hand_rel_vel:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:object_hand_rel_vel
+  params:
+    command_name: motion
+    hand_asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: robot
+      body_names: [right_hand_palm_link]
