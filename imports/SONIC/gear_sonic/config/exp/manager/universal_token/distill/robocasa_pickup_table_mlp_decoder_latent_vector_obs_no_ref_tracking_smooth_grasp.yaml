@@ -1,0 +1,86 @@
+# @package _global_
+#
+# Task-reward variant for the direct-latent MLP student.  The student does not
+# observe a reference motion, so reference-pose/velocity tracking rewards are
+# disabled.  The remaining objective emphasizes a stable physical grasp and
+# smooth commands while retaining the inherited safety penalties.
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs
+  - _self_
+
+exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_no_ref_tracking_smooth_grasp
+experiment_name: ${exp_base}_${exp_var}
+algo:
+  config:
+    ppo_bc_loss_schedule:
+      enabled: true
+      bc_min_coef: 0.2
+manager_env:
+  rewards:
+    # Remove all reference-motion tracking signals.  Null (instead of weight 0)
+    # keeps these terms out of RewardManager's active term set entirely.
+    tracking_anchor_pos: null
+    tracking_anchor_ori: null
+    tracking_relative_body_pos: null
+    tracking_relative_body_ori: null
+    tracking_body_linvel: null
+    tracking_body_angvel: null
+    object_tracking_reward: null
+
+    # Make contact achievable first, then reward a sustained multi-finger grasp.
+    # Ungating this term removes its dependency on reference-motion contact time.
+    grasp_reward:
+      weight: 10.0
+      params:
+        gate_with_contact_label: false
+        hand: right_hand
+        command_name: motion
+        min_contacts: 4
+    grasp_finger_direction:
+      # The old run reports about -0.65 at weight 10: this shaping term is
+      # currently negative and would dominate if doubled.  Keep it as a weak
+      # geometric hint while the physical-contact reward remains primary.
+      weight: 2.0
+      params:
+        use_contact_center: true
+
+    # The old run reports only about -0.004 at weight -0.1, so a 10x increase
+    # remains small relative to the grasp objective while making smoothness
+    # visible to PPO. Exclude the two discrete finger primitive dimensions.
+    meta_action_rate_l2:
+      weight: -1.0
+      params:
+        token_only: true
+
+    # This metric is identically zero in the old run. Direct-latent, non-delta
+    # execution does not update the wrapper's full-latent history buffers, so
+    # changing its weight cannot affect training; remove the inactive term.
+    full_latent_rate_l2: null
+
+    # Smooth the decoded joint command directly. Start below the standard
+    # tracking setup's -0.1 because this term was absent from the old run and
+    # its observed scale is not available yet.
+    action_rate_l2:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:action_rate_l2
+      weight: -0.02
+    anti_shake_ang_vel:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:anti_shake_ang_vel_l2
+      weight: -0.01
+      params:
+        command_name: motion
+        threshold: 1.5
+        body_names:
+          - left_wrist_yaw_link
+          - right_wrist_yaw_link
+          - head_link
+
+    # Slow the approach, but stop penalizing wrist motion once a physical grasp
+    # is established so the policy can lift and retain the object.
+    approach_velocity_penalty:
+      weight: -15.0
+      params:
+        min_contacts: 4
+        disable_after_contact: true

@@ -22,6 +22,13 @@ num_envs: 4096
 ### Checkpoint logic
 auto_load_latest: False
 checkpoint: null
+# Resume modes:
+# - resume: continue in the checkpoint's original experiment directory.
+# - resume + fork_resume: restore the full optimizer/scheduler/trainer progress
+#   into the explicitly configured new experiment directory, while starting
+#   with fresh environment state (for example, after changing the dataset).
+resume: false
+fork_resume: false
 
 ### Naming and dir structure
 project_name: TEST

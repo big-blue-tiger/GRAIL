@@ -976,11 +976,154 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
         del self.time_encoder
         del self.denoiser
 
+        # Normalization is part of the stochastic policy definition used by
+        # PPO.  Collect rollout-level moments separately from the active
+        # normalizers so every action in a rollout and every PPO replay of that
+        # rollout see one immutable normalization snapshot.  The pending
+        # moments are committed once, after all PPO epochs, and therefore only
+        # affect the next rollout.
+        for prefix, dim in (
+            ("proprio", self.proprio_input_dim),
+            ("privileged", self.privileged_input_dim),
+            ("target", self.action_dim),
+        ):
+            self.register_buffer(
+                f"_pending_{prefix}_sum",
+                torch.zeros(dim, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"_pending_{prefix}_square_sum",
+                torch.zeros(dim, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"_pending_{prefix}_count",
+                torch.zeros((), dtype=torch.float32),
+                persistent=False,
+            )
+        self.register_buffer(
+            "normalizer_version",
+            torch.zeros((), dtype=torch.long),
+            persistent=False,
+        )
+
+    @torch.no_grad()
+    def reset_normalizer_collection(self):
+        """Discard pending moments without changing the active normalizers."""
+        for prefix in ("proprio", "privileged", "target"):
+            getattr(self, f"_pending_{prefix}_sum").zero_()
+            getattr(self, f"_pending_{prefix}_square_sum").zero_()
+            getattr(self, f"_pending_{prefix}_count").zero_()
+
+    def get_normalizer_update_counts(self):
+        """Return active normalizer counters for policy-version checks."""
+        return {
+            prefix: int(getattr(self, f"{prefix}_updates").item())
+            for prefix in ("proprio", "privileged", "target")
+        }
+
+    @torch.no_grad()
+    def _accumulate_normalizer_moments(self, value, prefix, feature_dim):
+        """Accumulate sufficient statistics while leaving policy state frozen."""
+        flat = value.detach().reshape(-1, feature_dim).float()
+        if flat.numel() == 0:
+            return
+        getattr(self, f"_pending_{prefix}_sum").add_(flat.sum(dim=0))
+        getattr(self, f"_pending_{prefix}_square_sum").add_(
+            torch.square(flat).sum(dim=0)
+        )
+        getattr(self, f"_pending_{prefix}_count").add_(float(flat.shape[0]))
+
+    @torch.no_grad()
+    def collect_normalizer_moments(self, obs_dict, target=None):
+        """Collect one shard of rollout moments without applying an update."""
+        proprio = self._flatten_observation(
+            obs_dict[self.proprio_key], self.proprio_input_dim, self.proprio_key
+        )
+        privileged = self._flatten_observation(
+            obs_dict[self.privileged_key], self.privileged_input_dim, self.privileged_key
+        )
+        if self.proprio_normalization == "standardize":
+            self._accumulate_normalizer_moments(
+                proprio, "proprio", self.proprio_input_dim
+            )
+        if self.privileged_normalization == "standardize":
+            self._accumulate_normalizer_moments(
+                privileged, "privileged", self.privileged_input_dim
+            )
+        if target is not None and self.target_normalization == "standardize":
+            self._accumulate_normalizer_moments(target, "target", self.action_dim)
+
+    @staticmethod
+    @torch.no_grad()
+    def _sync_pending_moments(sum_value, square_sum, count):
+        """All-reduce sufficient statistics so every rank commits one version."""
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(sum_value)
+            torch.distributed.all_reduce(square_sum)
+            torch.distributed.all_reduce(count)
+
+    @torch.no_grad()
+    def commit_normalizer_collection(self):
+        """Apply one EMA update from all collected rollout moments.
+
+        This method is called only after all PPO epochs for the corresponding
+        rollout.  Consequently the newly committed statistics become part of
+        the next rollout's policy version.
+        """
+        committed_counts = {}
+        committed_any = False
+        for prefix in ("proprio", "privileged", "target"):
+            sum_value = getattr(self, f"_pending_{prefix}_sum")
+            square_sum = getattr(self, f"_pending_{prefix}_square_sum")
+            count = getattr(self, f"_pending_{prefix}_count")
+            self._sync_pending_moments(sum_value, square_sum, count)
+            committed_counts[prefix] = float(count.item())
+            if count.item() <= 0:
+                continue
+            committed_any = True
+
+            batch_mean = sum_value / count
+            batch_var = (square_sum / count - torch.square(batch_mean)).clamp_min(
+                self.target_std_eps**2
+                if prefix == "target"
+                else getattr(self, f"{prefix}_std_eps") ** 2
+            )
+
+            if prefix == "target":
+                mean = self.target_mean
+                var = self.target_var
+                updates = self.target_updates
+                momentum = self.target_norm_momentum
+            else:
+                mean = getattr(self, f"{prefix}_mean")
+                var = getattr(self, f"{prefix}_var")
+                updates = getattr(self, f"{prefix}_updates")
+                momentum = getattr(self, f"{prefix}_norm_momentum")
+
+            if int(updates.item()) == 0:
+                mean.copy_(batch_mean.to(mean))
+                var.copy_(batch_var.to(var))
+            else:
+                mean.lerp_(batch_mean.to(mean), momentum)
+                var.lerp_(batch_var.to(var), momentum)
+            updates.add_(1)
+
+        if committed_any:
+            self.normalizer_version.add_(1)
+        self.reset_normalizer_collection()
+        return committed_counts
+
     def forward(self, input, compute_aux_loss=False, **kwargs):
         if not hasattr(input, "__getitem__"):
             raise TypeError("EncoderVectorMlpPolicy expects an obs_dict-like input")
 
-        cond = self._encode_condition(input, update_state_stats=compute_aux_loss)
+        # Active normalization buffers stay frozen throughout rollout
+        # collection and all PPO epochs.  Statistics from the first replay of
+        # the rollout are accumulated separately and committed at the
+        # iteration boundary by the trainer.
+        cond = self._encode_condition(input, update_state_stats=False)
         pred_normalized = self.action_head(cond)
         pred_action = self._denormalize_target(pred_normalized)
 
@@ -1029,8 +1172,6 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
             bc_loss = F.mse_loss(reconstructed_absolute, target)
             normalized_target = target
         else:
-            with torch.no_grad():
-                self._update_target_stats(target)
             normalized_target = self._normalize_target(target)
             bc_loss = F.mse_loss(pred_normalized, normalized_target)
 
@@ -1065,6 +1206,192 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
             "aux_losses": aux_losses,
             "aux_loss_coef": {"latent_bc_mse": self.bc_loss_coef},
         }
+
+
+class EncoderJointVectorMlpPolicy(EncoderVectorMlpPolicy):
+    """Direct-BC MLP over jointly normalized structured observations.
+
+    Unlike :class:`EncoderVectorMlpPolicy`, this policy does not encode the
+    proprioceptive and privileged groups independently.  It flattens both
+    groups, concatenates them, applies one per-feature EMA normalizer, and
+    feeds the resulting vector directly to the action MLP.
+
+    The normalizer is shared as a module/update operation, while retaining an
+    independent mean and variance for every concatenated input feature.
+    """
+
+    def __init__(self, *args, **kwargs):
+        module_config_dict = kwargs.get("module_config_dict") or {}
+        if not module_config_dict and len(args) >= 2 and args[1] is not None:
+            module_config_dict = args[1]
+        config = dict(module_config_dict)
+
+        super().__init__(*args, **kwargs)
+
+        # Remove the split feature extractors constructed by the parent.  The
+        # joint policy has no trainable branch before concatenation.
+        del self.proprio_encoder
+        del self.privileged_encoder
+        del self.action_head
+
+        self.joint_input_dim = self.proprio_input_dim + self.privileged_input_dim
+        self.joint_normalization = config.get(
+            "joint_normalization", config.get("observation_normalization", "standardize")
+        )
+        if self.joint_normalization not in ("none", "standardize"):
+            raise ValueError(
+                "Unsupported joint_normalization="
+                f"{self.joint_normalization}; expected 'none' or 'standardize'"
+            )
+        self.joint_norm_momentum = float(
+            config.get("joint_norm_momentum", config.get("observation_norm_momentum", 0.05))
+        )
+        self.joint_norm_clip = float(
+            config.get("joint_norm_clip", config.get("observation_norm_clip", 5.0))
+        )
+        self.joint_std_eps = float(
+            config.get("joint_std_eps", config.get("observation_std_eps", 1.0e-4))
+        )
+
+        # Drop the obsolete split-normalizer state so checkpoints describe the
+        # architecture unambiguously.
+        for name in (
+            "proprio_mean",
+            "proprio_var",
+            "proprio_updates",
+            "privileged_mean",
+            "privileged_var",
+            "privileged_updates",
+            "_pending_proprio_sum",
+            "_pending_proprio_square_sum",
+            "_pending_proprio_count",
+            "_pending_privileged_sum",
+            "_pending_privileged_square_sum",
+            "_pending_privileged_count",
+        ):
+            delattr(self, name)
+
+        self.register_buffer("joint_mean", torch.zeros(self.joint_input_dim))
+        self.register_buffer("joint_var", torch.ones(self.joint_input_dim))
+        self.register_buffer("joint_updates", torch.zeros((), dtype=torch.long))
+        self.register_buffer(
+            "_pending_joint_sum",
+            torch.zeros(self.joint_input_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_pending_joint_square_sum",
+            torch.zeros(self.joint_input_dim, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_pending_joint_count",
+            torch.zeros((), dtype=torch.float32),
+            persistent=False,
+        )
+
+        activation = config.get("activation", "SiLU")
+        self.action_head = _build_mlp(
+            self.joint_input_dim,
+            config.get("mlp_hidden_dims", [2048, 1800, 512]),
+            self.action_dim,
+            activation,
+        )
+
+    def _joint_observation(self, obs_dict):
+        for key in (self.proprio_key, self.privileged_key):
+            if key not in obs_dict:
+                raise KeyError(
+                    f"EncoderJointVectorMlpPolicy requires observation key '{key}'"
+                )
+        proprio = self._flatten_observation(
+            obs_dict[self.proprio_key], self.proprio_input_dim, self.proprio_key
+        )
+        privileged = self._flatten_observation(
+            obs_dict[self.privileged_key], self.privileged_input_dim, self.privileged_key
+        )
+        if proprio.shape[:-1] != privileged.shape[:-1]:
+            raise ValueError(
+                f"Observation batch shape mismatch: {self.proprio_key} has "
+                f"{proprio.shape[:-1]}, {self.privileged_key} has {privileged.shape[:-1]}"
+            )
+        return torch.cat([proprio, privileged], dim=-1)
+
+    def _normalize_joint_observation(self, observation):
+        if self.joint_normalization == "none":
+            return observation
+        mean = self.joint_mean.to(device=observation.device, dtype=observation.dtype)
+        std = self.joint_var.clamp_min(self.joint_std_eps**2).sqrt().to(
+            device=observation.device, dtype=observation.dtype
+        )
+        normalized = (observation - mean) / std
+        if self.joint_norm_clip > 0:
+            normalized = normalized.clamp(-self.joint_norm_clip, self.joint_norm_clip)
+        return normalized
+
+    def _encode_condition(self, obs_dict, update_state_stats=False):  # noqa: ARG002
+        return self._normalize_joint_observation(self._joint_observation(obs_dict))
+
+    @torch.no_grad()
+    def reset_normalizer_collection(self):
+        for prefix in ("joint", "target"):
+            getattr(self, f"_pending_{prefix}_sum").zero_()
+            getattr(self, f"_pending_{prefix}_square_sum").zero_()
+            getattr(self, f"_pending_{prefix}_count").zero_()
+
+    def get_normalizer_update_counts(self):
+        """Return counters for the joint-input and target normalizers."""
+        return {
+            prefix: int(getattr(self, f"{prefix}_updates").item())
+            for prefix in ("joint", "target")
+        }
+
+    @torch.no_grad()
+    def collect_normalizer_moments(self, obs_dict, target=None):
+        joint = self._joint_observation(obs_dict)
+        if self.joint_normalization == "standardize":
+            self._accumulate_normalizer_moments(
+                joint, "joint", self.joint_input_dim
+            )
+        if target is not None and self.target_normalization == "standardize":
+            self._accumulate_normalizer_moments(target, "target", self.action_dim)
+
+    @torch.no_grad()
+    def commit_normalizer_collection(self):
+        committed_counts = {}
+        committed_any = False
+        for prefix in ("joint", "target"):
+            sum_value = getattr(self, f"_pending_{prefix}_sum")
+            square_sum = getattr(self, f"_pending_{prefix}_square_sum")
+            count = getattr(self, f"_pending_{prefix}_count")
+            self._sync_pending_moments(sum_value, square_sum, count)
+            committed_counts[prefix] = float(count.item())
+            if count.item() <= 0:
+                continue
+            committed_any = True
+
+            batch_mean = sum_value / count
+            eps = self.target_std_eps if prefix == "target" else self.joint_std_eps
+            batch_var = (square_sum / count - torch.square(batch_mean)).clamp_min(eps**2)
+            if prefix == "target":
+                mean, var, updates = self.target_mean, self.target_var, self.target_updates
+                momentum = self.target_norm_momentum
+            else:
+                mean, var, updates = self.joint_mean, self.joint_var, self.joint_updates
+                momentum = self.joint_norm_momentum
+
+            if int(updates.item()) == 0:
+                mean.copy_(batch_mean.to(mean))
+                var.copy_(batch_var.to(var))
+            else:
+                mean.lerp_(batch_mean.to(mean), momentum)
+                var.lerp_(batch_var.to(var), momentum)
+            updates.add_(1)
+
+        if committed_any:
+            self.normalizer_version.add_(1)
+        self.reset_normalizer_collection()
+        return committed_counts
 
 
 class EncoderVectorTransformerFlowPolicy(EncoderVectorDiffusionPolicy):

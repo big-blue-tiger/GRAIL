@@ -14,23 +14,81 @@ experiment_name: ${exp_base}_${exp_var}
 manager_env:
   config:
     gpu_collision_stack_size_exp: 30
+  rewards:
+    # Remove all reference-motion tracking signals. Null (instead of weight 0)
+    # keeps these terms out of RewardManager's active term set entirely.
+    tracking_anchor_pos: null
+    tracking_anchor_ori: null
+    tracking_relative_body_pos: null
+    tracking_relative_body_ori: null
+    tracking_body_linvel: null
+    tracking_body_angvel: null
+    object_tracking_reward: null
+
+    # Make contact achievable first, then reward a sustained multi-finger grasp.
+    # Ungating this term removes its dependency on reference-motion contact time.
+    grasp_reward:
+      weight: 10.0
+      params:
+        gate_with_contact_label: false
+        hand: right_hand
+        command_name: motion
+        min_contacts: 4
+    grasp_finger_direction:
+      # Keep this as a weak geometric hint while physical contact stays primary.
+      weight: 2.0
+      params:
+        use_contact_center: true
+
+    # Exclude the two discrete finger primitive dimensions from smoothing.
+    meta_action_rate_l2:
+      weight: -1.0
+      params:
+        token_only: true
+
+    # Direct-latent, non-delta execution does not update this term's history.
+    full_latent_rate_l2: null
+
+    # Smooth the decoded joint command directly.
+    action_rate_l2:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:action_rate_l2
+      weight: -0.02
+    anti_shake_ang_vel:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:anti_shake_ang_vel_l2
+      weight: -0.01
+      params:
+        command_name: motion
+        threshold: 1.5
+        body_names:
+          - left_wrist_yaw_link
+          - right_wrist_yaw_link
+          - head_link
+
+    # Stop penalizing wrist motion after a stable physical grasp is established.
+    approach_velocity_penalty:
+      weight: -15.0
+      params:
+        min_contacts: 4
+        disable_after_contact: true
 algo:
   config:
     # Parameterize policy noise as log(std), ensuring std = exp(log_std) > 0.
     use_log_std: true
     # Complementary PPO + behavior-cloning objective:
-    #   lambda_bc(k)  = max(0.1, 1 - k / 10000)
+    #   lambda_bc(k)  = max(0.2, 1 - k / 10000)
     #   lambda_ppo(k) = 1 - lambda_bc(k)
     # The static coefficients below are replaced while this schedule is enabled.
     ppo_loss_coef: 0.0
     distill_teacher_loss_coef: 0.0
     compute_aux_loss: true
     aux_loss_scale: 1.0
-    num_learning_epochs: 2
+    num_learning_epochs: 3
     gamma: 0.99
     lam: 0.95
     num_steps_per_env: 24
-    actor_learning_rate: 3.0e-4
+    actor_learning_rate: 2.0e-4
     entropy_coef: 0.001
     desired_kl: 0.01
     init_noise_std: 0.01
@@ -42,8 +100,8 @@ algo:
     distill_rollout_with_action_mean: false
     ppo_bc_loss_schedule:
       enabled: true
-      bc_min_coef: 0.1
-      # lambda_bc(k) = max(0.1, 1 - k / 10000)
+      bc_min_coef: 0.2
+      # lambda_bc(k) = max(0.2, 1 - k / 10000)
       end_iteration: 5000
       # Keep LR fixed before this iteration, then enable desired-KL adaptation.
       adaptive_after_iteration: 1000

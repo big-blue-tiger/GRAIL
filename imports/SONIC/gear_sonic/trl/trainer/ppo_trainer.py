@@ -384,6 +384,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         checkpoint=None,
         resume=False,
         warm_resume=False,
+        restore_env_state=True,
         flexible_load=False,
         local_seed=None,
         schedule_dict=None,
@@ -413,6 +414,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             checkpoint: Path to a checkpoint file to load on init.
             resume: If True and *checkpoint* is provided, also restore optimizer,
                 scheduler, and trainer state for full training resumption.
+            restore_env_state: Restore the checkpointed environment state during
+                a full resume. Disable this when resuming onto a new dataset.
             local_seed: Per-process random seed for reproducibility under DDP.
             schedule_dict: Dict defining parameter schedules over training steps.
             accelerator: HuggingFace ``Accelerator`` instance for distributed training.
@@ -449,6 +452,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 checkpoint,
                 resume=resume,
                 warm_resume=warm_resume,
+                restore_env_state=restore_env_state,
                 flexible_load=flexible_load,
             )
 
@@ -954,7 +958,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         # Iteration-level DAgger mixing is opt-in so legacy DAgger experiments that
         # do not use the residual/direct-latent wrapper keep their old rollout.
         self.dagger_mixed_rollout = bool(
-            self.config.get("use_dagger", False) and "dagger_rollout_mode" in self.config
+            self.config.get("use_dagger", False)
+            and "dagger_rollout_mode" in self.config
+            and float(self.config.get("dagger_student_ratio", 0.5)) < 1.0
         )
         self.dagger_rollout_mode = self.config.get("dagger_rollout_mode", "fixed")
         self.dagger_student_ratio = float(self.config.get("dagger_student_ratio", 0.5))
@@ -1634,19 +1640,21 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         student_ratio = 1.0
         is_teacher_env = None
         if self.dagger_mixed_rollout:
-            teacher_model = self.ref_model
-            teacher_model.eval()
-            teacher_model.init_rollout()
             student_ratio = self._get_dagger_student_ratio()
-            # _rollout_step is called once per training iteration. Sample the
-            # Teacher/Student environment membership here so every step in this
-            # iteration uses the same split.
             is_teacher_env = self._sample_dagger_teacher_mask(
                 self.num_envs, student_ratio, device
             )
+
             self._last_dagger_student_ratio = student_ratio
             self._last_dagger_num_teacher = int(is_teacher_env.sum().item())
-            self._last_dagger_num_student = self.num_envs - self._last_dagger_num_teacher
+            self._last_dagger_num_student = (
+                self.num_envs - self._last_dagger_num_teacher
+            )
+
+            if self._last_dagger_num_teacher > 0:
+                teacher_model = self.ref_model
+                teacher_model.eval()
+                teacher_model.init_rollout()
         self.storage.clear()
 
         dones = torch.zeros(self.env.num_envs, device=device)
@@ -2092,18 +2100,24 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         if needs_teacher:
             self.ref_model.eval()
             with torch.no_grad():
-                teacher_model_obs_dict = {
-                    key: value
-                    for key, value in mb_teacher_obs_dict.items()
-                    if key != "reference_hand_actions"
-                }
                 teacher_results = self.ref_model.act(
-                    obs_dict=teacher_model_obs_dict, episode_attnmask=episode_attnmask
+                    obs_dict=mb_teacher_obs_dict, episode_attnmask=episode_attnmask
                 )
                 if self.decoder_distill:
                     diffusion_target = self._build_diffusion_decoder_target(
                         mb_teacher_obs_dict, teacher_results["action_mean"]
                     )
+
+        # Normalizer buffers are part of the PPO policy version.  Accumulate
+        # sufficient statistics from exactly one replay of this rollout, but
+        # do not mutate the active statistics used to compute new log-probs.
+        # The training loop commits these moments only after every PPO epoch,
+        # so they first take effect in the next rollout.
+        if getattr(self, "_collect_rollout_normalizer_stats", False):
+            actor_module = getattr(self.policy_model, "actor_module", None)
+            collect_moments = getattr(actor_module, "collect_normalizer_moments", None)
+            if collect_moments is not None:
+                collect_moments(mb_obs_dict, diffusion_target)
 
         # We should only do one forward pass for especially DDP model
         if self.compute_imgaug_bc_loss:
@@ -3068,10 +3082,35 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         for obs_key in obs_dict.keys():  # noqa: SIM118
             obs_dict[obs_key] = obs_dict[obs_key].to(device)
 
+        actor_module = getattr(self.policy_model, "actor_module", None)
+        reset_normalizer_collection = getattr(
+            actor_module, "reset_normalizer_collection", None
+        )
+        commit_normalizer_collection = getattr(
+            actor_module, "commit_normalizer_collection", None
+        )
+        get_normalizer_update_counts = getattr(
+            actor_module, "get_normalizer_update_counts", None
+        )
+        has_rollout_normalizer_collection = (
+            reset_normalizer_collection is not None
+            and commit_normalizer_collection is not None
+            and get_normalizer_update_counts is not None
+            and getattr(actor_module, "collect_normalizer_moments", None) is not None
+        )
+        self._collect_rollout_normalizer_stats = False
+        self._last_normalizer_commit_counts = {}
+
         for batch_idx in range(1, args.num_total_batches + 1):
             batch_start_time = time.time()
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)  # noqa: F841
+
+            if has_rollout_normalizer_collection:
+                # Clear only pending moments.  Active normalizer buffers stay
+                # unchanged from here through rollout and every PPO epoch.
+                reset_normalizer_collection()
+                rollout_normalizer_update_counts = get_normalizer_update_counts()
 
             # update scheduled params
             if self.schedule_dict is not None:
@@ -3105,6 +3144,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 self._train_mode()
             with common.Timer("ppo_training"):
                 for ppo_epoch_idx in range(args.num_ppo_epochs):
+                    self._collect_rollout_normalizer_stats = (
+                        has_rollout_normalizer_collection and ppo_epoch_idx == 0
+                    )
                     minibatch_idx = 0
                     if self.ppo_shuffle_every_epoch or ppo_epoch_idx == 0:
                         b_inds = torch.randperm(args.local_batch_size, device=device)
@@ -3194,6 +3236,18 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                     #     # print(f"Empty cache at ppo_epoch_idx {ppo_epoch_idx}")
                     #     gc.collect()
                     #     torch.cuda.empty_cache()
+                self._collect_rollout_normalizer_stats = False
+
+            if has_rollout_normalizer_collection:
+                # One EMA update per rollout, after all PPO replays.  The new
+                # statistics therefore belong to the next policy version and
+                # cannot perturb this rollout's importance ratios or KL.
+                if get_normalizer_update_counts() != rollout_normalizer_update_counts:
+                    raise RuntimeError(
+                        "Policy normalizer changed between rollout collection and the end "
+                        "of PPO epochs"
+                    )
+                self._last_normalizer_commit_counts = commit_normalizer_collection()
             ######################################################### Sync Running Mean Std #########################################################  # noqa: E501
             with common.Timer("sync_running_mean_std"):
                 self.sync_running_mean_std()
@@ -3289,6 +3343,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                         )
                 else:
                     metrics["Policy/mean_noise_std"] = 0.0
+                if has_rollout_normalizer_collection:
+                    metrics["Policy/normalizer_version"] = int(
+                        actor_module.normalizer_version.item()
+                    )
+                    for prefix, count in self._last_normalizer_commit_counts.items():
+                        metrics[f"Policy/normalizer_{prefix}_samples"] = count
                 self.append_to_log_dict(log_dict)
                 metrics.update({f"Env/{k}": v for k, v in env_log_dict.items()})
                 metrics.update(env_log_dict)
@@ -3559,7 +3619,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             param_group["lr"] = self.args.learning_rate
 
     def load_checkpoint(
-        self, checkpoint_path, resume=False, warm_resume=False, flexible_load=False
+        self,
+        checkpoint_path,
+        resume=False,
+        warm_resume=False,
+        restore_env_state=True,
+        flexible_load=False,
     ):  # noqa: D417
         """Load a checkpoint to restore model weights and optionally full training state.
 
@@ -3572,6 +3637,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 counters (global_step, max_steps, etc.) so training starts fresh
                 in a new experiment_dir without tripping HF's
                 ``DefaultFlowCallback.on_step_end`` early-stop.
+            restore_env_state: Whether to restore checkpointed environment state
+                during a full resume. Trainer counters and schedules are restored
+                regardless of this setting.
             flexible_load: Reserved for future use; ignored in this build.
 
         Returns:
@@ -3613,7 +3681,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             ):
                 self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
 
-            if "env_state_dict" in checkpoint:
+            if restore_env_state and "env_state_dict" in checkpoint:
                 self.env.load_env_state_dict(checkpoint["env_state_dict"])
 
             if "state" in checkpoint:

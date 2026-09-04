@@ -1,0 +1,31 @@
+# @package _global_
+#
+# Direct-concatenation MLP student with a single per-feature EMA normalizer.
+# All task, trainer, teacher, decoder-distillation, and observation settings
+# inherit from the split-encoder MLP experiment.
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs
+  - _self_
+
+exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_ema
+experiment_name: ${exp_base}_${exp_var}
+
+algo:
+  config:
+    actor:
+      backbone:
+        _target_: gear_sonic.trl.modules.diffusion_policy_modules.EncoderJointVectorMlpPolicy
+        module_config_dict:
+          # flatten(proprio_obs): 805, privileged_obs: 48, joint input: 853.
+          # This width keeps the trainable parameter count within 0.012% of
+          # the inherited split-encoder student.
+          mlp_hidden_dims: [2048, 2048, 512]
+          joint_normalization: standardize
+
+    use_clampped_std: true
+    std_clamp_min: 0.001
+    std_clamp_max: 0.5
+    max_grad_norm: 0.1
+    num_mini_batches: 16
+    actor_learning_rate: 2.0e-5

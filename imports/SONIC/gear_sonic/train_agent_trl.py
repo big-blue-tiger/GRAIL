@@ -73,9 +73,10 @@ register_rl_resolvers()
 def resume_training(config):
     if config.get("checkpoint", None) is not None:
         last_existing_checkpoint = config.checkpoint
-        # Warm-resume: if checkpoint and experiment_dir point to different paths,
-        # load weights + optimizer state from the checkpoint but keep the
-        # explicit experiment_dir (fresh wandb run, fresh output dir).
+        # A checkpoint in another directory can either start a fresh schedule
+        # (warm resume), or continue the full training schedule in a new output
+        # directory (fork resume). Fork resume deliberately does not restore
+        # environment state, so it is safe to switch motion datasets.
         explicit_dir = config.get("experiment_dir", None)
         if explicit_dir is not None and os.path.abspath(explicit_dir) != os.path.abspath(
             os.path.dirname(last_existing_checkpoint)
@@ -84,10 +85,18 @@ def resume_training(config):
 
             with open_dict(config):
                 config.checkpoint = last_existing_checkpoint
-                config.warm_resume = True
+                if config.get("fork_resume", False):
+                    config.warm_resume = False
+                else:
+                    config.warm_resume = True
+            resume_mode = (
+                "Fork-resuming full training state"
+                if config.get("fork_resume", False)
+                else "Warm-resuming (weights + optimizer)"
+            )
             print(
-                f"Warm-resuming (weights + optimizer) from {last_existing_checkpoint} "
-                f"into new experiment_dir {explicit_dir}"
+                f"{resume_mode} from {last_existing_checkpoint} into new "
+                f"experiment_dir {explicit_dir}"
             )
             return
     elif config.get("experiment_dir", None) is not None:
@@ -565,6 +574,7 @@ def main(config: OmegaConf):
         checkpoint=config.checkpoint,
         resume=config.get("resume", False),
         warm_resume=config.get("warm_resume", False),
+        restore_env_state=not config.get("fork_resume", False),
         flexible_load=config.get("flexible_load", False),
         local_seed=config.seed,
         log_dir=experiment_save_dir,
