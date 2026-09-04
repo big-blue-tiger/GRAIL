@@ -30,7 +30,7 @@ python gear_sonic/train_agent_trl.py \
 
 
 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_transformer_flow_chunk40_decoder_latent_vector_obs_linear_dagger \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
   headless=False \
   num_envs=8
   

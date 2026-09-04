@@ -333,10 +333,6 @@ algo:
           privileged_input_dim: 48
           privileged_feature_dim: 512
           privileged_hidden_dims: [512]
-          observation_normalization: standardize
-          observation_norm_momentum: 0.05
-          observation_norm_clip: 5.0
-          observation_std_eps: 1.0e-4
 
           output_dim: [robot_action_dim]
           cond_dim: 1024

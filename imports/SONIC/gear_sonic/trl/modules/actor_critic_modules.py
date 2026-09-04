@@ -635,22 +635,6 @@ class Actor(nn.Module):
         self.obs_dict_buffer = TensorDict()
         self.dones_buffer = None
         self.steps = 0
-        Actor.clear_forward_state(self)
-
-    def clear_forward_state(self):
-        """Release tensors cached by the most recent policy forward.
-
-        The Normal distribution and auxiliary losses can reference a complete
-        autograd graph, including non-reentrant gradient-checkpoint state. They
-        are only needed until the current optimizer/statistics step finishes.
-        """
-        # Keep lifecycle state present so repeated init/clear cycles are
-        # idempotent.  Deleting these attributes made the second DAgger
-        # rollout fail when the frozen Teacher did not produce aux losses.
-        self.distribution = None
-        if self.has_aux_loss:
-            self.aux_losses = None
-            self.aux_loss_coef = None
 
     def eval_mode(self):
         self.is_eval_mode = True

@@ -1,6 +1,6 @@
 # @package _global_
 #
-# Direct-concatenation MLP student with a single per-feature EMA normalizer.
+# Direct-concatenation MLP student over raw structured observations.
 # All task, trainer, teacher, decoder-distillation, and observation settings
 # inherit from the split-encoder MLP experiment.
 
@@ -21,7 +21,6 @@ algo:
           # This width keeps the trainable parameter count within 0.012% of
           # the inherited split-encoder student.
           mlp_hidden_dims: [2048, 2048, 512]
-          joint_normalization: standardize
 
     use_clampped_std: true
     std_clamp_min: 0.001
