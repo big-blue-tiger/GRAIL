@@ -9,7 +9,6 @@ from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.envs.manager_env.mdp import commands, utils
 from gear_sonic.trl.utils import torch_transform
 from gear_sonic.utils.action_history import zero_actions_at_episode_start
-from gear_sonic.utils.relative_kinematics import relative_twist_at_target_origin_w
 from isaaclab.utils.math import (
     matrix_from_quat,
     quat_apply,
@@ -185,21 +184,6 @@ class StudentPrivilegedCfg(ObsGroup):
     object_ori_b_6d = None
     hand_object_transform_6d = None
     hand_object_contact_force_magnitude = None
-
-
-@configclass
-class StudentPrivilegedHistoryCfg(ObsGroup):
-    """Five-frame 60D task state used only by the opt-in history experiment."""
-
-    object_bps = None
-    table_corners_b = None
-    object_pos_b = None
-    object_ori_b_6d = None
-    palm_object_transform_6d = None
-    hand_object_contact_force_magnitude = None
-    object_lin_vel_b = None
-    object_ang_vel_b = None
-    object_hand_rel_vel = None
 
 
 @configclass
@@ -1186,66 +1170,6 @@ def object_ori_b_6d(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
 
     mat = matrix_from_quat(ori_b)
     return mat[..., :2].reshape(mat.shape[0], -1)  # (num_envs, 6)
-
-
-def _object_twist_relative_to_robot_body(
-    env: ManagerBasedEnv,
-    command_name: str,
-    body_index: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the live object's relative twist in a robot body's local axes."""
-    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-    object_asset = utils.get_active_object(env)
-    robot = command.robot
-    frame_quat_w = robot.data.body_quat_w[:, body_index]
-    relative_lin_vel_w, relative_ang_vel_w = relative_twist_at_target_origin_w(
-        frame_pos_w=robot.data.body_pos_w[:, body_index],
-        frame_lin_vel_w=robot.data.body_lin_vel_w[:, body_index],
-        frame_ang_vel_w=robot.data.body_ang_vel_w[:, body_index],
-        target_pos_w=object_asset.data.root_pos_w,
-        target_lin_vel_w=object_asset.data.root_lin_vel_w,
-        target_ang_vel_w=object_asset.data.root_ang_vel_w,
-    )
-    return (
-        quat_apply_inverse(frame_quat_w, relative_lin_vel_w),
-        quat_apply_inverse(frame_quat_w, relative_ang_vel_w),
-    )
-
-
-def object_lin_vel_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    """Object linear velocity relative to the pelvis, in pelvis axes."""
-    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-    relative_lin_vel_b, _ = _object_twist_relative_to_robot_body(
-        env, command_name, command.robot_anchor_body_index
-    )
-    return relative_lin_vel_b
-
-
-def object_ang_vel_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
-    """Object angular velocity relative to the pelvis, in pelvis axes."""
-    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-    _, relative_ang_vel_b = _object_twist_relative_to_robot_body(
-        env, command_name, command.robot_anchor_body_index
-    )
-    return relative_ang_vel_b
-
-
-def object_hand_rel_vel(
-    env: ManagerBasedEnv,
-    command_name: str,
-    hand_asset_cfg: SceneEntityCfg,
-) -> torch.Tensor:
-    """Object-vs-palm linear and angular velocity in right-palm axes."""
-    body_ids = hand_asset_cfg.body_ids
-    if isinstance(body_ids, slice) or len(body_ids) != 1:
-        raise ValueError(
-            "object_hand_rel_vel requires exactly one rigid hand frame, "
-            f"got body_ids={body_ids}"
-        )
-    relative_lin_vel_h, relative_ang_vel_h = _object_twist_relative_to_robot_body(
-        env, command_name, int(body_ids[0])
-    )
-    return torch.cat([relative_lin_vel_h, relative_ang_vel_h], dim=-1)
 
 
 def object_pos_b_multi_future(
@@ -2593,13 +2517,12 @@ def last_action_wo_hand(env: ManagerBasedEnv, asset_cfg) -> torch.Tensor:
 
 
 def last_meta_action(env: ManagerBasedEnv) -> torch.Tensor:
-    """Get the previous policy-space meta action.
+    """Get last meta action (policy output: latent residual + finger primitives).
 
     This returns the policy's output from the previous step, not the joint-level
-    actions applied to the simulation.  In the opt-in delta-command experiment
-    it is the effective change after hand-bound projection; legacy experiments
-    retain their existing absolute/residual semantics.  Its layout is:
-    - 64 dims: latent command or latent change (tokenizer space)
+    actions that were applied to the simulation. For a student policy using
+    latent residual mode, this is typically:
+    - 64 dims: latent residual (tokenizer space)
     - 2 dims: finger primitive actions (left + right hand)
     Total: 66 dims
 
@@ -3099,27 +3022,6 @@ def hand_object_transform_6d(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) ->
     ori_6d = mat[..., :2].reshape(mat.shape[0], -1)  # (num_envs, 6)
 
     return torch.cat([object_pos_in_hand, ori_6d], dim=-1)  # (num_envs, 9)
-
-
-def palm_object_transform_6d(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Object pose in one stable rigid palm frame as position plus 6D rotation."""
-    transformer = env.scene[asset_cfg.name]
-    target_pos_in_obj = transformer.data.target_pos_source
-    target_quat_in_obj = transformer.data.target_quat_source
-    if target_pos_in_obj.shape[1] != 1 or target_quat_in_obj.shape[1] != 1:
-        raise ValueError(
-            "palm_object_transform_6d requires exactly one FrameTransformer target; "
-            f"got positions {tuple(target_pos_in_obj.shape)} and "
-            f"orientations {tuple(target_quat_in_obj.shape)}"
-        )
-
-    palm_pos_in_obj = target_pos_in_obj[:, 0]
-    palm_quat_in_obj = target_quat_in_obj[:, 0]
-    object_pos_in_palm = quat_apply(quat_inv(palm_quat_in_obj), -palm_pos_in_obj)
-    object_quat_in_palm = quat_inv(palm_quat_in_obj)
-    mat = matrix_from_quat(object_quat_in_palm)
-    ori_6d = mat[..., :2].reshape(mat.shape[0], -1)
-    return torch.cat([object_pos_in_palm, ori_6d], dim=-1)
 
 
 def get_finger_tips_contact_force(env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:

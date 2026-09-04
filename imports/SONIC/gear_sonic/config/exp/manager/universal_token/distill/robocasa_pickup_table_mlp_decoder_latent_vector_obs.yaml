@@ -113,8 +113,8 @@ algo:
     dagger_student_ratio_increment: 0.0
     decoder_distill: true
     # Supervise the direct-latent MLP in the same continuous space in which it
-    # executes and, for delta variants, accumulates commands.  The Teacher
-    # target is encoder latent + scaled residual immediately before FSQ.
+    # executes. The Teacher target is encoder latent + scaled residual
+    # immediately before FSQ.
     target_latent_mode: pre_quantization
     # These keys only control the terminal table. All metrics are still sent
     # to the configured experiment tracker regardless of this allowlist.

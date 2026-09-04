@@ -928,33 +928,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.diffusion_hand_target_source = self.config.get(
             "diffusion_hand_target_source", "teacher_policy"
         )
-        self.student_delta_action = bool(self.env.config.get("student_delta_action", False))
-        self.previous_absolute_action_key = "previous_absolute_meta_action"
         if self.diffusion_hand_target_source not in {"teacher_policy", "reference_motion"}:
             raise ValueError(
                 "diffusion_hand_target_source must be 'teacher_policy' or 'reference_motion', "
                 f"got {self.diffusion_hand_target_source!r}"
             )
-        if self.student_delta_action:
-            if not self.decoder_distill:
-                raise ValueError("student_delta_action requires decoder_distill=true")
-            if not self.env.config.get("use_student_direct_latent", False):
-                raise ValueError("student_delta_action requires use_student_direct_latent=true")
-            if self.num_act != self.diffusion_latent_dim + self.diffusion_hand_dim:
-                raise ValueError(
-                    "student_delta_action dimensions must match latent plus hand dimensions; "
-                    f"got {self.num_act}, {self.diffusion_latent_dim}, {self.diffusion_hand_dim}"
-                )
-            actor_module = getattr(self.policy_model, "actor_module", None)
-            if not getattr(actor_module, "student_delta_action", False):
-                raise ValueError(
-                    "student_delta_action requires an opt-in delta-aware policy backbone"
-                )
-            if getattr(actor_module, "target_normalization", None) != "none":
-                raise ValueError(
-                    "student_delta_action raw absolute BC requires target_normalization='none'"
-                )
-
         # Iteration-level DAgger mixing is opt-in so legacy DAgger experiments that
         # do not use the residual/direct-latent wrapper keep their old rollout.
         self.dagger_mixed_rollout = bool(
@@ -1075,13 +1053,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.storage.register_key("actions_log_prob", shape=(1,), dtype=torch.float)
         self.storage.register_key("action_mean", shape=(self.num_act,), dtype=torch.float)
         self.storage.register_key("action_sigma", shape=(self.num_act,), dtype=torch.float)
-        if getattr(self, "student_delta_action", False):
-            self.storage.register_key(
-                self.previous_absolute_action_key,
-                shape=(self.num_act,),
-                dtype=torch.float,
-            )
-
         if self.learn_normalized_actions:
             self.storage.register_key(
                 "normalized_actions", shape=(self.num_act,), dtype=torch.float
@@ -1660,11 +1631,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         dones = torch.zeros(self.env.num_envs, device=device)
         with torch.no_grad():
             for i in range(self.num_steps_per_env):  # noqa: B007
-                previous_absolute_meta_action = None
-                if getattr(self, "student_delta_action", False):
-                    previous_absolute_meta_action = (
-                        self.env.get_previous_absolute_meta_action().to(device)
-                    )
                 # Compute the actions and values
                 # TODO: 1: unsqueeze to [B, 1, ...]  # noqa: TD002, TD003
                 policy_state_dict = self.policy_step(policy_model, obs_dict, cur_dones=dones)
@@ -1714,11 +1680,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                             self.storage.register_key(key, shape=value.shape[1:], dtype=torch.float)
                     self.storage.update_key(key, value)
                 self._store_clean_teacher_obs(clean_obs_dict)
-                if previous_absolute_meta_action is not None:
-                    self.storage.update_key(
-                        self.previous_absolute_action_key,
-                        previous_absolute_meta_action,
-                    )
                 for key, value in policy_state_dict.items():
                     if key == "obs_dict":
                         continue
@@ -2011,10 +1972,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             "padding_mask": padding_mask,
             "padding_mask_p1": padding_mask_p1,
         }
-        if getattr(self, "student_delta_action", False):
-            rollout_data[self.previous_absolute_action_key] = self.storage.query_key(
-                self.previous_absolute_action_key
-            ).transpose(0, 1).to(device)
         if self.use_symmetry:
             rollout_data["next_critic_obs"] = next_critic_obs
         return rollout_data
@@ -2068,10 +2025,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             "mb_padding_mask_p1": mb_padding_mask_p1,
             "episode_attnmask": episode_attnmask,
         }
-        if getattr(self, "student_delta_action", False):
-            mb_rollout_data[self.previous_absolute_action_key] = rollout_data[
-                self.previous_absolute_action_key
-            ][micro_batch_inds]
         if self.use_symmetry:
             mb_next_critic_obs = rollout_data["next_critic_obs"][micro_batch_inds]
             mb_rollout_data["mb_next_critic_obs"] = mb_next_critic_obs
@@ -2128,10 +2081,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             }
             if diffusion_target is not None:
                 policy_kwargs[self.diffusion_target_key] = diffusion_target
-            if getattr(self, "student_delta_action", False):
-                policy_kwargs[self.previous_absolute_action_key] = mb_rollout_data[
-                    self.previous_absolute_action_key
-                ]
             results = model.forward(
                 modes=["policy_w_and_wo_imgaug", "value"],
                 input_kwargs={
@@ -2149,10 +2098,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 }
                 if diffusion_target is not None:
                     policy_kwargs[self.diffusion_target_key] = diffusion_target
-                if getattr(self, "student_delta_action", False):
-                    policy_kwargs[self.previous_absolute_action_key] = mb_rollout_data[
-                        self.previous_absolute_action_key
-                    ]
                 results = model.forward(
                     modes=["policy", "value"],
                     input_kwargs={
