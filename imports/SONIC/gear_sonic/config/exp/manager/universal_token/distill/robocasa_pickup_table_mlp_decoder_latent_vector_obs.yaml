@@ -1,22 +1,150 @@
 # @package _global_
 #
-# Direct behavior-cloning student for the complete pickup_table motion set.
-# The condition encoders are shared with the vector diffusion experiment, but
-# the student predicts the decoder action directly with an independent MLP
-# action head.
+# Self-contained direct behavior-cloning student for the complete pickup_table
+# motion set. Keep the component defaults below, but define all experiment-level
+# settings here so changes to other distillation experiments cannot alter this
+# experiment through a deep inheritance chain.
 
 defaults:
-  - /exp/manager/universal_token/distill/robocasa_pickup_table_diffusion_decoder_latent_vector_obs
+  - /algo: ppo_im_phc
+  - /manager_env: base_env
+  - /callbacks/read_eval
+  - /manager_env/observations/camera_rgb: base
+  - /manager_env/observations/proprio_obs: robocasa_history
+  - /manager_env/observations/privileged_obs: robocasa_object_state
+  - override /trainer: trl_ppo_aux
+  - override /actor_critic: camera_cnn_distill
+  - override /manager_env/observations/policy: hoi_manip/grab_43dof_policy_mf_delta_bps
+  - override /manager_env/observations/critic: hoi_manip/grab_43dof_critic_mf_delta
+  - override /manager_env/observations/policy_atm: proprio_hist
+  - override /manager_env/observations/tokenizer: unitoken_all_noz_heading
+  - override /manager_env/rewards: hoi_manip/grab_rewards_no_lift_ucw
+  - override /manager_env/events: tracking/no_dr
+  - override /manager_env/terminations: tracking/hoi_grab_no_lift
   - _self_
 
+use_manager_env: true
+
+exp_base: ${hydra:runtime.choices.exp}
 exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs
 experiment_name: ${exp_base}_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 16
+project_name: GRAB_Tracking
+motion_shard_by_rank: true
+
+actor_prop_history_length: 10
+actor_actions_history_length: 10
+critic_prop_history_length: 10
+critic_actions_history_length: 10
+
 manager_env:
+  observations:
+    # This structured-state experiment does not request an ego camera.
+    camera_rgb: null
+
   config:
+    safe_nan: true
     gpu_collision_stack_size_exp: 30
+    robot:
+      type: g1_43dof
+    terrain_type: plane
+    env_spacing: 10.0
+    eval_camera_offset: [2, -2, 1]
+    replicate_physics: false
+    enable_cameras: false
+    camera_resolution: null
+    cameras: null
+    render_ego: false
+    render_results: false
+    overview_camera: false
+
+    add_object: true
+    object_is_dynamic: true
+    add_table: true
+    object_mass: 0.1
+    lift_contact_force_threshold: 0.1
+    scene_scale: null
+    table_size: [2.0, 0.6, 0.04]
+    object_usd_path: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/object_usd
+    multi_object_per_env: false
+
+    use_motion_hand_actions: false
+    teacher_use_motion_hand_actions: true
+    student_use_motion_hand_actions: false
+    use_finger_primitive: true
+    motion_meta_info_path: null
+    contact_sensor_finger_links:
+      - right_hand_palm_link
+      - right_hand_thumb_0_link
+      - right_hand_thumb_1_link
+      - right_hand_thumb_2_link
+      - right_hand_index_0_link
+      - right_hand_index_1_link
+      - right_hand_middle_0_link
+      - right_hand_middle_1_link
+    train_only_events:
+      - push_robot
+      - force_push_robot
+
+    use_latent_residual: true
+    latent_residual_mode: pre_quantization
+    latent_residual_scale: 0.1
+    use_student_direct_latent: true
+    meta_action_dim: 66
+    tokenizer_action_dim: 64
+    hand_action_dim: 2
+    finger_primitive:
+      primitive_action_map:
+        left:
+          dof_names: [left_hand_index_0_joint, left_hand_index_1_joint, left_hand_middle_0_joint, left_hand_middle_1_joint, left_hand_thumb_0_joint, left_hand_thumb_1_joint, left_hand_thumb_2_joint]
+          pos_0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+          pos_1: [-1.42857143, -2.14285714, -1.42857143, -2.14285714, 0.0, 1.0, 1.0]
+          discrete: true
+        right:
+          dof_names: [right_hand_index_0_joint, right_hand_index_1_joint, right_hand_middle_0_joint, right_hand_middle_1_joint, right_hand_thumb_0_joint, right_hand_thumb_1_joint, right_hand_thumb_2_joint]
+          pos_0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+          pos_1: [1.42857143, 2.14285714, 1.42857143, 2.14285714, 0.0, -1.0, -1.0]
+          discrete: true
+
+    action_transform_module_cfg: models/sonic_manipulation_base/model_config.yaml
+    action_transform_module_checkpoint: models/sonic_manipulation_base/last.pt
+    freeze_action_transform_module: true
+    use_staged_wrapper: false
+
+  commands:
+    motion:
+      motion_lib_num_dof: 29
+      hand_default_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      num_future_frames: 10
+      dt_future_ref_frames: 0.1
+      smpl_num_future_frames: 10
+      smpl_dt_future_ref_frames: 0.02
+      debug_vis: false
+      use_paired_motions: true
+      start_from_first_frame: false
+      sample_before_contact: true
+      sample_from_n_initial_frames: 30
+      object_position_randomize: false
+      encoder_sample_probs:
+        g1: 1.0
+        teleop: 0.0
+        smpl: 0.0
+      filter_motion_keys: null
+      motion_lib_cfg:
+        motion_file: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/robot
+        object_motion_file: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/objects
+        bps_dir: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table/bps
+        filter_motion_keys: null
+        max_unique_motions: null
+        asset:
+          assetRoot: /home/tide/robot/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/
+        smpl_motion_file: dummy
+
   rewards:
-    # Remove all reference-motion tracking signals. Null (instead of weight 0)
-    # keeps these terms out of RewardManager's active term set entirely.
+    # Remove all reference-motion tracking signals. Null keeps these terms out
+    # of RewardManager's active term set entirely.
     tracking_anchor_pos: null
     tracking_anchor_ori: null
     tracking_relative_body_pos: null
@@ -25,8 +153,8 @@ manager_env:
     tracking_body_angvel: null
     object_tracking_reward: null
 
-    # Make contact achievable first, then reward a sustained multi-finger grasp.
-    # Ungating this term removes its dependency on reference-motion contact time.
+    finger_primitive_limit:
+      weight: 0.0
     grasp_reward:
       weight: 10.0
       params:
@@ -35,21 +163,15 @@ manager_env:
         command_name: motion
         min_contacts: 4
     grasp_finger_direction:
-      # Keep this as a weak geometric hint while physical contact stays primary.
       weight: 2.0
       params:
         use_contact_center: true
 
-    # Exclude the two discrete finger primitive dimensions from smoothing.
     meta_action_rate_l2:
       weight: -1.0
       params:
         token_only: true
-
-    # Direct-latent, non-delta execution does not update this term's history.
     full_latent_rate_l2: null
-
-    # Smooth the decoded joint command directly.
     action_rate_l2:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:action_rate_l2
@@ -66,58 +188,97 @@ manager_env:
           - right_wrist_yaw_link
           - head_link
 
-    # Stop penalizing wrist motion after a stable physical grasp is established.
+    is_terminated:
+      weight: -10.0
+    hand_table_contact_penalty:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_hand_table_contact_penalty
+      weight: -1.0
     approach_velocity_penalty:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_approach_velocity_penalty
       weight: -15.0
       params:
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: object_to_hand_contact_sensor
+        sigma: 0.25
+        contact_threshold: 0.1
         min_contacts: 4
         disable_after_contact: true
+    upright_penalty:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:upright_penalty
+      weight: 0
+      params:
+        command_name: motion
+        body_names:
+          - pelvis
+          - torso_link
+
 algo:
   config:
-    # Parameterize policy noise as log(std), ensuring std = exp(log_std) > 0.
+    num_steps_per_env: 24
+    num_learning_iterations: 30000
+    num_learning_epochs: 3
+    num_mini_batches: 4
+    actor_learning_rate: 2.0e-4
+    gamma: 0.99
+    lam: 0.95
+    entropy_coef: 0.001
+    desired_kl: 0.01
+    init_noise_std: 0.01
     use_log_std: true
-    # Complementary PPO + behavior-cloning objective:
-    #   lambda_bc(k)  = max(0.2, 1 - k / 10000)
-    #   lambda_ppo(k) = 1 - lambda_bc(k)
-    # The static coefficients below are replaced while this schedule is enabled.
+
     ppo_loss_coef: 0.0
     distill_teacher_loss_coef: 0.0
     compute_aux_loss: true
     aux_loss_scale: 1.0
-    num_learning_epochs: 3
-    gamma: 0.99
-    lam: 0.95
-    num_steps_per_env: 24
-    actor_learning_rate: 2.0e-4
-    entropy_coef: 0.001
-    desired_kl: 0.01
-    init_noise_std: 0.01
+    use_dagger: true
+    teacher_input_key: actor_obs
+    teacher_checkpoint: /home/tide/robot/GRAIL/imports/SONIC/models/pnp_table/last.pt
+    teacher_actor:
+      _target_: gear_sonic.trl.modules.actor_critic_modules.Actor
+      running_mean_std: false
+      output_original_obs_dict: true
+      has_aux_loss: true
+      backbone:
+        _target_: gear_sonic.trl.modules.base_module.BaseModuleAux
+        process_output_dim: true
+        aux_loss_func:
+          latent_l2:
+            _target_: gear_sonic.trl.losses.token_losses.LatentL2Loss
+            latent_dim: 64
+        aux_loss_coef:
+          latent_l2: 0.01
+        module_config_dict:
+          input_dim: [actor_obs]
+          output_dim: [robot_action_dim]
+          layer_config:
+            type: MLP
+            hidden_dims: [512, 256, 128]
+            activation: SiLU
+
+    decoder_distill: true
+    diffusion_target_key: diffusion_target
+    target_latent_mode: pre_quantization
+    diffusion_latent_dim: 64
+    diffusion_hand_dim: 2
+    diffusion_hand_target_source: reference_motion
     # PPO must execute actions sampled from the Student's Gaussian policy.
-    # The inherited diffusion-distillation config replaces sampled actions with
-    # the mean, which makes the rollout distribution inconsistent with the
-    # Gaussian log-probabilities used by PPO. Teacher rollouts remain
-    # deterministic via an explicit override in the trainer.
     distill_rollout_with_action_mean: false
+
     ppo_bc_loss_schedule:
       enabled: true
       bc_min_coef: 0.2
-      # lambda_bc(k) = max(0.2, 1 - k / 10000)
       end_iteration: 5000
-      # Keep LR fixed before this iteration, then enable desired-KL adaptation.
       adaptive_after_iteration: 1000
-    # Match the transformer-flow linear DAgger curriculum: start with all
-    # Teacher environments, linearly grow the Student share to 0.5 at
-    # iteration 3000, then keep a 1:1 Student/Teacher rollout split.
     dagger_rollout_mode: fixed
     dagger_student_ratio: 1
     dagger_student_ratio_increment: 0.0
-    decoder_distill: true
-    # Supervise the direct-latent MLP in the same continuous space in which it
-    # executes. The Teacher target is encoder latent + scaled residual
-    # immediately before FSQ.
-    target_latent_mode: pre_quantization
-    # These keys only control the terminal table. All metrics are still sent
-    # to the configured experiment tracker regardless of this allowlist.
+
+    save_interval: 500
+    eval_frequency: 500
     console_loss_keys:
       - loss/weighted_ppo_loss_avg
       - loss/policy_avg
@@ -127,18 +288,79 @@ algo:
       - loss/total_aux_loss_avg
       - loss/lambda_ppo
       - loss/lambda_bc
-    # The environment deliberately preserves the five-frame proprio history as
-    # [B, 5, 161]. The regular PPO rollout storage otherwise allocates this
-    # group from its flattened metadata (805), which cannot store that tensor.
+
+    # Preserve the five-frame proprio history as [B, 5, 161].
     rollout_storage_obs_shapes:
       proprio_obs: [5, 161]
+
     actor:
+      _target_: gear_sonic.trl.modules.actor_critic_modules.Actor
+      running_mean_std: false
+      input_key: actor_obs
+      input_obs_dict: true
+      output_original_obs_dict: true
+      has_aux_loss: true
       backbone:
         _target_: gear_sonic.trl.modules.diffusion_policy_modules.EncoderVectorMlpPolicy
         process_output_dim: true
         module_config_dict:
-          # Marker only; EncoderVectorMlpPolicy does not use diffusion sampling.
+          actor_key: actor_obs
+          image_key: camera_rgb
+          image_shape: [108, 192, 3]
+          image_feature_dim: 128
+          resnet_type: resnet18
+          pretrained: true
+          trainable: true
+          normalize_image: true
+          fusion_hidden_dims: [512, 256, 128]
+          replace_terms:
+            - target_object_pos
+            - hand_object_transform_6d
+            - finger_tips_force
+            - object_pos_b
+            - object_ori_b_6d
+            - table_pos_b
+            - table_ori_b
+            - object_pos_delta_multi_future
+            - object_ori_delta_multi_future_6d
+            - object_bps
+
+          proprio_key: proprio_obs
+          proprio_input_dim: 805
+          proprio_feature_dim: 512
+          proprio_hidden_dims: [1024]
+          privileged_key: privileged_obs
+          privileged_input_dim: 48
+          privileged_feature_dim: 512
+          privileged_hidden_dims: [512]
+          observation_normalization: standardize
+          observation_norm_momentum: 0.05
+          observation_norm_clip: 5.0
+          observation_std_eps: 1.0e-4
+
+          output_dim: [robot_action_dim]
+          cond_dim: 1024
+          timestep_dim: 128
+          timestep_hidden_dim: 1024
+          timestep_feature_dim: 256
+          cond_hidden_dims: [512]
+          denoiser_hidden_dims: [2048, 2048, 1024]
+          activation: SiLU
           diffusion_objective: bc_mse
+          diffusion_target_key: ${algo.config.diffusion_target_key}
+          target_normalization: standardize
+          target_norm_momentum: 0.05
+          target_norm_clip: 5.0
+          target_std_eps: 1.0e-4
+          num_train_timesteps: 100
+          num_inference_steps: 4
+          num_timestep_buckets: 1000
+          noise_beta_alpha: 1.5
+          noise_beta_beta: 1.0
+          noise_s: 0.999
+          beta_start: 1.0e-4
+          beta_end: 2.0e-2
+          diffusion_loss_coef: 1.0
+
           mlp_hidden_dims: [2048, 1024, 512]
-          # Paper's DAgger imitation-loss coefficient.
           bc_loss_coef: 10.0

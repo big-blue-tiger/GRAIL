@@ -54,7 +54,7 @@ python gear_sonic/train_agent_trl.py \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt 
 
 CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_no_ref_tracking_smooth_grasp \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
   headless=True \
   num_envs=4096 \
   experiment_name=mlp_bc1_ppo1_studentonly \
@@ -68,7 +68,7 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=300
 
 CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_no_ref_tracking_smooth_grasp \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
   headless=true \
   num_envs=4096 \
   experiment_name=mlp_bc1_ppo1_studentonly \
