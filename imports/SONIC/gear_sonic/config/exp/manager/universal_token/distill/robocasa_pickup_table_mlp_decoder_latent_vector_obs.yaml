@@ -344,7 +344,9 @@ algo:
           activation: SiLU
           diffusion_objective: bc_mse
           diffusion_target_key: ${algo.config.diffusion_target_key}
-          target_normalization: standardize
+          # The MLP predicts the Teacher's raw 66-D action target directly.
+          # target_normalization: standardize
+          target_normalization: none
           target_norm_momentum: 0.05
           target_norm_clip: 5.0
           target_std_eps: 1.0e-4

@@ -24,7 +24,7 @@ python -u -m grail.datatool.batch_filter_teacher_policy \
 cd /home/tide/robot/GRAIL/imports/SONIC
 
 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_ema \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint \
   headless=True \
   num_envs=8
 
@@ -41,7 +41,7 @@ python gear_sonic/train_agent_trl.py \
 cd /home/GRAIL/imports/SONIC
 
 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_ema \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint \
   headless=True \
   num_envs=4096 \
   experiment_name=mlp_bc1_ppo1_studentonly_cleandata_joint_ema \
@@ -54,10 +54,10 @@ python gear_sonic/train_agent_trl.py \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt 
 
 CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint \
   headless=True \
   num_envs=4096 \
-  experiment_name=mlp_bc1_ppo1_studentonly \
+  experiment_name=mlp_bc_ppo_studentonly_nonormalize \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
@@ -65,24 +65,8 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   algo.config.num_learning_iterations=10000 \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=300
+  algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000
 
-CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs \
-  headless=true \
-  num_envs=4096 \
-  experiment_name=mlp_bc1_ppo1_studentonly \
-  resume=true \
-  checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/mlp_bc1_ppo1_studentonly-20260902_174901/last.pt \
-  experiment_dir=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/mlp_bc1_ppo1_studentonly-20260902_174901 \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/bps \
-  manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.num_learning_iterations=10000 \
-  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=300
 
 CUDA_VISIBLE_DEVICES=2 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_transformer_flow_chunk1_decoder_latent_vector_obs \

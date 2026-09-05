@@ -927,7 +927,7 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
     This variant encodes the raw proprioceptive and privileged observations
     separately and replaces the diffusion path with an independent MLP action
     head.  The head predicts the complete decoder action (64 latent values plus
-    2 hand values) in the normalized target space.
+    2 hand values) directly in the environment's raw action space.
     """
 
     def __init__(self, *args, **kwargs):
@@ -947,9 +947,10 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
             activation,
         )
 
-        # The parent owns the shared condition encoders and target
-        # normalization helpers.  The direct-BC policy must not retain the
-        # diffusion-only trainable branches in its optimizer or state dict.
+        # The parent owns the shared condition encoders.  Its target-stat
+        # buffers remain for checkpoint compatibility, but this direct-BC
+        # policy does not use them.  It must not retain the diffusion-only
+        # trainable branches in its optimizer or state dict.
         del self.time_encoder
         del self.denoiser
 
@@ -981,8 +982,12 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
             raise TypeError("EncoderVectorMlpPolicy expects an obs_dict-like input")
 
         cond = self._encode_condition(input)
-        pred_normalized = self.action_head(cond)
-        pred_action = self._denormalize_target(pred_normalized)
+        pred_action = self.action_head(cond)
+        # Direct-action regression intentionally bypasses target
+        # denormalization.  To restore the old behavior, replace the direct
+        # assignment above with these two lines.
+        # pred_normalized = self.action_head(cond)
+        # pred_action = self._denormalize_target(pred_normalized)
 
         if not compute_aux_loss:
             return pred_action
@@ -1004,13 +1009,14 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
                 f"got {tuple(target.shape[:-1])}, expected {tuple(cond.shape[:-1])}"
             )
 
-        with torch.no_grad():
-            self._update_target_stats(target)
-        normalized_target = self._normalize_target(target)
-        bc_loss = F.mse_loss(pred_normalized, normalized_target)
+        # Direct-action regression must neither update target statistics nor
+        # transform the Teacher action target.
+        # with torch.no_grad():
+        #     self._update_target_stats(target)
+        # normalized_target = self._normalize_target(target)
+        bc_loss = F.mse_loss(pred_action, target)
 
         target_flat = target.detach().float().reshape(-1, self.action_dim)
-        norm_flat = normalized_target.detach().float().reshape(-1, self.action_dim)
         pred_flat = pred_action.detach().float().reshape(-1, self.action_dim)
         return {
             "action_mean": pred_action,
@@ -1018,8 +1024,6 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
                 "latent_bc_mse": bc_loss,
                 "bc_target/raw_abs_mean": target_flat.abs().mean(),
                 "bc_target/raw_std_mean": target_flat.std(dim=0, unbiased=False).mean(),
-                "bc_target/norm_abs_mean": norm_flat.abs().mean(),
-                "bc_target/norm_std_mean": norm_flat.std(dim=0, unbiased=False).mean(),
                 "bc_pred/raw_abs_mean": pred_flat.abs().mean(),
             },
             "aux_loss_coef": {"latent_bc_mse": self.bc_loss_coef},
