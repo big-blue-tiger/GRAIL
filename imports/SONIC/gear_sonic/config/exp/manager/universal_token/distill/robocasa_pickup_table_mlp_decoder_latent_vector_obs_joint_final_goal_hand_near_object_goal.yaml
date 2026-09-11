@@ -1,0 +1,34 @@
+# @package _global_
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_final_goal_hand_near
+  - _self_
+
+exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_final_goal_hand_near_object_goal
+experiment_name: ${exp_base}_${exp_var}
+
+manager_env:
+  rewards:
+    joint_acc_l2:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: isaaclab.envs.mdp:joint_acc_l2
+      weight: -2.5e-7
+      params:
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: robot
+    object_final_goal_distance:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_distance
+      weight: 0.5
+      params:
+        command_name: motion
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: object
+        exp_coeff: -1.0
+
+algo:
+  config:
+    ppo_bc_loss_schedule:
+      bc_min_coef: 0.1

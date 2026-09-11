@@ -64,6 +64,7 @@ from gear_sonic.trl.utils import (
     scheduler,
 )
 from gear_sonic.utils import average_meters  # noqa: E402
+from gear_sonic.utils.empirical_normalizer import RolloutLatentMoments  # noqa: E402
 
 console_ = console.Console()
 import time  # noqa: E402
@@ -1844,6 +1845,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         vf_loss_stats = torch.zeros(stats_shape, device=device)
         entropy_stats = torch.zeros(stats_shape, device=device)
         weighted_ppo_loss_stats = torch.zeros(stats_shape, device=device)
+        weighted_pg_loss_stats = torch.zeros(stats_shape, device=device)
+        weighted_vf_loss_stats = torch.zeros(stats_shape, device=device)
+        weighted_entropy_loss_stats = torch.zeros(stats_shape, device=device)
+        ppo_loss_coef_stats = torch.zeros(stats_shape, device=device)
         vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
         ratio_stats = torch.zeros(stats_shape, device=device)
         advantage_mean_stats = torch.zeros(stats_shape, device=device)
@@ -1861,6 +1866,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.vf_loss_stats = vf_loss_stats
         self.entropy_stats = entropy_stats
         self.weighted_ppo_loss_stats = weighted_ppo_loss_stats
+        self.weighted_pg_loss_stats = weighted_pg_loss_stats
+        self.weighted_vf_loss_stats = weighted_vf_loss_stats
+        self.weighted_entropy_loss_stats = weighted_entropy_loss_stats
+        self.ppo_loss_coef_stats = ppo_loss_coef_stats
         self.vf_clipfrac_stats = vf_clipfrac_stats
         self.ratio_stats = ratio_stats
         self.advantage_mean_stats = advantage_mean_stats
@@ -2061,6 +2070,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                         mb_teacher_obs_dict, teacher_results["action_mean"]
                     )
 
+        if getattr(self, "_collect_latent_moments", False):
+            if diffusion_target is None:
+                raise RuntimeError("Empirical latent normalization requires decoder targets")
+            self._latent_moments.collect(diffusion_target[..., :self.diffusion_latent_dim])
+
         # We should only do one forward pass for especially DDP model
         if self.compute_imgaug_bc_loss:
             policy_kwargs = {
@@ -2220,7 +2234,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         """
         ppo_loss_dict = self._compute_ppo_loss(forward_results, mb_rollout_data)
 
-        loss = ppo_loss_dict["ppo_loss"] * self._get_ppo_loss_coef()
+        # ``_compute_ppo_loss`` already applies the per-component coefficients.
+        loss = ppo_loss_dict["ppo_loss"]
 
         ret_dict = {
             "ppo_loss_dict": ppo_loss_dict,
@@ -2335,6 +2350,10 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         if getattr(self.env, "safe_nan", False):
             entropy_batch[entropy_batch.isnan()] = 0.0
         entropy_loss = -masked_mean(entropy_batch, ~padding_mask)
+        ppo_loss_coef = self._get_ppo_loss_coef()
+        weighted_pg_loss = ppo_loss_coef * pg_loss
+        weighted_vf_loss = args.vf_coef * vf_loss
+        weighted_entropy_loss = ppo_loss_coef *self.entropy_coef * entropy_loss
         if self.use_symmetry:
             actor_sym_loss = torch.mean(
                 torch.sum(
@@ -2359,14 +2378,14 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 )
             )
             loss = (
-                pg_loss
-                + args.vf_coef * vf_loss
-                + self.entropy_coef * entropy_loss
+                weighted_pg_loss
+                + weighted_vf_loss
+                + weighted_entropy_loss
                 + actor_sym_loss
                 + critic_sym_loss
             )
         else:
-            loss = pg_loss + args.vf_coef * vf_loss + self.entropy_coef * entropy_loss
+            loss = weighted_pg_loss + weighted_vf_loss + weighted_entropy_loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"Invalid loss detected: {loss}")  # noqa: T201
@@ -2387,6 +2406,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             "pg_loss": pg_loss,
             "vf_loss": vf_loss,
             "entropy_loss": entropy_loss,
+            "weighted_pg_loss": weighted_pg_loss,
+            "weighted_vf_loss": weighted_vf_loss,
+            "weighted_entropy_loss": weighted_entropy_loss,
+            "ppo_loss_coef": ppo_loss_coef,
+            "vf_loss_coef": args.vf_coef,
+            "entropy_loss_coef": self.entropy_coef,
             "ratio": ratio,
             "vf_clipfrac": vf_clipfrac,
         }
@@ -2445,9 +2470,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         pg_loss = loss_dict["ppo_loss_dict"]["pg_loss"]
         vf_loss = loss_dict["ppo_loss_dict"]["vf_loss"]
         entropy_loss = loss_dict["ppo_loss_dict"]["entropy_loss"]
-        weighted_ppo_loss = (
-            loss_dict["ppo_loss_dict"]["ppo_loss"] * self._get_ppo_loss_coef()
-        )
+        ppo_loss_dict = loss_dict["ppo_loss_dict"]
         ratio = loss_dict["ppo_loss_dict"]["ratio"]
         vf_clipfrac = loss_dict["ppo_loss_dict"]["vf_clipfrac"]
 
@@ -2490,7 +2513,19 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             ]["swap_loss"]
         self.entropy_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = -entropy_loss
         self.weighted_ppo_loss_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = (
-            weighted_ppo_loss
+            ppo_loss_dict["ppo_loss"]
+        )
+        self.weighted_pg_loss_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = (
+            ppo_loss_dict["weighted_pg_loss"]
+        )
+        self.weighted_vf_loss_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = (
+            ppo_loss_dict["weighted_vf_loss"]
+        )
+        self.weighted_entropy_loss_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = (
+            ppo_loss_dict["weighted_entropy_loss"]
+        )
+        self.ppo_loss_coef_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = (
+            ppo_loss_dict["ppo_loss_coef"]
         )
         self.vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = vf_clipfrac
         self.ratio_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = ratio.mean()
@@ -2559,6 +2594,20 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         metrics["loss/weighted_ppo_loss_avg"] = (
             self.accelerator.gather_for_metrics(self.weighted_ppo_loss_stats).mean().item()
         )
+        metrics["loss/weighted_pg_avg"] = (
+            self.accelerator.gather_for_metrics(self.weighted_pg_loss_stats).mean().item()
+        )
+        metrics["loss/weighted_value_avg"] = (
+            self.accelerator.gather_for_metrics(self.weighted_vf_loss_stats).mean().item()
+        )
+        metrics["loss/weighted_entropy_avg"] = (
+            self.accelerator.gather_for_metrics(self.weighted_entropy_loss_stats).mean().item()
+        )
+        metrics["loss/ppo_coef"] = (
+            self.accelerator.gather_for_metrics(self.ppo_loss_coef_stats).mean().item()
+        )
+        metrics["loss/value_coef"] = self.args.vf_coef
+        metrics["loss/entropy_coef"] = self.entropy_coef
         metrics["val/clipfrac_avg"] = (
             self.accelerator.gather_for_metrics(self.vf_clipfrac_stats).mean().item()
         )
@@ -3016,10 +3065,17 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         for obs_key in obs_dict.keys():  # noqa: SIM118
             obs_dict[obs_key] = obs_dict[obs_key].to(device)
 
+        latent_normalizer = getattr(self.policy_model.actor_module, "latent_normalizer", None)
+        self._collect_latent_moments = False
+        self._latent_moments = None
+
         for batch_idx in range(1, args.num_total_batches + 1):
             batch_start_time = time.time()
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)  # noqa: F841
+
+            if latent_normalizer is not None:
+                self._latent_moments = RolloutLatentMoments(latent_normalizer)
 
             # update scheduled params
             if self.schedule_dict is not None:
@@ -3053,6 +3109,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 self._train_mode()
             with common.Timer("ppo_training"):
                 for ppo_epoch_idx in range(args.num_ppo_epochs):
+                    self._collect_latent_moments = latent_normalizer is not None and ppo_epoch_idx == 0
                     minibatch_idx = 0
                     if self.ppo_shuffle_every_epoch or ppo_epoch_idx == 0:
                         b_inds = torch.randperm(args.local_batch_size, device=device)
@@ -3136,6 +3193,13 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                     #     # print(f"Empty cache at ppo_epoch_idx {ppo_epoch_idx}")
                     #     gc.collect()
                     #     torch.cuda.empty_cache()
+            self._collect_latent_moments = False
+            latent_samples = 0
+            if self._latent_moments is not None:
+                # Only new rollout moments are synchronized. The resulting
+                # cumulative statistics first affect the next rollout.
+                latent_samples = self._latent_moments.commit()
+                self._latent_moments = None
             ######################################################### Sync Running Mean Std #########################################################  # noqa: E501
             with common.Timer("sync_running_mean_std"):
                 self.sync_running_mean_std()
@@ -3231,6 +3295,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                         )
                 else:
                     metrics["Policy/mean_noise_std"] = 0.0
+                if latent_normalizer is not None:
+                    metrics["Policy/latent_normalizer_samples"] = latent_samples
+                    metrics["Policy/latent_normalizer_count"] = latent_normalizer.count.item()
+                    metrics["Policy/latent_normalizer_std_mean"] = latent_normalizer._std.mean().item()
+                    metrics["Policy/latent_normalizer_mean_mean"] = latent_normalizer._mean.mean().item()
                 self.append_to_log_dict(log_dict)
                 metrics.update({f"Env/{k}": v for k, v in env_log_dict.items()})
                 metrics.update(env_log_dict)

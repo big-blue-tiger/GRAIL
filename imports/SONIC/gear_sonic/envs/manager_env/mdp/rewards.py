@@ -39,6 +39,7 @@ class RewardsCfg:
     tracking_body_linvel = None
     tracking_body_angvel = None
     action_rate_l2 = None
+    joint_acc_l2 = None
     joint_limit = None
     undesired_contacts = None
     undesired_contacts_no_hands = None
@@ -74,6 +75,7 @@ class RewardsCfg:
     hand_table_contact_penalty = None
     # Object motion tracking reward (OmniGrasp-style r_t^obj)
     object_tracking_reward = None
+    object_final_goal_distance = None
     object_lift_contact_reward = None
     # Finger primitive action limit penalty
     finger_primitive_limit = None
@@ -94,6 +96,8 @@ class RewardsCfg:
     upright_penalty = None
     # Foot slippage penalty (penalize foot velocity while in ground contact)
     foot_slippage_penalty = None
+    feet_air_time = None
+    feet_slip = None
 
 
 def tracking_anchor_pos_error(
@@ -778,45 +782,70 @@ def anti_shake_ang_vel_l2(
 # ==================== HOI Manipulation Rewards ====================
 
 
+def reward_object_final_goal_distance(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    exp_coeff: float = -1.0,
+) -> torch.Tensor:
+    """Reward proximity to the last-frame object position, without contact gating.
+
+    Match target_object_poses_6d's world-frame target, including environment
+    origins and the configured object height offset. Distance is in meters.
+    """
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
+    target_pos_w = (
+        command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
+        + env.scene.env_origins
+    )
+    target_pos_w[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
+    current_pos_w = env.scene[asset_cfg.name].data.root_pos_w[:, :3]
+    distance = torch.norm(current_pos_w - target_pos_w, dim=-1)
+    return torch.exp(exp_coeff * distance)
+
+
 def reward_hand_fingers_object_distance(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("object_to_hand_frame_transformer"),
     exp_coeff: float = -10.0,
     command_name: str = "motion",
+    gate_with_contact_label: bool = True,
+    max_distance: float | None = None,
 ) -> torch.Tensor:
     """Compute reward for hand proximity to the object.
 
     Encourage the hand to approach the object using an exponential distance kernel.
-    Only applied when the contact label indicates contact should happen
-    (current_frame >= first_contact_frame).
+    By default, only applied when the contact label indicates contact should
+    happen (current_frame >= first_contact_frame). Optionally truncate the
+    reward to zero beyond a maximum distance.
 
     Args:
         env: The environment.
         asset_cfg: Frame transformer config for the object-to-hand transform.
         exp_coeff: Exponential coefficient for distance-to-reward mapping (negative).
         command_name: Name of the tracking command term.
+        gate_with_contact_label: Whether to gate by the reference contact label.
+        max_distance: Maximum rewarded distance in meters (inclusive), or None.
 
     Returns:
         Reward tensor of shape (num_envs,) in [0, 1].
     """
-    command: TrackingCommand = env.command_manager.get_term(command_name)
-
-    # Check if contact data is available - use precomputed per-env first contact frame
-    per_env_first_contact = getattr(command, "_per_env_first_contact", None)
-
-    if per_env_first_contact is not None:
-        current_time = command.motion_start_time_steps + command.time_steps
-        should_contact = (current_time >= per_env_first_contact).float()
-    else:
-        # No contact data, always apply reward
-        should_contact = torch.ones(env.num_envs, device=env.device)
-
     hand_object_transform = get_hand_object_transform(env, asset_cfg)
     object_pos_in_hand = hand_object_transform[:, :3]
     object_pos_in_hand_distance = torch.norm(object_pos_in_hand, dim=-1)
     reward = torch.exp(exp_coeff * object_pos_in_hand_distance)
-    # Only apply reward when contact should happen
-    return reward * should_contact
+    if max_distance is not None:
+        reward = torch.where(object_pos_in_hand_distance <= max_distance, reward, 0.0)
+
+    if gate_with_contact_label:
+        command: TrackingCommand = env.command_manager.get_term(command_name)
+        per_env_first_contact = getattr(command, "_per_env_first_contact", None)
+        if per_env_first_contact is not None:
+            current_time = command.motion_start_time_steps + command.time_steps
+            reward = reward * (current_time >= per_env_first_contact).float()
+
+    return reward
 
 
 def reward_grasp(

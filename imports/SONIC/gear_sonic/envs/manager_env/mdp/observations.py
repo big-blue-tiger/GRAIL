@@ -184,6 +184,7 @@ class StudentPrivilegedCfg(ObsGroup):
     object_ori_b_6d = None
     hand_object_transform_6d = None
     hand_object_contact_force_magnitude = None
+    target_object_poses_6d = None
 
 
 @configclass
@@ -3022,6 +3023,42 @@ def hand_object_transform_6d(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) ->
     ori_6d = mat[..., :2].reshape(mat.shape[0], -1)  # (num_envs, 6)
 
     return torch.cat([object_pos_in_hand, ori_6d], dim=-1)  # (num_envs, 9)
+
+
+def target_object_poses_6d(
+    env: ManagerBasedEnv, command_name: str, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """Final reference object pose in live pelvis and hand frames (9D each).
+
+    Recompute relative poses every step, keeping the world target at the motion's
+    last frame. The hand frame and 6D rotation layout match the live object terms.
+    """
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
+    target_pos_w = (
+        command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
+        + env.scene.env_origins
+    )
+    target_pos_w[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
+    target_quat_w = command.motion_lib.get_object_root_quat(command.motion_ids, final_steps)[:, 0]
+
+    transformer = env.scene[asset_cfg.name]
+    hand_pos_in_obj, hand_quat_in_obj = _get_hand_pose_in_object_frame(transformer)
+    hand_pos_w = transformer.data.source_pos_w + quat_apply(
+        transformer.data.source_quat_w, hand_pos_in_obj
+    )
+    hand_quat_w = quat_mul(transformer.data.source_quat_w, hand_quat_in_obj)
+    robot = command.robot.data
+    anchor = command.robot_anchor_body_index
+    poses = []
+    for pos_w, quat_w in (
+        (robot.body_pos_w[:, anchor], robot.body_quat_w[:, anchor]),
+        (hand_pos_w, hand_quat_w),
+    ):
+        pos, quat = subtract_frame_transforms(pos_w, quat_w, target_pos_w, target_quat_w)
+        rot_6d = matrix_from_quat(quat)[..., :2].reshape(env.num_envs, 6)
+        poses.extend((pos, rot_6d))
+    return torch.cat(poses, dim=-1)
 
 
 def get_finger_tips_contact_force(env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:

@@ -72,6 +72,34 @@ class CommandsCfg:
 
     motion = None
     force = None
+    motion_velocity = None
+
+
+class MotionVelocityCommand(CommandTerm):
+    """Expose live reference velocity for official locomotion reward gates."""
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._env.command_manager.get_term(self.cfg.command_name).command_vel
+
+    def _update_metrics(self):
+        pass
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        pass
+
+    def _update_command(self):
+        pass
+
+
+@configclass
+class MotionVelocityCommandCfg(CommandTermCfg):
+    """Read-only view of a tracking command; does not sample new targets."""
+
+    class_type: type = MotionVelocityCommand
+    command_name: str = "motion"
+    resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
+    debug_vis: bool = False
 
 
 class TrackingCommand(CommandTerm):

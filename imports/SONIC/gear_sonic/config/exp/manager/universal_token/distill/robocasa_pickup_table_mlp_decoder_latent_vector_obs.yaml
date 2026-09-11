@@ -143,14 +143,19 @@ manager_env:
         smpl_motion_file: dummy
 
   rewards:
-    # Remove all reference-motion tracking signals. Null keeps these terms out
-    # of RewardManager's active term set entirely.
-    tracking_anchor_pos: null
-    tracking_anchor_ori: null
-    tracking_relative_body_pos: null
-    tracking_relative_body_ori: null
-    tracking_body_linvel: null
-    tracking_body_angvel: null
+    # Robot motion tracking at half of pnp_table's effective weights.
+    tracking_anchor_pos:
+      weight: 0.25
+    tracking_anchor_ori:
+      weight: 0.5
+    tracking_relative_body_pos:
+      weight: 0.25
+    tracking_relative_body_ori:
+      weight: 0.5
+    tracking_body_linvel:
+      weight: 0.25
+    tracking_body_angvel:
+      weight: 0.25
     object_tracking_reward: null
 
     finger_primitive_limit:
@@ -227,7 +232,7 @@ algo:
     lam: 0.95
     entropy_coef: 0.001
     desired_kl: 0.01
-    init_noise_std: 0.01
+    init_noise_std: 0.15
     use_log_std: true
 
     ppo_loss_coef: 0.0
@@ -344,12 +349,12 @@ algo:
           activation: SiLU
           diffusion_objective: bc_mse
           diffusion_target_key: ${algo.config.diffusion_target_key}
-          # The MLP predicts the Teacher's raw 66-D action target directly.
-          # target_normalization: standardize
+          # Only the 64 pre-FSQ latent outputs use cumulative empirical stats.
+          # The two hand commands stay raw. Statistics commit after PPO epochs.
           target_normalization: none
-          target_norm_momentum: 0.05
-          target_norm_clip: 5.0
-          target_std_eps: 1.0e-4
+          latent_normalization: empirical
+          latent_norm_eps: 1.0e-3
+          latent_norm_until: null
           num_train_timesteps: 100
           num_inference_steps: 4
           num_timestep_buckets: 1000

@@ -16,6 +16,8 @@ import torch.nn.functional as F
 from torch.utils import checkpoint as checkpoint_utils
 from torchvision import models
 
+from gear_sonic.utils.empirical_normalizer import EmpiricalNormalizer
+
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -926,8 +928,8 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
 
     This variant encodes the raw proprioceptive and privileged observations
     separately and replaces the diffusion path with an independent MLP action
-    head.  The head predicts the complete decoder action (64 latent values plus
-    2 hand values) directly in the environment's raw action space.
+    head. Optional empirical normalization applies only to the 64 latent
+    outputs; the returned 66-D action mean is always in the raw action space.
     """
 
     def __init__(self, *args, **kwargs):
@@ -954,16 +956,41 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
         del self.time_encoder
         del self.denoiser
 
+        self.latent_normalization = module_config_dict.get("latent_normalization", "none")
+        if self.latent_normalization not in ("none", "empirical"):
+            raise ValueError(f"Unsupported latent_normalization={self.latent_normalization}")
+        self.latent_normalizer = None
+        if self.latent_normalization == "empirical":
+            algo_config = kwargs.get("algo_config")
+            if algo_config is None and len(args) > 4:
+                algo_config = args[4]
+            self.latent_dim = int((algo_config or {}).get("diffusion_latent_dim", 64))
+            if self.latent_dim != 64 or self.action_dim != self.latent_dim + 2:
+                raise ValueError("Empirical latent normalization requires 64 latent + 2 hand outputs")
+            if self.target_normalization != "none":
+                raise ValueError("Set target_normalization=none when using empirical latent normalization")
+            self.latent_normalizer = EmpiricalNormalizer(
+                self.latent_dim,
+                eps=float(module_config_dict.get("latent_norm_eps", 1e-2)),
+                until=module_config_dict.get("latent_norm_until"),
+            )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        if self.latent_normalizer is None and any(
+            key.startswith(prefix + "latent_normalizer.") for key in state_dict
+        ):
+            error_msgs.append("Checkpoint requires latent_normalization=empirical")
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def _encode_condition(self, obs_dict):
         for key in (self.proprio_key, self.privileged_key):
             if key not in obs_dict:
-                raise KeyError(
-                    f"EncoderVectorMlpPolicy requires observation key '{key}'"
-                )
-        proprio = self._flatten_observation(
-            obs_dict[self.proprio_key], self.proprio_input_dim, self.proprio_key
-        )
+                raise KeyError(f"EncoderVectorMlpPolicy requires observation key '{key}'")
+        proprio = self._flatten_observation(obs_dict[self.proprio_key], self.proprio_input_dim, self.proprio_key)
         privileged = self._flatten_observation(
             obs_dict[self.privileged_key], self.privileged_input_dim, self.privileged_key
         )
@@ -982,12 +1009,16 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
             raise TypeError("EncoderVectorMlpPolicy expects an obs_dict-like input")
 
         cond = self._encode_condition(input)
-        pred_action = self.action_head(cond)
-        # Direct-action regression intentionally bypasses target
-        # denormalization.  To restore the old behavior, replace the direct
-        # assignment above with these two lines.
-        # pred_normalized = self.action_head(cond)
-        # pred_action = self._denormalize_target(pred_normalized)
+        prediction = self.action_head(cond)
+        pred_action = prediction
+        if self.latent_normalizer is not None:
+            pred_action = torch.cat(
+                [
+                    self.latent_normalizer.inverse(prediction[..., : self.latent_dim]),
+                    prediction[..., self.latent_dim :],
+                ],
+                dim=-1,
+            )
 
         if not compute_aux_loss:
             return pred_action
@@ -995,29 +1026,47 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
         target = self._extract_target(kwargs)
         if target is None:
             raise ValueError(
-                f"{self.__class__.__name__} requires {self.diffusion_target_key} "
-                "when compute_aux_loss=True"
+                f"{self.__class__.__name__} requires {self.diffusion_target_key} when compute_aux_loss=True"
             )
-        target = target.to(device=cond.device, dtype=cond.dtype)
+        target_dtype = torch.float32 if self.latent_normalizer is not None else cond.dtype
+        target = target.to(device=cond.device, dtype=target_dtype)
         if target.shape[-1] != self.action_dim:
-            raise ValueError(
-                f"BC target dim mismatch: got {target.shape[-1]}, expected {self.action_dim}"
-            )
+            raise ValueError(f"BC target dim mismatch: got {target.shape[-1]}, expected {self.action_dim}")
         if target.shape[:-1] != cond.shape[:-1]:
             raise ValueError(
                 "BC target batch shape must match encoded condition batch shape: "
                 f"got {tuple(target.shape[:-1])}, expected {tuple(cond.shape[:-1])}"
             )
 
-        # Direct-action regression must neither update target statistics nor
-        # transform the Teacher action target.
-        # with torch.no_grad():
-        #     self._update_target_stats(target)
-        # normalized_target = self._normalize_target(target)
-        bc_loss = F.mse_loss(pred_action, target)
+        loss_target = target
+        if self.latent_normalizer is not None:
+            loss_target = torch.cat(
+                [self.latent_normalizer.normalize(target[..., : self.latent_dim]), target[..., self.latent_dim :]],
+                dim=-1,
+            )
+        # Preserve the 66-D mean reduction, including the two raw hand targets.
+        # The Trainer commits statistics after all PPO epochs, never in forward.
+        bc_loss = (
+            F.mse_loss(prediction.float(), loss_target)
+            if self.latent_normalizer is not None
+            else F.mse_loss(prediction, loss_target)
+        )
 
         target_flat = target.detach().float().reshape(-1, self.action_dim)
         pred_flat = pred_action.detach().float().reshape(-1, self.action_dim)
+        diagnostics = {}
+        if self.latent_normalizer is not None:
+            diagnostics = {
+                "bc_latent/raw_mse": F.mse_loss(
+                    pred_action[..., : self.latent_dim].detach(), target[..., : self.latent_dim]
+                ),
+                "bc_latent/normalized_mse": F.mse_loss(
+                    prediction[..., : self.latent_dim].detach().float(), loss_target[..., : self.latent_dim]
+                ),
+                "bc_hand/raw_mse": F.mse_loss(
+                    pred_action[..., self.latent_dim :].detach(), target[..., self.latent_dim :]
+                ),
+            }
         return {
             "action_mean": pred_action,
             "aux_losses": {
@@ -1025,6 +1074,7 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
                 "bc_target/raw_abs_mean": target_flat.abs().mean(),
                 "bc_target/raw_std_mean": target_flat.std(dim=0, unbiased=False).mean(),
                 "bc_pred/raw_abs_mean": pred_flat.abs().mean(),
+                **diagnostics,
             },
             "aux_loss_coef": {"latent_bc_mse": self.bc_loss_coef},
         }

@@ -1,0 +1,58 @@
+# @package _global_
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_final_goal
+  # The parent disables this term with null; restore its full definition before overriding its weight.
+  - /manager_env/rewards/terms/object_tracking_reward@_global_.manager_env.rewards
+  - _self_
+
+exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_final_goal_hand_near
+experiment_name: ${exp_base}_${exp_var}
+
+manager_env:
+  commands:
+    motion_velocity:
+      _target_: gear_sonic.envs.manager_env.mdp.commands.MotionVelocityCommandCfg
+      command_name: motion
+  rewards:
+    # Initial weights: calibrate each term's Episode_Reward magnitude toward 0.2
+    # on representative moving episodes; standing air time and ideal slip are zero.
+    feet_air_time:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: isaaclab_tasks.manager_based.locomotion.velocity.mdp.rewards:feet_air_time_positive_biped
+      weight: 3.0
+      params:
+        command_name: motion_velocity
+        threshold: 0.4
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: contact_forces
+          body_names: [left_ankle_roll_link, right_ankle_roll_link]
+          preserve_order: true
+    feet_slip:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: isaaclab_tasks.manager_based.locomotion.velocity.mdp.rewards:feet_slide
+      weight: -1.0
+      params:
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: contact_forces
+          body_names: [left_ankle_roll_link, right_ankle_roll_link]
+          preserve_order: true
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: robot
+          body_names: [left_ankle_roll_link, right_ankle_roll_link]
+          preserve_order: true
+    hand_fingers_object_distance:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_hand_fingers_object_distance
+      weight: 1.5
+      params:
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: object_to_hand_frame_transformer
+        exp_coeff: -10.0
+        command_name: motion
+        gate_with_contact_label: false
+        max_distance: 0.25
