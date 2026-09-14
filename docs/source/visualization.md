@@ -68,9 +68,9 @@ QUAT_CONVENTION=wxyz bash grail/visualization/scripts/visualize.sh \
     data/hf_dataset/data_update/data/pickup_table
 
 # Isaac Lab server container, three parallel render workers
-bash grail/visualization/scripts/visualize.sh \
-    data/hf_dataset/data_update/data/pickup_table \
-    32 1.5,-1.5,1.0 wxyz server 3
+CUDA_VISIBLE_DEVICES=0 bash grail/visualization/scripts/visualize.sh \
+    data/hf_dataset/data_update/data/pickup_table_walk_concat \
+    1 1.5,-1.5,1.0 xyzw local 1
 
 # Data-export dir — defaults match (xyzw)
 bash grail/visualization/scripts/visualize.sh \

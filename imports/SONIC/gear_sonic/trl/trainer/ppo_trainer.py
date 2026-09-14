@@ -58,6 +58,7 @@ from tqdm import tqdm  # noqa: E402, F401
 from gear_sonic.trl.callbacks import hv_callback_handler  # noqa: E402
 from gear_sonic.trl.modules import data_utils  # noqa: E402
 from gear_sonic.trl.modules.action_chunk import ActionChunkExecutor  # noqa: E402
+from gear_sonic.trl.modules.eval_residual_transition import EvalResidualTransition  # noqa: E402
 from gear_sonic.trl.utils import (
     common,
     rl,
@@ -489,6 +490,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.args = args
         self.config = config
         self.env = env
+        self.residual_transition = EvalResidualTransition(env)
         self.processing_class = processing_class
         self.policy_model = model
 
@@ -1160,6 +1162,19 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         # assert len(action_mean.shape) == 2, f"{action_mean.shape=}"
         # assert len(action_sigma.shape) == 2, f"{action_sigma.shape=}"
 
+        if policy_model is self.ref_model:
+            # Only the frozen Teacher emits residuals. Blend its mean once;
+            # deterministic rollout and chunk labels share that blended value.
+            policy_state_dict["action_mean"] = self.residual_transition.apply(
+                policy_state_dict["action_mean"], residual=True
+            )
+            if use_action_mean:
+                policy_state_dict["actions"] = policy_state_dict["action_mean"].detach()
+            else:
+                policy_state_dict["actions"] = self.residual_transition.apply(
+                    policy_state_dict["actions"], residual=True
+                )
+
         return policy_state_dict
 
     def _chunked_value_evaluate(self, value_model, obs_dict, episode_attnmask, chunk_size=1024):
@@ -1637,6 +1652,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 policy_state_dict = self.policy_step(policy_model, obs_dict, cur_dones=dones)
 
                 clean_obs_dict = self._compute_clean_obs_dict(obs_dict)
+                transition_weight = self.residual_transition.weights(device)
+                if getattr(self.storage, "residual_transition_weight", None) is None:
+                    self.storage.register_key("residual_transition_weight", shape=())
+                self.storage.update_key("residual_transition_weight", transition_weight)
+                # Student actions are executed unchanged. The saved weight is
+                # used only for Teacher supervision during minibatch training.
                 env_step_state = policy_state_dict
                 if teacher_model is not None:
                     if clean_obs_dict is None:
@@ -1917,6 +1938,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             for key in self.storage.stored_keys
             if key.startswith("clean_")
         }
+        transition_weight = self.storage.query_key("residual_transition_weight").transpose(0, 1).to(device)
         actions = self.storage.actions.transpose(0, 1).to(device)
         logprobs = self.storage.actions_log_prob.transpose(0, 1).squeeze(-1).to(device)
         values = self.storage.values.transpose(0, 1).to(device)  # noqa: PD011
@@ -1940,6 +1962,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             next_critic_obs = torch.cat(
                 (next_critic_obs, self._flip_obs(next_critic_obs, "critic_obs")), dim=0
             )
+            transition_weight = transition_weight.repeat(2, 1)
             actions = torch.cat((actions, self._flip_actions(actions)), dim=0)
             logprobs = logprobs.repeat(2, 1)
             values = values.repeat(2, 1, 1)
@@ -1967,6 +1990,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             padding_mask_p1 = torch.zeros_like(dones)
 
         rollout_data = {
+            "residual_transition_weight": transition_weight,
             "all_obs_dict": all_obs_dict,
             "clean_obs_dict": clean_obs_dict,
             "actions": actions,
@@ -2019,6 +2043,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         episode_attnmask = rl.compute_episode_attnmask(mb_dones)
 
         mb_rollout_data = {
+            "residual_transition_weight": rollout_data["residual_transition_weight"][micro_batch_inds],
             "micro_batch_inds": micro_batch_inds,
             "mb_obs_dict": mb_obs_dict,
             "mb_teacher_obs_dict": mb_teacher_obs_dict or mb_obs_dict,
@@ -2064,6 +2089,13 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             with torch.no_grad():
                 teacher_results = self.ref_model.act(
                     obs_dict=mb_teacher_obs_dict, episode_attnmask=episode_attnmask
+                )
+                # Fresh Teacher inference on stored observations: blend once
+                # using rollout-time weights, not the current environment frame.
+                teacher_results["action_mean"] = self.residual_transition.apply(
+                    teacher_results["action_mean"],
+                    weight=mb_rollout_data["residual_transition_weight"],
+                    residual=True,
                 )
                 if self.decoder_distill:
                     diffusion_target = self._build_diffusion_decoder_target(
@@ -2220,6 +2252,21 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
     def _get_ppo_loss_coef(self):
         """Return the effective coefficient applied to the PPO objective."""
         return float(self.config.get("ppo_loss_coef", 1.0))
+
+    def _should_update_latent_normalizer(self):
+        """Keep target statistics fixed after the configured iteration.
+
+        Experiments without a cutoff retain cumulative updates. Since the
+        comparison uses restored trainer state, resumed runs preserve the same
+        iteration boundary.
+        """
+        freeze_after_iteration = self.config.get("latent_norm_freeze_after_iteration", None)
+        if freeze_after_iteration is None:
+            return True
+        freeze_after_iteration = int(freeze_after_iteration)
+        if freeze_after_iteration < 0:
+            raise ValueError("latent_norm_freeze_after_iteration must be non-negative")
+        return self.state.global_step <= freeze_after_iteration
 
     def _compute_loss(self, forward_results, mb_rollout_data):
         """Compute the total loss as a weighted sum of PPO and optional auxiliary losses.
@@ -3074,14 +3121,17 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)  # noqa: F841
 
-            if latent_normalizer is not None:
-                self._latent_moments = RolloutLatentMoments(latent_normalizer)
-
             # update scheduled params
             if self.schedule_dict is not None:
                 self.scheduled_params_dict = scheduler.update_scheduled_params(
                     self, self.schedule_dict, self.state.global_step
                 )
+
+            update_latent_normalizer = (
+                latent_normalizer is not None and self._should_update_latent_normalizer()
+            )
+            if update_latent_normalizer:
+                self._latent_moments = RolloutLatentMoments(latent_normalizer)
 
             reinit_dr_freq = self.env.config.get("reinit_dr_freq", 0)
             if reinit_dr_freq > 0 and self.state.global_step % reinit_dr_freq == 0:
@@ -3109,7 +3159,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 self._train_mode()
             with common.Timer("ppo_training"):
                 for ppo_epoch_idx in range(args.num_ppo_epochs):
-                    self._collect_latent_moments = latent_normalizer is not None and ppo_epoch_idx == 0
+                    self._collect_latent_moments = update_latent_normalizer and ppo_epoch_idx == 0
                     minibatch_idx = 0
                     if self.ppo_shuffle_every_epoch or ppo_epoch_idx == 0:
                         b_inds = torch.randperm(args.local_batch_size, device=device)
@@ -3296,6 +3346,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 else:
                     metrics["Policy/mean_noise_std"] = 0.0
                 if latent_normalizer is not None:
+                    metrics["Policy/latent_normalizer_frozen"] = float(not update_latent_normalizer)
                     metrics["Policy/latent_normalizer_samples"] = latent_samples
                     metrics["Policy/latent_normalizer_count"] = latent_normalizer.count.item()
                     metrics["Policy/latent_normalizer_std_mean"] = latent_normalizer._std.mean().item()

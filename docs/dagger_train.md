@@ -1,4 +1,4 @@
-### 数据清晰
+### 数据清理
 *检测穿模*
 ```bash
 python -u -m grail.datatool.batch_render_replay_clip \
@@ -20,6 +20,14 @@ python -u -m grail.datatool.batch_filter_teacher_policy \
 
 ### 在本地训练
 
+训练会自动读取 `motion_file` 所在数据集的 `meta/<motion_key>.pkl`。
+若包含 `transition_start_frame` 和 `transition_end_frame`，则与 play 使用同一套残差过渡：
+起始帧之前为纯 SONIC，过渡区间内 GRAIL 残差系数从 0 线性递增至 1，结束帧之后为 SONIC + 完整 GRAIL 残差。
+系数按各环境当前 motion 的实际帧计算，包含随机起始偏移与源数据帧率换算；没有过渡元数据的 motion 保持原行为。
+DAgger 的教师执行动作和蒸馏目标均应用此系数（包括 action-chunk）；学生的完整 latent 输出通过该目标学习，不直接乘残差系数。
+使用拼接数据时，将训练命令的 `motion_file`、`object_motion_file`、`bps_dir` 和 `object_usd_path` 指向拼接数据集，并保留同级 `meta` 目录即可，无需额外开关。
+若希望每次都从行走第一帧开始，再加 `++manager_env.commands.motion.start_from_first_frame=True` 和 `++manager_env.commands.motion.sample_before_contact=False`。
+
 ```bash
 cd /home/tide/robot/GRAIL/imports/SONIC
 
@@ -36,6 +44,32 @@ python gear_sonic/train_agent_trl.py \
   headless=False \
   num_envs=8
   
+```
+
+### 本地直接replay
+
+修改单条 Kimodo 约束后，可一键上传、远程生成、下载覆盖、拼接并重新渲染：
+
+```bash
+bash grail/walk_data_tool/regenerate_kimodo_walk.sh \
+    data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/kimodo_end_frame/pickup_table__alcohol_1__000.json
+```
+
+追加 `--dry-run` 可先检查匹配的生成命令和输出路径，不连接服务器、不修改数据。
+不传 JSON 时默认处理上述动作。脚本从 JSON 同目录的 `generate_commands.sh`
+精确匹配 `--constraints`，保留该动作的文本、时长和种子，仅改写远程输入/输出路径。
+服务器使用实际容器 `yuguanchao_kimodo`，每次工作目录为
+`/home/cuixinru/data0/kimodo/data/grail_single/<动作名>/<时间戳_PID>/`。
+回传的同名 CSV/NPZ 覆盖 `kimodo_walk/`，随后仅拼接该动作（过渡 10 帧），
+视频覆盖 `pickup_table_walk_concat/vis/<动作名>.mp4`。任一步失败即停止；
+渲染成功后才替换旧视频，其他动作的视频和已有合集不会更新。
+
+批量 replay：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash grail/visualization/scripts/visualize.sh \
+    data/hf_dataset/data_update/data/pickup_table_walk_concat \
+    16 1.5,-1.5,1.0 xyzw local 1
 ```
 
 ## 服务器端训练
@@ -70,11 +104,11 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   algo.config.num_mini_batches=4 \
   algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000
 
-CUDA_VISIBLE_DEVICES=2 python gear_sonic/train_agent_trl.py \
+CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_final_goal_hand_near_object_goal \
   headless=True \
-  num_envs=1024 \
-  experiment_name=mlp_normalize_low_lr_final_goal_tracking_critccoef \
+  num_envs=4096 \
+  experiment_name=robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_final_goal_hand_near_object_goal \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
@@ -102,7 +136,6 @@ CUDA_VISIBLE_DEVICES=2 python gear_sonic/train_agent_trl.py \
 ```bash
 cd /home/tide/robot/GRAIL/imports/SONIC
 
-
 python gear_sonic/eval_agent_trl.py \
   +checkpoint=/home/tide/robot/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/manager/universal_token/distill/robocasa_pickup_table_diffusion_decoder_latent_vector_obs_robocasa_pickup_table_diffusion_decoder_latent_vector_obs-20260820_175517/last.pt \
   +headless=True \
@@ -117,6 +150,41 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
   ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/bps \
   ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/tide/robot/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/
+```
+## 纯PNPTABLE PLAY
+
+Play 自动读取动作对应的 `meta/<motion_key>.pkl`。若同时包含
+`transition_start_frame` 和 `transition_end_frame`，latent 残差会额外乘以
+`clamp((f - start) / (end - start), 0, 1)`，其中 `f` 按原始动作 FPS
+从当前仿真步数换算（包含 reset 的起始偏移）。起始帧系数为 0，结束帧为 1，
+结束后恢复原有 `latent_residual_scale`；缺少任一字段则保持原行为。
+两个字段须为从 0 开始的整数，且 `0 <= start < end`。
+仅缩放 latent 残差，不改变手指 primitive 输出；训练和 direct-latent 学生不受影响。
+
+```bash
+python gear_sonic/eval_agent_trl.py \
+  --config-name=base \
+  +exp=manager/universal_token/hoi/pnp_table \
+  +callbacks=im_eval \
+  checkpoint=/home/tide/robot/GRAIL/imports/SONIC/models/pnp_table/last.pt \
+  headless=False \
+  num_envs=1 \
+  ++run_once=True \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_shard_rank=0 \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_shard_world_size=1 \
+  ++manager_env.commands.motion.start_from_first_frame=True \
+  ++manager_env.commands.motion.sample_before_contact=False \
+  ++manager_env.config.object_usd_path=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
+  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
+  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
+  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/tide/robot/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  ++manager_env.config.gpu_collision_stack_size_exp=27 \
+  ++manager_env.config.render_results=True \
+  ++manager_env.config.save_rendering_dir=/home/tide/robot/GRAIL/outputs/pnp_table_walk_concat_video \
+  ++manager_env.recorders.render_envs._target_=gear_sonic.envs.manager_env.mdp.recorders.RenderEnvsRecorderCfg \
+  ++manager_env.recorders.render_envs.video_save_path=/home/tide/robot/GRAIL/outputs/pnp_table_walk_concat_video \
+  ++manager_env.recorders.render_envs.video_quality=5
 ```
 ## 服务器端play
 ```bash

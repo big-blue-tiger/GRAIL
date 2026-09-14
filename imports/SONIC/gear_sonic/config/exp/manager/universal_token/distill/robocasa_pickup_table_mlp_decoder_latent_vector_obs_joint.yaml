@@ -1,15 +1,98 @@
 # @package _global_
 #
 # Direct-concatenation MLP student over raw structured observations.
-# Inherits the split-encoder experiment and adds final-frame reference object
-# poses relative to the live pelvis and hand to the student observations.
+# Consolidates final-frame object goals, hand proximity and locomotion rewards,
+# and target latent statistics scheduling over the split-encoder experiment.
 
 defaults:
   - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs
+  # The base disables object tracking with null; restore its full definition.
+  - /manager_env/rewards/terms/object_tracking_reward@_global_.manager_env.rewards
   - _self_
 
 exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_ema
 experiment_name: ${exp_base}_${exp_var}
+num_envs: 4096
+
+manager_env:
+  observations:
+    privileged_obs:
+      target_object_poses_6d:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: gear_sonic.envs.manager_env.mdp:target_object_poses_6d
+        params:
+          command_name: motion
+          asset_cfg:
+            _target_: isaaclab.managers.SceneEntityCfg
+            name: object_to_hand_frame_transformer
+
+  commands:
+    motion:
+      init_z_offset: 0.05
+    motion_velocity:
+      _target_: gear_sonic.envs.manager_env.mdp.commands.MotionVelocityCommandCfg
+      command_name: motion
+
+  rewards:
+    feet_air_time:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: isaaclab_tasks.manager_based.locomotion.velocity.mdp.rewards:feet_air_time_positive_biped
+      weight: 10.0
+      params:
+        command_name: motion_velocity
+        threshold: 0.4
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: contact_forces
+          body_names: [left_ankle_roll_link, right_ankle_roll_link]
+          preserve_order: true
+    feet_slip:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: isaaclab_tasks.manager_based.locomotion.velocity.mdp.rewards:feet_slide
+      weight: -2.0
+      params:
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: contact_forces
+          body_names: [left_ankle_roll_link, right_ankle_roll_link]
+          preserve_order: true
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: robot
+          body_names: [left_ankle_roll_link, right_ankle_roll_link]
+          preserve_order: true
+    hand_fingers_object_distance:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_hand_fingers_object_distance
+      weight: 1.5
+      params:
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: object_to_hand_frame_transformer
+        exp_coeff: -10.0
+        command_name: motion
+        gate_with_contact_label: false
+        max_distance: 0.25
+    action_rate_l2:
+      weight: -0.1
+    joint_acc_l2:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: isaaclab.envs.mdp:joint_acc_l2
+      weight: -2.5e-7
+      params:
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: robot
+    object_final_goal_distance:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_distance
+      weight: 1.0
+      params:
+        command_name: motion
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: object
+        exp_coeff: -1.0
 
 algo:
   config:
@@ -17,6 +100,7 @@ algo:
       backbone:
         _target_: gear_sonic.trl.modules.diffusion_policy_modules.EncoderJointVectorMlpPolicy
         module_config_dict:
+          privileged_input_dim: 66
           latent_normalization: empirical
           latent_norm_eps: 1.0e-3
           latent_norm_until: null
@@ -28,3 +112,7 @@ algo:
     max_grad_norm: 1
     num_mini_batches: 16
     actor_learning_rate: 2.0e-4
+    # Keep updating through iteration 3000, then freeze target latent statistics.
+    latent_norm_freeze_after_iteration: 3000
+    ppo_bc_loss_schedule:
+      bc_min_coef: 0.2

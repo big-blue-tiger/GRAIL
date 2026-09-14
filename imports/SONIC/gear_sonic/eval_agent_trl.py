@@ -58,6 +58,7 @@ from gear_sonic.trl.modules.action_chunk import (
     motion_discontinuity,
 )
 from gear_sonic.trl.utils import common as trl_utils_common
+from gear_sonic.trl.modules.eval_residual_transition import EvalResidualTransition
 from gear_sonic.trl.utils import scheduler
 from gear_sonic.utils import common as rl_utils_common
 from gear_sonic.utils import config_utils, obs_utils
@@ -1225,6 +1226,7 @@ def main(override_config: omegaconf.OmegaConf):
                 device=device,
             )
         previous_dones = torch.zeros(config.num_envs, dtype=torch.bool, device=device)
+        residual_transition = EvalResidualTransition(env)
 
         with torch.no_grad():
             while True:
@@ -1255,7 +1257,7 @@ def main(override_config: omegaconf.OmegaConf):
                     decoder_obs_dict = obs_dict
                 capture_camera_rgb(obs_dict)
                 capture_camera_outputs()
-                actor_state["actions"] = action_mean
+                actor_state["actions"] = residual_transition.apply(action_mean)
                 actor_state["obs_dict"] = decoder_obs_dict
 
                 step_count += 1

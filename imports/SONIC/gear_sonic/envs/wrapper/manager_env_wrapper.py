@@ -909,40 +909,40 @@ class ManagerEnvWrapper:
             tokenizer_meta_actions = meta_actions[:, :tokenizer_action_dim]
             hand_actions_raw = meta_actions[:, tokenizer_action_dim:]
 
-            # # Teacher/residual execution may use reference hands while the
-            # # student/direct-latent policy executes its own two hand primitives.
-            # if action_mode == "residual":
-            #     motion_hand_mask = torch.full(
-            #         (meta_actions.shape[0],),
-            #         self._teacher_use_motion_hand_actions,
-            #         device=meta_actions.device,
-            #         dtype=torch.bool,
-            #     )
-            # elif action_mode == "direct_latent":
-            #     motion_hand_mask = torch.full(
-            #         (meta_actions.shape[0],),
-            #         self._student_use_motion_hand_actions,
-            #         device=meta_actions.device,
-            #         dtype=torch.bool,
-            #     )
-            # elif action_mode == "mixed":
-            #     motion_hand_mask = torch.where(
-            #         is_teacher_env,
-            #         torch.full_like(is_teacher_env, self._teacher_use_motion_hand_actions),
-            #         torch.full_like(is_teacher_env, self._student_use_motion_hand_actions),
-            #     )
-            # else:
-            #     raise ValueError(
-            #         f"Unknown action_mode: {action_mode}. "
-            #         f"Valid modes are 'direct_latent', 'residual', or 'mixed'."
-            #     )
+            # Teacher/residual execution may use reference hands while the
+            # student/direct-latent policy executes its own two hand primitives.
+            if action_mode == "residual":
+                motion_hand_mask = torch.full(
+                    (meta_actions.shape[0],),
+                    self._teacher_use_motion_hand_actions,
+                    device=meta_actions.device,
+                    dtype=torch.bool,
+                )
+            elif action_mode == "direct_latent":
+                motion_hand_mask = torch.full(
+                    (meta_actions.shape[0],),
+                    self._student_use_motion_hand_actions,
+                    device=meta_actions.device,
+                    dtype=torch.bool,
+                )
+            elif action_mode == "mixed":
+                motion_hand_mask = torch.where(
+                    is_teacher_env,
+                    torch.full_like(is_teacher_env, self._teacher_use_motion_hand_actions),
+                    torch.full_like(is_teacher_env, self._student_use_motion_hand_actions),
+                )
+            else:
+                raise ValueError(
+                    f"Unknown action_mode: {action_mode}. "
+                    f"Valid modes are 'direct_latent', 'residual', or 'mixed'."
+                )
 
-            # if motion_hand_mask.any().item():
-            #     # Use motion data directly: -1.0 = open, +1.0 = closed
-            #     # Threshold at 0 in _convert_primitive_to_finger_actions
-            #     motion_hand_actions = self.get_reference_hand_actions()
-            #     hand_actions_raw = hand_actions_raw.clone()
-            #     hand_actions_raw[motion_hand_mask] = motion_hand_actions[motion_hand_mask]
+            if motion_hand_mask.any().item():
+                # Use motion data directly: -1.0 = open, +1.0 = closed
+                # Threshold at 0 in _convert_primitive_to_finger_actions
+                motion_hand_actions = self.get_reference_hand_actions()
+                hand_actions_raw = hand_actions_raw.clone()
+                hand_actions_raw[motion_hand_mask] = motion_hand_actions[motion_hand_mask]
 
             # Action history and action-based rewards must reflect the primitives
             # that are actually sent to the environment after source selection.
