@@ -164,6 +164,9 @@ class ManagerEnvWrapper:
 
             env_config = exported_config.get("env_config", {})
             algo_config = exported_config.get("algo_config", {})
+            active_encoders = self.config.get("action_transform_active_encoders", None)
+            if active_encoders is not None:
+                algo_config.actor.backbone.active_encoders = active_encoders
 
             self.action_transform_module = custom_instantiate(
                 algo_config.actor, env_config=env_config, algo_config=algo_config, _resolve=False
@@ -188,7 +191,17 @@ class ManagerEnvWrapper:
                 checkpoint = torch.load(
                     action_transform_module_checkpoint, map_location=self.device, weights_only=False
                 )
-                self.action_transform_module.load_state_dict(checkpoint["policy_state_dict"])
+                state_dict = checkpoint["policy_state_dict"]
+                if active_encoders is not None:
+                    # Drop only disabled encoder weights; keep strict checks for everything else.
+                    disabled_prefixes = tuple(
+                        f"actor_module.{group}.{name}."
+                        for name in algo_config.actor.backbone.encoders
+                        if name not in active_encoders
+                        for group in ("encoders", "encoder_input_projectors")
+                    )
+                    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(disabled_prefixes)}
+                self.action_transform_module.load_state_dict(state_dict)
                 logger.info(
                     f"Loaded action_transform_module checkpoint: {action_transform_module_checkpoint}"
                 )

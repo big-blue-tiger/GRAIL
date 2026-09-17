@@ -3454,8 +3454,6 @@ class TrackingCommand(CommandTerm):
                 ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
             )
             root_pos[env_ids] += rand_samples[:, 0:3]
-            if self.cfg.init_z_offset != 0.0:
-                root_pos[env_ids, 2] += self.cfg.init_z_offset
             orientations_delta = quat_from_euler_xyz(
                 rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
             )
@@ -3470,6 +3468,10 @@ class TrackingCommand(CommandTerm):
             )
             root_lin_vel[env_ids] += rand_samples[:, :3]
             root_ang_vel[env_ids] += rand_samples[:, 3:]
+
+        # Fixed collision-mesh compensation applies during both training and evaluation.
+        if self.cfg.init_z_offset != 0.0:
+            root_pos[env_ids, 2] += self.cfg.init_z_offset
 
         # Handle DOF mismatch between motion library and robot
         motion_lib_joint_pos = self.joint_pos.clone()  # Shape: [num_envs, motion_lib_num_dof]

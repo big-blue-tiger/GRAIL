@@ -39,6 +39,7 @@ class RewardsCfg:
     tracking_body_linvel = None
     tracking_body_angvel = None
     action_rate_l2 = None
+    action_acc_l2 = None
     joint_acc_l2 = None
     joint_limit = None
     undesired_contacts = None
@@ -98,6 +99,7 @@ class RewardsCfg:
     foot_slippage_penalty = None
     feet_air_time = None
     feet_slip = None
+    micro_step_penalty = None
 
 
 def tracking_anchor_pos_error(

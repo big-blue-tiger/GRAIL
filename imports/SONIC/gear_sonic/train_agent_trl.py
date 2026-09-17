@@ -343,7 +343,13 @@ def main(config: OmegaConf):
         _lock_path = "/tmp/isaaclab_app_launcher.lock"
         _local_rank = int(os.environ.get("LOCAL_RANK", 0))
         with FileLock(_lock_path):
-            app_launcher = AppLauncher(args_cli)
+            # Kit also parses sys.argv; Hydra's --config-path can crash Kit startup.
+            hydra_argv = sys.argv
+            try:
+                sys.argv = sys.argv[:1]
+                app_launcher = AppLauncher(args_cli)
+            finally:
+                sys.argv = hydra_argv
 
         simulation_app = app_launcher.app
 

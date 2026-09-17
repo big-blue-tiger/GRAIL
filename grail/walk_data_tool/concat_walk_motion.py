@@ -231,6 +231,50 @@ def slice_robot_motion(motion, start=None, stop=None):
             for key, value in motion.items()}
 
 
+def crop_paired_motion(robot, objects, source_frame, transition_frames):
+    """Crop robot/object time together; contacts remain zero-based frame indices."""
+    total = validate_fields(robot, "robot")
+    if validate_fields(objects, "object") != total or robot["fps"] != objects["fps"]:
+        raise ValueError("Robot/object frame counts or fps differ")
+    if type(source_frame) is not int or not 0 <= source_frame < total:
+        raise ValueError(f"Invalid source_frame: {source_frame}")
+    if total - source_frame <= transition_frames:
+        raise ValueError(f"Cropping at {source_frame} leaves {total - source_frame} frames; "
+                         f"PCHIP requires at least {transition_frames + 1}")
+    cropped_objects = {}
+    for key, value in objects.items():
+        if key in CONTACT_FIELDS:
+            cropped_objects[key] = {int(frame) - source_frame: points
+                                    for frame, points in value.items() if frame >= source_frame}
+        elif key in {"fps", "scale"}:
+            cropped_objects[key] = value
+        else:
+            cropped_objects[key] = value[source_frame:]
+    return slice_robot_motion(robot, start=source_frame), cropped_objects
+
+
+def constraint_source_frame(manifest_path, robot_path, motion_key, robot):
+    """Resolve an exact source/key pair and reject stale constraint metadata."""
+    if manifest_path is None:
+        return 0
+    manifest = json.loads(Path(manifest_path).read_text())
+    matches = [record for record in manifest["records"]
+               if Path(record["source"]).resolve() == Path(robot_path).resolve()
+               and record["motion_key"] == str(motion_key)]
+    if len(matches) != 1:
+        raise ValueError(f"Expected one constraint record for {robot_path} / {motion_key}; "
+                         f"found {len(matches)}")
+    record = matches[0]
+    if (record.get("source_sha256") != file_hash(robot_path)
+            or record.get("source_num_frames") != len(robot["dof"])
+            or record.get("source_fps") != robot["fps"]):
+        raise ValueError("Constraint manifest does not match source hash/frame count/fps; re-export constraints")
+    frame = record.get("source_frame")
+    if type(frame) is not int or not 0 <= frame < len(robot["dof"]):
+        raise ValueError(f"Invalid source_frame in constraint manifest: {frame}")
+    return frame
+
+
 def joint_mapping(asset=ASSET):
     joints = [j for j in ET.parse(asset).getroot().find("worldbody").iter("joint")
               if j.get("type") != "free"]
@@ -267,7 +311,7 @@ def load_kimodo_csv(path, template, *, asset=ASSET):
         result["dof"][..., None] * axes[None]], axis=1)
     result["smpl_joints"] = np.zeros((n, 24, 3))
     for key in ("hand_dof_pos", "hand_action_left", "hand_action_right"):
-        result[key] = np.repeat(template[key][:1], n, axis=0)
+        result[key] = np.repeat(template[key][:1], n, axis=0) if key == "hand_dof_pos" else np.ones(n)
     for key in WALK_FIELDS:
         result[key] = result[key].astype(template[key].dtype)
     validate_fields(result, "robot")
@@ -374,7 +418,7 @@ def file_hash(path):
 
 
 def export_dataset(walk_csv, dataset_dir, motion_name, output_dir, overwrite=False,
-                   transition_frames=TRANSITION_FRAMES):
+                   transition_frames=TRANSITION_FRAMES, constraint_manifest=None):
     if not isinstance(transition_frames, int) or transition_frames < 1:
         raise ValueError("transition_frames must be a positive integer")
     dataset_dir, output_dir = Path(dataset_dir).resolve(), Path(output_dir).resolve()
@@ -392,6 +436,10 @@ def export_dataset(walk_csv, dataset_dir, motion_name, output_dir, overwrite=Fal
     n_b = validate_fields(robot, "robot")
     if validate_fields(objects, "object") != n_b or robot["fps"] != objects["fps"]:
         raise ValueError("Robot/object frame counts or fps differ")
+    original_frames = n_b
+    source_frame = constraint_source_frame(constraint_manifest, robot_path, robot_key, robot)
+    robot, objects = crop_paired_motion(robot, objects, source_frame, transition_frames)
+    n_b = len(robot["dof"])
     assets = [Path("meta") / f"{motion_name}.pkl", Path("bps") / f"{motion_name}.npy"]
     usd = [p.relative_to(dataset_dir) for ext in (".usd", ".usda")
            if (p := dataset_dir / "object_usd" / f"{motion_name}{ext}").is_file()]
@@ -427,6 +475,8 @@ def export_dataset(walk_csv, dataset_dir, motion_name, output_dir, overwrite=Fal
     # including rewritten A/B frames, not just the newly inserted frames.
     output_meta.update({
         "total_frames": len(combined["dof"]),
+        "source_start_frame": source_frame,
+        "source_total_frames": original_frames,
         "transition_start_frame": n_a - transition_frames,
         "transition_end_frame": n_a - transition_frames + len(transition["dof"]) - 1,
     })
@@ -436,6 +486,10 @@ def export_dataset(walk_csv, dataset_dir, motion_name, output_dir, overwrite=Fal
     report = {"sources": {"walk_csv": str(walk_csv), "robot": str(robot_path),
                            "objects": str(object_path)}, "motion_name": motion_name,
               "internal_motion_key": robot_key, "frames_a": n_a, "frames_b": n_b,
+              "source_frame": source_frame, "source_num_frames": original_frames,
+              "constraint_manifest": str(Path(constraint_manifest).resolve()) if constraint_manifest else None,
+              "source_to_output_frame_offset": b_start_index - source_frame,
+              "original_unchanged_from_frame": source_frame + transition_frames,
               "transition_frames": transition_frames, "transition_start_index": n_a,
               "transition_method": "four-point PCHIP; sign-continuous normalized quaternion components",
               "replacement_start_index": n_a - transition_frames,
@@ -492,6 +546,8 @@ def main():
     parser.add_argument("--dataset-dir", type=Path, default=DATA_ROOT / "pickup_table_cleaned_succeeded")
     parser.add_argument("--motion-name", default=DEFAULT_NAME)
     parser.add_argument("--output-dir", type=Path, default=DATA_ROOT / "pickup_table_walk_concat")
+    parser.add_argument("--constraint-manifest", type=Path,
+                        help="Read and validate source_frame from the new constraint manifest; omitted = frame 0")
     parser.add_argument("--transition-frames", type=int, default=TRANSITION_FRAMES,
                         help="Inserted frames N and context per side; knots A[-N-1], A[-1], B[0], B[N] (default: 10)")
     parser.add_argument("--overwrite", action="store_true")

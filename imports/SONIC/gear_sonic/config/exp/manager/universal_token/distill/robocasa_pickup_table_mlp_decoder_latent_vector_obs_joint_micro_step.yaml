@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint
+  - _self_
+
+exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step
+experiment_name: ${exp_base}_${exp_var}
+
+manager_env:
+  config:
+    action_transform_active_encoders: [g1]
+  rewards:
+    micro_step_penalty:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp.micro_step_reward:MicroStepPenalty
+      # Each qualifying foot touchdown contributes weight * step_dt to the reward.
+      weight: -3.0
+      params:
+        # command_name: motion_velocity
+        min_step_length: 0.13
+        min_air_time: 0.3
+        # Reference-speed gating is commented out in MicroStepPenalty.
+        # use_slow_speed_gate: true
+        # slow_speed_full: 0.05
+        # slow_speed_zero: 0.10
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: contact_forces
+          body_names: [left_ankle_roll_link, right_ankle_roll_link]
+          preserve_order: true
+        asset_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: robot
+          body_names: [left_ankle_roll_link, right_ankle_roll_link]
+          preserve_order: true

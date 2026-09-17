@@ -262,6 +262,11 @@ def _write_run_once_report(path, checkpoint, results, num_envs):
             "accepted": accepted,
             "early_terminated": rejected,
             "missing": int(num_envs) - len(completed_results),
+            "timeout_success": sum(result["timed_out"] for result in completed_results),
+            "timeout_success_rate": (
+                sum(result["timed_out"] for result in completed_results) / int(num_envs)
+                if complete else None
+            ),
         },
     }
     _atomic_write_json(path, payload)
@@ -1314,7 +1319,7 @@ def main(override_config: omegaconf.OmegaConf):
                             displayed_reasons = [
                                 (
                                     f"{reason}(参考/真实物体位置偏差 > "
-                                    f"{config.object_pos_deviation_threshold:.3f} m)"
+                                    f"{object_pos_threshold:.3f} m)"
                                     if reason == "object_pos_deviation"
                                     else reason
                                 )
@@ -1329,6 +1334,12 @@ def main(override_config: omegaconf.OmegaConf):
                             )
                     envs_completed |= done_mask
                     if envs_completed.all():
+                        timeout_success = sum(result["timed_out"] for result in run_once_results)
+                        logger.info(
+                            f"Timeout Success Rate: {timeout_success}/{config.num_envs} "
+                            f"= {timeout_success / config.num_envs:.2%} "
+                            "(每个环境仅统计首个 episode，timeout 即成功)"
+                        )
                         logger.info(
                             f"全部 {config.num_envs} 条数据均已完成一次 episode；"
                             "退出评估 (run_once=True)。"

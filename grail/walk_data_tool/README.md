@@ -1,134 +1,183 @@
-# Kimodo → GRAIL 动作拼接
+# 行走动作拼接
 
-将 Kimodo 行走 CSV 放在 GRAIL 抓取 motion 之前。固定抓取段 B 的世界坐标，
-用 pelvis yaw 和双脚中心 XY 对齐行走段 A 的最后一帧。导出数据，不生成视频。
+`concat_walk_motion.py` 将 Kimodo 行走动作接在原始抓取动作之前，并导出配套数据。下面统一使用一种批量写法：在仓库根目录的 Bash 终端执行，使用已安装项目依赖的 `grail` Conda 环境。
 
-## 运行
+输入数据集为 `data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded`，遍历其中 `robot/*.pkl`，以文件名（不含扩展名）作为 `--motion-name`，查找 `kimodo_walk/` 中的同名 CSV。例如，`robot/pickup_table__alcohol_12__001.pkl` 对应 `kimodo_walk/pickup_table__alcohol_12__001.csv` 和 `objects/pickup_table__alcohol_12__001.pkl`，以及同名的配套资源。拼接读取 CSV，不读取旁边的 NPZ 文件。
 
-在仓库根目录、已有 GRAIL Python 环境下运行（需要 NumPy、SciPy、joblib 和 SONIC FK 的依赖）：
+## 按最后一次脚步结束帧生成约束
 
-```bash
-conda activate grail
-python grail/walk_data_tool/concat_walk_motion.py
-```
+`export_kimodo_end_frame.py` 扫描**整段**原始 robot motion，利用 Kimodo 的 CPU
+运动学计算左右脚踝、脚尖的世界坐标，选择最后一次有效移动后双脚稳定窗口的起始帧 `k`。
+`k` 是原数据的零基帧索引，它作为 **Kimodo 生成行走的末帧约束**；生成行走的第一帧仍为
+采样得到的起点。检测包含抓取期间、抓取之后的小碎步，因此允许裁掉部分抓取过程。
 
-默认读取：
-
-- A：`data/kimodo/demo/qpos.csv`
-- B：`data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot/pickup_table__alcohol_12__001.pkl`
-- 同名的 `objects/`、`meta/`、`bps/`、`object_usd/` 配套文件。
-
-默认写到 `data/hf_dataset/data_update/data/pickup_table_walk_concat/`：
-
-```text
-robot/pickup_table__alcohol_12__001.pkl
-objects/pickup_table__alcohol_12__001.pkl
-meta/pickup_table__alcohol_12__001.pkl
-bps/pickup_table__alcohol_12__001.npy
-object_usd/pickup_table__alcohol_12__001.usd
-reports/pickup_table__alcohol_12__001.json
-```
-
-输入存在 BPS 的 `_*.npy` 共享文件时也会复制。BPS、USD 按原文件复制，
-meta 保留桌子等原有字段，并新增 `total_frames`、`transition_start_frame`、
-`transition_end_frame`。当前样例分别为 **513、243、272**，起止索引从 0 开始且两端都包含，
-表示 `build_transition` 生成的完整 30 帧替换窗口（包含 A/B 被重写的帧）。
-不会复制原数据集的清洗报告或其他 motion。当前样例 USD 没有外部引用。
-后续若换成带外部资源的 USD，需要同时提供那些资源并保持引用路径。
-
-可覆盖输入和输出路径：
+先导出到独立目录（不会加载生成模型、CUDA 或 IsaacSim）：
 
 ```bash
-python grail/walk_data_tool/concat_walk_motion.py \
-  --walk-csv data/kimodo/demo/qpos.csv \
-  --dataset-dir data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded \
-  --motion-name pickup_table__alcohol_7__000 \
-  --output-dir data/hf_dataset/data_update/data/pickup_table_walk_concat \
-  --transition-frames 20
+dataset=data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded
+python grail/walk_data_tool/export_kimodo_end_frame.py \
+  --input-dir "$dataset/robot" \
+  --output-dir "$dataset/kimodo_end_frame_last_step" \
+  --workers 4 --replay
 ```
 
-`--transition-frames N` 默认为 10，同时控制新增过渡帧数和两侧控制点距离：
-10 对应 `A[-11], A[-1], B[0], B[10]`，20 对应
-`A[-21], A[-1], B[0], B[20]`。A 末帧和 B 首帧之间插入 N 帧，
-因此两个端点相隔 N+1 个时间步。每段输入至少需要 N+1 帧。
-完整替换窗口为 3N 帧，拼接方式为 `[A_aligned[:-N], window, B[N:]]`；
-输出总帧数为 `len(A) + N + len(B)`。物体、接触帧、meta 和报告索引同步调整。
+默认最多使用 4 个 CPU 进程，按 PKL 分配任务，每个进程复用运动学实例并限制计算线程数。
+`--workers 1` 可串行运行；同一 seed 下，改变进程数或 `--pattern` 不改变单条动作的结果。
+重复写入已有输出需加 `--overwrite`。每个 PKL 可包含多个 motion，输出名会附加
+`__motion_000` 等序号；后续现有拼接接口仍要求每个 PKL 只有一个 motion。
 
-已有输出默认报错；重新生成同一结果时添加 `--overwrite`。
-输出目录不能是输入数据集目录、其父目录或子目录。默认路径按脚本位置解析，
-传入的相对路径按当前工作目录解析。
+检测参数如下，时间均按**原动作 FPS**换算，`--fps` 仍只控制 Kimodo 生成 FPS：
 
-## 时间轴和数据约定
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `--foot-speed-on` | `0.05` | 任一脚踝/脚尖开始移动的速度，m/s |
+| `--foot-speed-off` | `0.03` | 双脚稳定窗口内的速度上限，m/s |
+| `--min-foot-excursion` | `0.03` | 区间内相对起点的最大三维位移，m；不是净位移 |
+| `--stable-time` | `0.3` | 确认稳定所需的连续时长，s；不额外后移选帧 |
+| `--smooth-window` | `0.08` | 检测用中值滤波窗口，s；转换为奇数帧，0 禁用 |
+| `--transition-frames` | `10` | 为后续 PCHIP 保留至少 N+1 帧，需与拼接参数一致 |
 
-以下以默认 `--transition-frames 10` 为例：当前输入 A 为 253 帧，B 为 250 帧、25 Hz。
-加入 10 帧过渡后，输出 **513 帧、25 Hz**：
+速度使用相邻帧差分，左右脚独立查找区间；稳定窗口同时检查双脚。有效位移包含原地抬脚后
+回落、仅脚尖移动。小于位移阈值的区间作为噪声忽略；始终低于开始速度的缓慢移动不会触发
+脚步区间。这是运动学检测，不是接触力判定，可结合诊断图调整阈值。滤波仅影响检测，导出
+约束始终使用第 `k` 帧原始姿态。没有有效脚步且存在稳定状态时选第 0 帧。
 
-- A 占索引 `0..252`，过渡占 `253..262`，B 占 `263..512`，两段端点都保留。
-- 插值采用四点 PCHIP，控制点是 A[-11]、A[-1]、B[0]、B[10]，即输出索引
-  `242、252、263、273`。在输出索引 `243..272` 上重新求值，覆盖恰好 30 帧：
-  A 最后 10 帧 + 新增 10 帧 + B 最前 10 帧。控制点的实际间隔为 `10、11、10` 帧。
-- 根位置、关节角及手指数据逐分量 PCHIP；四元数控制点先连续符号校正，逐分量
-  PCHIP 后再归一化。`pose_aa` 从插值后的根四元数和 DOF 重建。
-  A 末帧、B 首帧的数据（含四元数符号）原样保留，避免改变控制点。
-- 两段各需至少 11 帧。A 的 `0..242` 和 B 的 `10..249` 保持原样（A 已做 SE(2) 对齐）；
-  B 的 `1..9` 允许被插值改写，不再承诺整个 B 数组不变。没有对 B 做整体平移或旋转。
-  25 Hz 下仍只新增 0.4 秒，A 原末帧到 B 原首帧相隔 11 个时间步，即 0.44 秒。
-- CSV 不含 FPS，本工具按 B 的 FPS 解释全部 CSV 帧，不重采样。
-  如果 CSV 原本为 30 Hz，行走播放速度会变为原来的 5/6。
-- CSV 为无表头的 36 列：`xyz + wxyz + 29 DOF`，米、弧度、Z-up。
-  机器人 PKL 的 `root_rot` 用 **xyzw**；物体 `root_quat` 用 **wxyz**。
-- 身体顺序来自 Kimodo `exports/mujoco.py` 对 G1 XML 的 joint 遍历。
-  本工具存有明确的源关节名称和轴定义，与 GRAIL MJCF 按名称映射、校验旋转轴。
-  CSV 应使用官方转换器默认的 `mujoco_rest_zero=False` 导出方式。
-- PCHIP 前的 A 保留肩肘摆臂等身体动作，六个腕 roll/pitch/yaw 固定为 `0`。
-  这是相对前臂的中立腕姿，手掌仍随手臂运动，不锁定世界朝向。
-- A 的 14 个三指手 DOF、左右手标量动作分别重复 B 首帧原值。
-  手指排列和标量动作编码保持原样；不由手指角度均值重新推算动作。
-- B 首帧和第 10 帧及之后的所有机器人数组完整保留；重建 A 和 PCHIP 窗口的 `pose_aa`。
-  `smpl_joints` 保持与源导出器一致的全零占位。
-- 物体在 A 和过渡阶段保持 B 首帧的位姿；这两个阶段无手物接触，B 的接触帧索引整体加 263。
-  meta 中桌子的位姿、尺寸以及 BPS 均不做坐标变换。
+默认参数已根据六条视频的人工停步时间校准。旧的 5 mm 门槛会将站立时脚跟抬落和踝部
+晃动误判为小碎步；现在以 3 cm 为有效位移门槛，同时将启动/稳定速度调整为 0.05/0.03 m/s。
+稳定观察时间为 0.3 s，以免把迈步中的短暂停顿当作结束；中值滤波仍为 0.08 s。
+参数统一应用于所有动作，不按文件名指定帧。小于 3 cm 的微动默认忽略，仍可用 CLI 降低门槛。
 
-GRAIL 当前 `MotionLibRobot` 会在加载时做 50 Hz 重采样并从 FK 推导速度。
-导出阶段增加 10 帧并用 PCHIP 重写接缝附近的 30 帧，不做全段重采样、IK 或额外高度修正。
-窗口内 root Z 也做 PCHIP 插值；不保证脚接触固定或边界速度连续。
-当前 29 维 `dof` 文件的训练路径使用 `hand_action_left/right`；独立的 14 维
-`hand_dof_pos` 完整保存在 PKL 中供回放等消费者读取，现有 loader 不会自动把它追加到 29 维身体 DOF。
+以下时间均使用原始 25 FPS，视频帧数和 FPS 已核对一致；人工标注按近似秒数解释。
+`alcohol_4__000` 已确认是第 4 秒结束、第 5 秒刚开始，目标记为 5.0 s。
 
-## 训练 / 评估加载
+| 动作（省略 `pickup_table__`） | 人工停步时间（s） | 新检测时间（s） | 原始帧 k |
+| --- | --- | --- | --- |
+| `alcohol_1__001` | 3.0 | 3.00 | 75 |
+| `alcohol_2__000` | 1.0 | 1.44 | 36 |
+| `alcohol_2__001` | 5.0 | 5.24 | 131 |
+| `alcohol_2__004` | 0.0 | 0.00 | 0 |
+| `alcohol_4__000` | 5.0 | 5.36 | 134 |
+| `alcohol_4__001` | 2.0 | 1.92 | 48 |
 
-在你原有训练或评估命令后使用以下覆盖项（这里以本机路径为例，部署到 `/home/GRAIL` 时相应替换前缀）：
+校准样本最大偏差为 0.44 s，回归测试容差为 0.5 s，无走动样本要求严格选第 0 帧。
+这些是校准集结果，不代表其他数据集上的检测准确率。
+
+输出包括每条成功动作的约束 JSON、`manifest.json`、仅包含成功动作的 `generate_commands.sh`、
+`failures.json`，以及 `diagnostics/<动作名>.png`。PNG 显示原始/滤波轨迹、速度、移动区间和
+选帧；速度轴在阈值附近为线性、较大值为对数，便于同时检查大步和小碎步。`--replay` 额外
+生成可直接用浏览器打开的 HTML，播放 `k` 前后各 1 秒的原始骨架，支持逐帧拖动、脚部放大；
+无法选帧时显示末尾 1 秒。HTML 无网络、视频编码器或模拟器依赖。
+
+末尾仍在移动、无法确认双脚稳定、剩余帧不足或单条数据异常时，记录失败并继续其余动作，
+最后返回非零退出码。损坏的 PKL 也会生成说明失败原因的占位图。manifest 中的成功记录包含
+`source_frame`、源文件 SHA-256、帧数、FPS、检测参数和移动区间。覆盖重跑时，本次失败动作
+以前生成的约束 JSON 会移除，防止误用；其他未参与本次处理的文件不会清理。
+
+**必须使用这些新约束重新运行 Kimodo 生成，不能把现有旧 CSV 直接用于新裁剪记录。**
+将约束上传至 `--server-data-dir` 对应目录，在服务器运行新的 `generate_commands.sh`，再把
+生成 CSV 按动作名放入 `kimodo_walk/`。模型生成沿用现有服务器流程，不在本地检测阶段执行。
+
+## 使用同一 manifest 同步裁剪和拼接
+
+批量脚本仍串行拼接，显式传入本次生成时使用的 manifest：
 
 ```bash
-++manager_env.config.object_usd_path=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
-++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/tide/robot/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/
+bash grail/walk_data_tool/concat_kimodo_walk.sh \
+  data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded \
+  data/hf_dataset/data_update/data/pickup_table_walk_concat \
+  data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/kimodo_end_frame_last_step/manifest.json
 ```
 
-`meta/` 按 `robot/` 的同级目录自动查找。文件名和内部 key 保持原有关系。
-若要从行走第一帧开始评估，额外设置
-`++manager_env.commands.motion.start_from_first_frame=True`。
+拼接通过源路径和 motion key 查找唯一记录，并检查 SHA-256、帧数和 FPS。记录缺失、重复或
+源文件变化均报错。机器人所有时序字段和物体位置/旋转从 `[k:]` 同步裁剪；删除 `< k` 的
+接触记录，其余接触索引先减 `k`，再增加行走前缀长度。物体在新增前缀期间保持原第 `k` 帧
+状态。直接调用 Python 接口或 CLI 时若省略 `--constraint-manifest`，仍按旧行为从第 0 帧拼接。
 
-## 验证与扩展
-
-脚本在临时目录完成写出、回读、B 第 10 帧起的后缀、A 保留前缀和内部控制点逐值及 dtype 比对、静态资源 SHA-256 比对、
-现有 `validate_motion_input` 校验后，再发布对应文件。JSON 报告记录帧数、帧率策略、
-过渡帧数与方法、拼接索引、SE(2) 旋转和平移、中心 / yaw 误差及单脚残差。
+以下是等价的展开批处理命令：
 
 ```bash
-python -m unittest grail.walk_data_tool.test_concat_walk_motion -v
+(
+  set -eo pipefail
+  set -u
+  shopt -s failglob
+
+  dataset=data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded
+  output=data/hf_dataset/data_update/data/pickup_table_walk_concat
+  constraint_manifest="$dataset/kimodo_end_frame_last_step/manifest.json"
+
+  mkdir -p "$output/object_usd/textures"
+  cp -a "$dataset/object_usd/textures/." "$output/object_usd/textures/"
+
+  mkdir -p "$output/reports"
+  missing_list="$output/reports/missing_walk_csv.txt"
+  failed_list="$output/reports/failed_concat.txt"
+  : > "$missing_list"
+  : > "$failed_list"
+  total=0
+  succeeded=0
+  missing=0
+  failed=0
+
+  for robot in "$dataset"/robot/*.pkl; do
+    name=$(basename "$robot" .pkl)
+    csv="$dataset/kimodo_walk/$name.csv"
+    total=$((total + 1))
+    if [[ ! -f "$csv" ]]; then
+      printf '%s\n' "$name" >> "$missing_list"
+      missing=$((missing + 1))
+      continue
+    fi
+    if python grail/walk_data_tool/concat_walk_motion.py \
+      --dataset-dir "$dataset" \
+      --walk-csv "$csv" \
+      --motion-name "$name" \
+      --output-dir "$output" \
+      --constraint-manifest "$constraint_manifest" \
+      --transition-frames 10 \
+      --overwrite; then
+      succeeded=$((succeeded + 1))
+    else
+      printf '%s\n' "$name" >> "$failed_list"
+      failed=$((failed + 1))
+    fi
+  done
+
+  printf '\n总数：%d，成功：%d，缺少 CSV：%d，转换失败：%d\n' \
+    "$total" "$succeeded" "$missing" "$failed"
+  printf '\n缺少 walk-csv 的动作（%s）：\n' "$missing_list"
+  cat "$missing_list"
+  printf '\n转换失败的动作（%s）：\n' "$failed_list"
+  cat "$failed_list"
+  # 有未成功转换的动作时，汇总后返回非零退出码。
+  [[ "$missing" -eq 0 && "$failed" -eq 0 ]]
+)
 ```
 
-测试包括实际样例导出、CPU `MotionLibRobot` 加载、50 Hz 机器人 / 物体 / 接触 / 手动作读取。
-CPU loader 仍会创建 multiprocessing 本地套接字，运行环境须允许本地进程通信。
-A 原末帧与 B 原首帧的中心误差要求 `<1e-5 m`，yaw 误差要求 `<1e-5 rad`。
-该样例的左右单脚水平残差各约 4.2 cm，这是站姿差异；本版本只对齐中心，不要求两脚分别重合。
+`--transition-frames 10` 使用四点 PCHIP 插值，新增 10 帧，并改写行走末尾和裁剪后动作开头各 10 帧的过渡区间；两段动作都至少需要 11 帧。行走段通过水平平移和偏航旋转对齐第 `k` 帧，按原始动作的 FPS 使用，不进行重采样。裁剪后第 10 帧（即原动作 `k+10` 帧）起保持原始数据不变。
 
-脚本接口分为 CSV 适配、GRAIL FK、`compute_se2_alignment`、`transform_motion_se2`、
-`build_transition`、`concat_motion`、物体扩展与导出。`concat_motion` 接受多个同格式、同帧率的 motion，
-不隐式对齐；`build_transition` 默认产生 30 帧替换窗口，随后按 `[A_aligned[:-10], window, B[10:]]` 拼接。
-后续批量任务可复用导出函数，IK 可放在过渡生成与拼接之间。
-世界位置、xyzw 旋转、世界速度和局部关节数据有各自的处理类别；未知字段直接报错，
-需新增明确的适配策略。首版 CLI 处理一组 CSV + 抓取 motion。
+`--overwrite` 允许批量处理时重复写入共享 BPS 资源，也会覆盖输出目录中已有的同名结果。源数据集保持不变；缺少 CSV 或单个动作转换失败时，记录动作名并继续处理其余动作，具体转换报错保留在终端输出中。最后打印本次总数、成功数、缺少 CSV 数和转换失败数，并列出未成功的动作名；清单分别保存到 `reports/missing_walk_csv.txt` 和 `reports/failed_concat.txt`，每次运行重置。只导出有对应 CSV 且转换成功的动作；输出目录中以前运行的结果不会自动清理，统计以本次执行为准。有未成功转换的动作时，命令在输出汇总后返回非零退出码。
+
+全部结果写入 `data/hf_dataset/data_update/data/pickup_table_walk_concat`，每个动作包含以下完整配套文件：
+
+- `robot/<动作名>.pkl`：拼接后的机器人动作。
+- `objects/<动作名>.pkl`：与机器人帧数一致的物体动作及接触信息。
+- `meta/<动作名>.pkl`：保留原始元数据，并更新总帧数、过渡起止帧（从 0 开始，包含两端）。
+- `bps/<动作名>.npy` 和 `bps/_*.npy`：对应动作及共享 BPS 资源。
+- `object_usd/<动作名>.usd` 或 `.usda`：原始物体资产。
+- `object_usd/textures/`：由命令中的 `cp -a` 完整复制共享纹理目录，保留子目录结构和隐藏文件；重复执行时覆盖同名纹理文件。
+- `reports/<动作名>.json`：输入来源、帧数、对齐误差及数据校验结果。
+
+报告额外记录 `source_frame`、`source_num_frames` 和 `source_to_output_frame_offset`。
+原始保留帧 `t` 对应输出帧 `t + source_to_output_frame_offset`；机器人过渡改写范围按原有
+`replacement_start_index` / `replacement_stop_index_exclusive` 表示。
+
+CPU 测试（包含本地 Kimodo 存在时的串并行一致性与真实 FK 拼接检查）：
+
+```bash
+python -m unittest discover -s grail/walk_data_tool/tests -v
+```
+
+每个动作必须具备上述输入配套资源，其中同名 USD/USDA 资产应恰好有一个。脚本在写出前会重新读取并校验动作及资源。
+
+Kimodo 行走段的 `hand_action_left` / `hand_action_right` 在拼接时直接设为 `+1`（闭合），
+之后沿用现有 PCHIP 过渡至原动作的手指令，无需额外后处理。`hand_dof_pos` 仍沿用原动作接入帧的记录。
