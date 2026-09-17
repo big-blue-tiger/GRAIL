@@ -239,6 +239,7 @@ class Actor(nn.Module):
             action_mean = output["action_mean"]
             self.aux_losses = output["aux_losses"]
             self.aux_loss_coef = output["aux_loss_coef"]
+            self.aux_losses_per_sample = output.get("aux_losses_per_sample", {})
         else:
             action_mean = output
         return action_mean

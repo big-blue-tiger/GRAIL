@@ -38,6 +38,14 @@ class RewardsCfg:
     tracking_relative_body_ori_weighted = None
     tracking_body_linvel = None
     tracking_body_angvel = None
+    tracking_relative_body_pos_upper = None
+    tracking_relative_body_pos_lower = None
+    tracking_relative_body_ori_upper = None
+    tracking_relative_body_ori_lower = None
+    tracking_body_linvel_upper = None
+    tracking_body_linvel_lower = None
+    tracking_body_angvel_upper = None
+    tracking_body_angvel_lower = None
     action_rate_l2 = None
     action_acc_l2 = None
     joint_acc_l2 = None
@@ -77,6 +85,7 @@ class RewardsCfg:
     # Object motion tracking reward (OmniGrasp-style r_t^obj)
     object_tracking_reward = None
     object_final_goal_distance = None
+    object_acc_l2 = None
     object_lift_contact_reward = None
     # Finger primitive action limit penalty
     finger_primitive_limit = None
@@ -464,8 +473,21 @@ def tracking_body_ori_error(
     return torch.exp(-angular_err.square().mean(dim=-1) / (std * std))
 
 
+def _gate_tracking_before_grail(command, reward, gate_before_grail):
+    """Disable a tracking term at the reported GRAIL start of Kimodo motions."""
+    if not gate_before_grail:
+        return reward
+    from gear_sonic.trl.modules.eval_residual_transition import KimodoTrackingBoundary
+
+    if not hasattr(command, "_kimodo_tracking_boundary"):
+        command._kimodo_tracking_boundary = KimodoTrackingBoundary()
+    active = command._kimodo_tracking_boundary.before_grail(command, reward.device)
+    return torch.where(active, reward, 0.0)
+
+
 def tracking_relative_body_pos_error(
-    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None,
+    gate_before_grail: bool = False,
 ) -> torch.Tensor:
     """Compute body position tracking reward using anchor-relative reference positions.
 
@@ -485,11 +507,13 @@ def tracking_relative_body_pos_error(
     tracked = _get_body_indexes(command, body_names)
     pos_diff = command.body_pos_relative_w[:, tracked] - command.robot_body_pos_w[:, tracked]
     per_body_err = (pos_diff * pos_diff).sum(dim=-1)
-    return torch.exp(-per_body_err.mean(dim=-1) / (std * std))
+    reward = torch.exp(-per_body_err.mean(dim=-1) / (std * std))
+    return _gate_tracking_before_grail(command, reward, gate_before_grail)
 
 
 def tracking_relative_body_ori_error(
-    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None,
+    gate_before_grail: bool = False,
 ) -> torch.Tensor:
     """Compute body orientation tracking reward using anchor-relative reference orientations.
 
@@ -511,7 +535,8 @@ def tracking_relative_body_ori_error(
         command.body_quat_relative_w[:, tracked],
         command.robot_body_quat_w[:, tracked],
     )
-    return torch.exp(-angular_err.square().mean(dim=-1) / (std * std))
+    reward = torch.exp(-angular_err.square().mean(dim=-1) / (std * std))
+    return _gate_tracking_before_grail(command, reward, gate_before_grail)
 
 
 def tracking_relative_body_ori_weighted_error(
@@ -561,7 +586,8 @@ def tracking_relative_body_ori_weighted_error(
 
 
 def tracking_body_linvel_error(
-    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None,
+    gate_before_grail: bool = False,
 ) -> torch.Tensor:
     """Compute body linear velocity tracking reward using a Gaussian kernel.
 
@@ -580,11 +606,13 @@ def tracking_body_linvel_error(
     tracked = _get_body_indexes(command, body_names)
     vel_diff = command.body_lin_vel_w[:, tracked] - command.robot_body_lin_vel_w[:, tracked]
     per_body_err = (vel_diff * vel_diff).sum(dim=-1)
-    return torch.exp(-per_body_err.mean(dim=-1) / (std * std))
+    reward = torch.exp(-per_body_err.mean(dim=-1) / (std * std))
+    return _gate_tracking_before_grail(command, reward, gate_before_grail)
 
 
 def tracking_body_angvel_error(
-    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None
+    env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None,
+    gate_before_grail: bool = False,
 ) -> torch.Tensor:
     """Compute body angular velocity tracking reward using a Gaussian kernel.
 
@@ -603,7 +631,8 @@ def tracking_body_angvel_error(
     tracked = _get_body_indexes(command, body_names)
     vel_diff = command.body_ang_vel_w[:, tracked] - command.robot_body_ang_vel_w[:, tracked]
     per_body_err = (vel_diff * vel_diff).sum(dim=-1)
-    return torch.exp(-per_body_err.mean(dim=-1) / (std * std))
+    reward = torch.exp(-per_body_err.mean(dim=-1) / (std * std))
+    return _gate_tracking_before_grail(command, reward, gate_before_grail)
 
 
 def feet_contact_duration(
@@ -789,11 +818,15 @@ def reward_object_final_goal_distance(
     command_name: str = "motion",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     exp_coeff: float = -1.0,
+    gate_with_contact_label: bool = False,
+    hand: str = "right_hand",
 ) -> torch.Tensor:
-    """Reward proximity to the last-frame object position, without contact gating.
+    """Reward proximity to the last-frame object position.
 
     Match target_object_poses_6d's world-frame target, including environment
     origins and the configured object height offset. Distance is in meters.
+    When gated, require the selected hand's current reference contact label;
+    reward becomes zero again when that label turns off.
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
     final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
@@ -804,7 +837,48 @@ def reward_object_final_goal_distance(
     target_pos_w[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
     current_pos_w = env.scene[asset_cfg.name].data.root_pos_w[:, :3]
     distance = torch.norm(current_pos_w - target_pos_w, dim=-1)
-    return torch.exp(exp_coeff * distance)
+    reward = torch.exp(exp_coeff * distance)
+    if gate_with_contact_label:
+        in_contact = command.get_in_contact(hand)
+        if in_contact is None:
+            raise RuntimeError(
+                "reward_object_final_goal_distance requires reference contact labels "
+                f"for {hand} when gate_with_contact_label=True"
+            )
+        reward = torch.where(in_contact > 0.5, reward, 0.0)
+    return reward
+
+
+def object_acc_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    command_name: str = "motion",
+    gate_with_contact_label: bool = False,
+    angular_scale: float = 1.0,
+    hand: str = "right_hand",
+) -> torch.Tensor:
+    """Penalize simulated object COM linear and angular acceleration.
+
+    Return ||a||^2 + angular_scale * ||alpha||^2 using world-frame physics
+    accelerations (m/s^2 and rad/s^2), with no additional dt normalization.
+    Use a negative reward weight. When gated, require the selected hand's
+    current reference contact label; cost becomes zero again on release.
+    """
+    if angular_scale < 0:
+        raise ValueError("object_acc_l2 requires angular_scale >= 0")
+    data = env.scene[asset_cfg.name].data
+    cost = data.body_lin_acc_w[:, 0].square().sum(dim=-1)
+    cost = cost + angular_scale * data.body_ang_acc_w[:, 0].square().sum(dim=-1)
+    if gate_with_contact_label:
+        command: TrackingCommand = env.command_manager.get_term(command_name)
+        in_contact = command.get_in_contact(hand)
+        if in_contact is None:
+            raise RuntimeError(
+                "object_acc_l2 requires reference contact labels "
+                f"for {hand} when gate_with_contact_label=True"
+            )
+        cost = torch.where(in_contact > 0.5, cost, 0.0)
+    return cost
 
 
 def reward_hand_fingers_object_distance(
@@ -814,13 +888,14 @@ def reward_hand_fingers_object_distance(
     command_name: str = "motion",
     gate_with_contact_label: bool = True,
     max_distance: float | None = None,
+    contact_lead_time: float = 0.0,
 ) -> torch.Tensor:
     """Compute reward for hand proximity to the object.
 
     Encourage the hand to approach the object using an exponential distance kernel.
-    By default, only applied when the contact label indicates contact should
-    happen (current_frame >= first_contact_frame). Optionally truncate the
-    reward to zero beyond a maximum distance.
+    When gated, start contact_lead_time seconds before either hand's first
+    reference contact and remain active afterward. Motions without reference
+    contact receive zero reward. Optionally truncate beyond a maximum distance.
 
     Args:
         env: The environment.
@@ -829,10 +904,13 @@ def reward_hand_fingers_object_distance(
         command_name: Name of the tracking command term.
         gate_with_contact_label: Whether to gate by the reference contact label.
         max_distance: Maximum rewarded distance in meters (inclusive), or None.
+        contact_lead_time: Seconds before first contact to enable the gated reward.
 
     Returns:
         Reward tensor of shape (num_envs,) in [0, 1].
     """
+    if not 0.0 <= contact_lead_time < float("inf"):
+        raise ValueError("contact_lead_time must be finite and nonnegative")
     hand_object_transform = get_hand_object_transform(env, asset_cfg)
     object_pos_in_hand = hand_object_transform[:, :3]
     object_pos_in_hand_distance = torch.norm(object_pos_in_hand, dim=-1)
@@ -842,10 +920,21 @@ def reward_hand_fingers_object_distance(
 
     if gate_with_contact_label:
         command: TrackingCommand = env.command_manager.get_term(command_name)
-        per_env_first_contact = getattr(command, "_per_env_first_contact", None)
-        if per_env_first_contact is not None:
-            current_time = command.motion_start_time_steps + command.time_steps
-            reward = reward * (current_time >= per_env_first_contact).float()
+        first_contact_lookup = getattr(command, "_first_contact_lookup", None)
+        if first_contact_lookup is None:
+            raise RuntimeError(
+                "reward_hand_fingers_object_distance requires first reference contact "
+                "frames when gate_with_contact_label=True"
+            )
+        first_contact = first_contact_lookup[command.motion_ids]
+        current_frame = command.motion_start_time_steps + command.time_steps
+        total_frames = command.motion_lib.get_time_step_total(command.motion_ids)
+        # No-contact motions use total_frames as their first-contact sentinel.
+        has_contact = first_contact < total_frames
+        time_until_contact = (first_contact - current_frame) * env.step_dt
+        reward = torch.where(
+            has_contact & (time_until_contact <= contact_lead_time), reward, 0.0
+        )
 
     return reward
 

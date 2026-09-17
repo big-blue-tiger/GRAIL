@@ -1046,11 +1046,12 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
             )
         # Preserve the 66-D mean reduction, including the two raw hand targets.
         # The Trainer commits statistics after all PPO epochs, never in forward.
-        bc_loss = (
-            F.mse_loss(prediction.float(), loss_target)
+        bc_loss_per_sample = (
+            F.mse_loss(prediction.float(), loss_target, reduction="none")
             if self.latent_normalizer is not None
-            else F.mse_loss(prediction, loss_target)
-        )
+            else F.mse_loss(prediction, loss_target, reduction="none")
+        ).mean(dim=-1)
+        bc_loss = bc_loss_per_sample.mean()
 
         target_flat = target.detach().float().reshape(-1, self.action_dim)
         pred_flat = pred_action.detach().float().reshape(-1, self.action_dim)
@@ -1077,6 +1078,7 @@ class EncoderVectorMlpPolicy(EncoderVectorDiffusionPolicy):
                 **diagnostics,
             },
             "aux_loss_coef": {"latent_bc_mse": self.bc_loss_coef},
+            "aux_losses_per_sample": {"latent_bc_mse": bc_loss_per_sample},
         }
 
 

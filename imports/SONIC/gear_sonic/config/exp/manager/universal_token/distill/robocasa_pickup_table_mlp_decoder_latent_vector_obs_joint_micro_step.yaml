@@ -7,6 +7,14 @@ defaults:
 exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step
 experiment_name: ${exp_base}_${exp_var}
 
+algo:
+  config:
+    contact_loss_shift:
+      enabled: true
+      amount: 0.05
+      command_name: motion
+      hand: right_hand
+
 manager_env:
   config:
     action_transform_active_encoders: [g1]

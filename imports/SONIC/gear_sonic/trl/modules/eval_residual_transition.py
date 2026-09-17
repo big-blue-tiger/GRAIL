@@ -3,9 +3,69 @@
 from pathlib import Path
 import logging
 import numbers
+import json
 
 import joblib
 import torch
+
+
+def motion_source_step_ratio(command, key):
+    """Convert source PKL frame indices to the motion command's simulation steps."""
+    source = command.motion_lib._motion_data_load[key]
+    if "path" in source:
+        source = next(iter(joblib.load(source["path"]).values()))
+    source_fps = float(source["fps"])
+    if not 0 < source_fps < float("inf"):
+        raise ValueError(f"{key}: invalid motion fps {source_fps}")
+    return command.motion_lib._sim_fps / source_fps
+
+
+class KimodoTrackingBoundary:
+    """Cache report boundaries; ordinary motions remain tracked throughout.
+
+    b_start_index is the first GRAIL frame, not the beginning or end of the
+    PCHIP replacement window. Rebuild the tensor when the library reloads keys.
+    """
+
+    def __init__(self):
+        self._keys = None
+        self._boundaries = {}
+
+    def before_grail(self, command, device):
+        keys = command.motion_lib.curr_motion_keys
+        if keys is not self._keys:
+            motion_file = Path(command.cfg.motion_lib_cfg["motion_file"])
+            robot_dir = motion_file if motion_file.is_dir() else motion_file.parent
+            bounds = []
+            for key in keys:
+                source = command.motion_lib._motion_data_load[key]
+                # Directory mode keys are PKL stems, not internal motion keys.
+                source_path = Path(source["path"]) if "path" in source else motion_file
+                name = source_path.stem if source_path.is_file() else str(key)
+                path = robot_dir.parent / "reports" / f"{name}.json"
+                if path not in self._boundaries:
+                    boundary = float("inf")
+                    if path.is_file():
+                        report = json.loads(path.read_text())
+                        if report.get("sources", {}).get("walk_csv") is not None:
+                            start = report.get("b_start_index")
+                            total = report.get("total_frames")
+                            fps = report.get("fps")
+                            if (type(start) is not int or type(total) is not int
+                                    or not 0 <= start < total
+                                    or not isinstance(fps, (int, float))
+                                    or not 0 < fps < float("inf")):
+                                raise ValueError(f"{path}: invalid Kimodo boundary/frame count/fps")
+                            ratio = motion_source_step_ratio(command, key)
+                            if abs(ratio * fps - command.motion_lib._sim_fps) > 1e-5:
+                                raise ValueError(f"{path}: report fps does not match source motion")
+                            boundary = start * ratio
+                    self._boundaries[path] = boundary
+                bounds.append(self._boundaries[path])
+            self._frame_bounds = torch.tensor(bounds, device=device, dtype=torch.float64)
+            self._keys = keys
+        frame = command.motion_start_time_steps + command.time_steps
+        return frame < self._frame_bounds[command.motion_ids]
 
 
 class EvalResidualTransition:
@@ -51,13 +111,7 @@ class EvalResidualTransition:
                             )
                         # Metadata indexes source frames, whereas command time
                         # is measured in simulation steps (often 50 Hz).
-                        source = command.motion_lib._motion_data_load[key]
-                        if "path" in source:
-                            source = next(iter(joblib.load(source["path"]).values()))
-                        source_fps = float(source["fps"])
-                        if not 0 < source_fps < float("inf"):
-                            raise ValueError(f"{key}: invalid motion fps {source_fps}")
-                        step_ratio = command.motion_lib._sim_fps / source_fps
+                        step_ratio = motion_source_step_ratio(command, key)
                         bound = (start * step_ratio, end * step_ratio)
                         logging.getLogger(__name__).info(
                             "Residual transition %s: frames %s -> %s", key, start, end

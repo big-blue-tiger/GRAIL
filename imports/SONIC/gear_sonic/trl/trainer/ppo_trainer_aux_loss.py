@@ -1,6 +1,6 @@
 import torch
 
-from gear_sonic.trl.trainer.ppo_trainer import TRLPPOTrainer
+from gear_sonic.trl.trainer.ppo_trainer import TRLPPOTrainer, masked_mean
 
 
 class TRLAuxLossPPOTrainer(TRLPPOTrainer):
@@ -57,6 +57,38 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         if self.ppo_bc_end_iteration is not None and self.ppo_bc_end_iteration <= 0:
             raise ValueError("ppo_bc_loss_schedule.end_iteration must be positive")
 
+        contact_cfg = self.config.get("contact_loss_shift", {})
+        self.contact_loss_shift_enabled = bool(contact_cfg.get("enabled", False))
+        self.contact_loss_shift_amount = float(contact_cfg.get("amount", 0.05))
+        self.contact_loss_command_name = contact_cfg.get("command_name", "motion")
+        self.contact_loss_hand = contact_cfg.get("hand", "right_hand")
+        if not 0.0 <= self.contact_loss_shift_amount <= 1.0:
+            raise ValueError("contact_loss_shift.amount must be in [0, 1]")
+        if self.contact_loss_hand not in ("left_hand", "right_hand"):
+            raise ValueError("contact_loss_shift.hand must be left_hand or right_hand")
+        if self.contact_loss_shift_enabled and (
+            self.action_chunk_enabled or self.compute_imgaug_bc_loss or not self.compute_aux_loss
+        ):
+            raise ValueError("contact_loss_shift requires standard PPO with per-sample auxiliary BC")
+
+    def _rollout_loss_contact_mask(self):
+        if not self.contact_loss_shift_enabled:
+            return None
+        command = self.env.env.command_manager.get_term(self.contact_loss_command_name)
+        in_contact = command.get_in_contact(self.contact_loss_hand)
+        if in_contact is None:
+            raise RuntimeError(
+                f"contact_loss_shift requires reference contact labels for {self.contact_loss_hand}"
+            )
+        return (in_contact > 0.5).detach().clone()
+
+    def _contact_loss_coefs(self, mb_rollout_data):
+        """Shift scheduled coefficients per saved rollout label before reduction."""
+        ppo, bc = self._get_ppo_bc_loss_coefs()
+        mask = mb_rollout_data["loss_contact_mask"].float()
+        shift = mask * self.contact_loss_shift_amount
+        return (ppo + shift).clamp(0., 1.), (bc - shift).clamp(0., 1.)
+
     def _get_ppo_bc_loss_coefs(self):
         """Return the complementary PPO/BC coefficients for the current iteration.
 
@@ -85,8 +117,10 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         ppo_coef = 1.0 - bc_coef
         return ppo_coef, bc_coef
 
-    def _get_ppo_loss_coef(self):
+    def _get_ppo_loss_coef(self, mb_rollout_data=None):
         """Return the scheduled PPO coefficient used by the base trainer."""
+        if self.contact_loss_shift_enabled and mb_rollout_data is not None:
+            return self._contact_loss_coefs(mb_rollout_data)[0]
         ppo_coef, _ = self._get_ppo_bc_loss_coefs()
         return ppo_coef
 
@@ -116,6 +150,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             self.aux_loss_stats = {}
             self.total_aux_loss_unscaled_stats = torch.zeros(stats_shape, device=device)
             self.total_aux_loss_stats = torch.zeros(stats_shape, device=device)
+            self.effective_bc_coef_stats = torch.zeros(stats_shape, device=device)
 
     def _extract_aux_losses_from_forward_results(self, forward_results):
         """Pull auxiliary losses and their coefficients from the policy output dict.
@@ -178,6 +213,8 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         )
 
         if not aux_losses_dict:
+            if self.contact_loss_shift_enabled:
+                raise RuntimeError("contact_loss_shift requires auxiliary BC losses")
             # No auxiliary losses found
             return {
                 "aux_losses_dict": {},
@@ -195,12 +232,32 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         # Apply either the static auxiliary scale or the scheduled BC weight.
         _, bc_coef = self._get_ppo_bc_loss_coefs()
         total_aux_loss = total_aux_loss_unscaled * bc_coef
+        if self.contact_loss_shift_enabled:
+            _, sample_bc_coef = self._contact_loss_coefs(mb_rollout_data)
+            per_sample_losses = policy_results.get("aux_losses_per_sample", {})
+            total_aux_loss = torch.tensor(0.0, device=device)
+            for loss_name, loss_value in aux_losses_dict.items():
+                coef = aux_loss_coef.get(loss_name, 0.0)
+                if coef == 0.0:
+                    continue
+                if loss_name not in per_sample_losses:
+                    raise RuntimeError(f"contact_loss_shift requires per-sample loss: {loss_name}")
+                sample_loss = per_sample_losses[loss_name]
+                if sample_loss.shape != sample_bc_coef.shape:
+                    raise ValueError("BC loss and rollout contact labels must have identical shapes")
+                total_aux_loss = total_aux_loss + coef * masked_mean(
+                    sample_loss * sample_bc_coef, ~mb_rollout_data["mb_padding_mask"]
+                )
 
         return {
             "aux_losses_dict": aux_losses_dict,
             "aux_loss_coef": aux_loss_coef,
             "total_aux_loss_unscaled": total_aux_loss_unscaled,
             "total_aux_loss": total_aux_loss,
+            "effective_bc_coef": (
+                masked_mean(sample_bc_coef, ~mb_rollout_data["mb_padding_mask"])
+                if self.contact_loss_shift_enabled else bc_coef
+            ),
         }
 
     def _compute_loss(self, forward_results, mb_rollout_data):
@@ -312,6 +369,9 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                 total_aux_loss_unscaled
             )
             self.total_aux_loss_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = total_aux_loss
+            self.effective_bc_coef_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = (
+                aux_loss_result.get("effective_bc_coef", 0.0)
+            )
 
     def _get_train_metrics(self):
         """Collect training metrics including auxiliary loss averages.
@@ -350,6 +410,9 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                 self.accelerator.gather_for_metrics(self.total_aux_loss_stats).mean().item()
             )
             metrics["aux_loss_scale"] = self.aux_loss_scale
+            metrics["loss/effective_bc_coef"] = (
+                self.accelerator.gather_for_metrics(self.effective_bc_coef_stats).mean().item()
+            )
 
         ppo_coef, bc_coef = self._get_ppo_bc_loss_coefs()
         metrics["loss/lambda_ppo"] = ppo_coef
