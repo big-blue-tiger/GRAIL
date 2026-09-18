@@ -114,7 +114,7 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
   headless=True \
   num_envs=4096 \
-  experiment_name=robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
+  experiment_name=allgraspreward_bclossmask_003minbcloss \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
@@ -123,7 +123,7 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   algo.config.num_learning_iterations=15000 \
   algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
-  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.05
+  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.03
 
 CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
@@ -247,12 +247,28 @@ python gear_sonic/eval_agent_trl.py \
 ## 服务器端play
 ```bash
 python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/walk1-20260915_171808/last.pt \
+  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/walk01bccoef009shiftbc-20260917_092945/last.pt \
   +headless=True \
   ++num_envs=16 \
   +run_once=True \
   ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/walk1-20260915_171808 \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/walk01bccoef009shiftbc-20260917_092945 \
+  "~manager_env/recorders=empty" \
+  "+manager_env/recorders=render" \
+  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
+  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
+  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
+  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  ++object_pos_deviation_threshold=25 \
+&& \
+python gear_sonic/eval_agent_trl.py \
+  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/walk01bccoef00shiftbc-20260917_104256/last.pt \
+  +headless=True \
+  ++num_envs=16 \
+  +run_once=True \
+  ++manager_env.config.render_results=True \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/walk01bccoef00shiftbc-20260917_104256 \
   "~manager_env/recorders=empty" \
   "+manager_env/recorders=render" \
   ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
@@ -261,6 +277,8 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
   ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   ++object_pos_deviation_threshold=25
+
+
 
 python gear_sonic/eval_agent_trl.py \
   +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/joint_micro_step_high_regularization-20260915_162103/last.pt \
@@ -286,11 +304,6 @@ rsync -aP \
   /home/tide/robot/GRAIL/ \
   ygc@202.120.37.249:/home/ygc/data0/GRAIL/
 
-rsync -aP \
-  --no-owner --no-group \
-  -e "ssh -p 9991 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
-  /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat \
-  ygc@202.120.37.249:/home/ygc/data0/GRAIL/data/hf_dataset/data_update/data/
 
 
   rsync -aP \

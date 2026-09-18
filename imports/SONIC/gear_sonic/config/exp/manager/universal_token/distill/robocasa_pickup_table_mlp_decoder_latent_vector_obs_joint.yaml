@@ -49,7 +49,7 @@ manager_env:
     feet_slip:
       _target_: isaaclab.managers.RewardTermCfg
       func: isaaclab_tasks.manager_based.locomotion.velocity.mdp.rewards:feet_slide
-      weight: -5.0
+      weight: -10.0
       params:
         sensor_cfg:
           _target_: isaaclab.managers.SceneEntityCfg
@@ -71,7 +71,7 @@ manager_env:
           name: object_to_hand_frame_transformer
         exp_coeff: -10.0
         command_name: motion
-        gate_with_contact_label: true
+        gate_with_contact_label: false
         contact_lead_time: 2.0
         max_distance: 0.25
     action_rate_l2:
@@ -102,7 +102,7 @@ manager_env:
           _target_: isaaclab.managers.SceneEntityCfg
           name: object
         exp_coeff: -1.0
-        gate_with_contact_label: true
+        gate_with_contact_label: false
         hand: right_hand
     object_acc_l2:
       _target_: isaaclab.managers.RewardTermCfg
@@ -140,4 +140,4 @@ algo:
     # Keep updating through iteration 3000, then freeze target latent statistics.
     latent_norm_freeze_after_iteration: 3000
     ppo_bc_loss_schedule:
-      bc_min_coef: 0.2
+      bc_min_coef: 0.03

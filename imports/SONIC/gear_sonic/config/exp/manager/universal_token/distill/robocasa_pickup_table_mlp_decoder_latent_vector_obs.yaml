@@ -148,7 +148,7 @@ manager_env:
       weight: 0.25
     tracking_anchor_ori:
       weight: 0.5
-    # Split each term into two independent body means with its original weight/std.
+    # Split each term into two independent body means with half its original weight and unchanged std.
     tracking_relative_body_pos: null
     tracking_relative_body_ori: null
     tracking_body_linvel: null
@@ -156,7 +156,7 @@ manager_env:
     tracking_relative_body_pos_upper:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_pos_error
-      weight: 0.25
+      weight: 0.125
       params:
         command_name: motion
         std: 0.3
@@ -166,7 +166,7 @@ manager_env:
     tracking_relative_body_pos_lower:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_pos_error
-      weight: 0.25
+      weight: 0.125
       params:
         command_name: motion
         std: 0.3
@@ -177,7 +177,7 @@ manager_env:
     tracking_relative_body_ori_upper:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_ori_error
-      weight: 0.5
+      weight: 0.25
       params:
         command_name: motion
         std: 0.4
@@ -185,7 +185,7 @@ manager_env:
     tracking_relative_body_ori_lower:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_ori_error
-      weight: 0.5
+      weight: 0.25
       params:
         command_name: motion
         std: 0.4
@@ -194,7 +194,7 @@ manager_env:
     tracking_body_linvel_upper:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_linvel_error
-      weight: 0.25
+      weight: 0.125
       params:
         command_name: motion
         std: 1.0
@@ -202,7 +202,7 @@ manager_env:
     tracking_body_linvel_lower:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_linvel_error
-      weight: 0.25
+      weight: 0.125
       params:
         command_name: motion
         std: 1.0
@@ -211,7 +211,7 @@ manager_env:
     tracking_body_angvel_upper:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
-      weight: 0.25
+      weight: 0.125
       params:
         command_name: motion
         std: 3.14
@@ -219,7 +219,7 @@ manager_env:
     tracking_body_angvel_lower:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
-      weight: 0.25
+      weight: 0.125
       params:
         command_name: motion
         std: 3.14
@@ -231,7 +231,7 @@ manager_env:
     grasp_reward:
       weight: 10.0
       params:
-        gate_with_contact_label: true
+        gate_with_contact_label: false
         hand: right_hand
         command_name: motion
         min_contacts: 4
@@ -270,7 +270,7 @@ manager_env:
     approach_velocity_penalty:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:reward_approach_velocity_penalty
-      weight: -15.0
+      weight: -25.0
       params:
         sensor_cfg:
           _target_: isaaclab.managers.SceneEntityCfg
@@ -344,7 +344,7 @@ algo:
     ppo_bc_loss_schedule:
       enabled: true
       bc_min_coef: 0.2
-      end_iteration: 5000
+      end_iteration: 3000
       adaptive_after_iteration: 1000
     dagger_rollout_mode: fixed
     dagger_student_ratio: 1

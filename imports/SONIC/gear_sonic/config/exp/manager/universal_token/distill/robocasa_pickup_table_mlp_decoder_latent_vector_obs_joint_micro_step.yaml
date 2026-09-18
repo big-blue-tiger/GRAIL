@@ -9,8 +9,10 @@ experiment_name: ${exp_base}_${exp_var}
 
 algo:
   config:
-    contact_loss_shift:
+    teacher_termination_loss_override:
       enabled: true
+    contact_loss_shift:
+      enabled: false
       amount: 0.05
       command_name: motion
       hand: right_hand
@@ -18,12 +20,19 @@ algo:
 manager_env:
   config:
     action_transform_active_encoders: [g1]
+  terminations:
+    ee_body_pos:
+      params:
+        threshold: 0.3  # Student end-effector height error limit (meters).
+    object_pos_deviation:
+      params:
+        threshold: 0.3  # Student object position error limit (meters).
   rewards:
     micro_step_penalty:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp.micro_step_reward:MicroStepPenalty
       # Each qualifying foot touchdown contributes weight * step_dt to the reward.
-      weight: -3.0
+      weight: -8.0
       params:
         # command_name: motion_velocity
         min_step_length: 0.13

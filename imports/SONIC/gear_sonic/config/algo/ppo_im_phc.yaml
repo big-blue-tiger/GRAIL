@@ -7,6 +7,8 @@ defaults:
 algo:
   _recursive_: False
   config:
+    teacher_termination_loss_override:
+      enabled: false
     num_learning_epochs: 5
     num_mini_batches: 4
     clip_param: 0.2

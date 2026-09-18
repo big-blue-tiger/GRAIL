@@ -1,4 +1,8 @@
+from copy import deepcopy
+from pathlib import Path
+
 import torch
+from omegaconf import OmegaConf
 
 from gear_sonic.trl.trainer.ppo_trainer import TRLPPOTrainer, masked_mean
 
@@ -29,6 +33,11 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
     """
 
     _tag_names = ["trl", "aux_loss_ppo"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.teacher_termination_loss_override_enabled:
+            self._init_teacher_termination_loss_override()
 
     def _init_config(self):
         """Extend base config initialisation with auxiliary loss settings.
@@ -66,10 +75,68 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             raise ValueError("contact_loss_shift.amount must be in [0, 1]")
         if self.contact_loss_hand not in ("left_hand", "right_hand"):
             raise ValueError("contact_loss_shift.hand must be left_hand or right_hand")
-        if self.contact_loss_shift_enabled and (
+        self.teacher_termination_loss_override_enabled = bool(
+            self.config.get("teacher_termination_loss_override", {}).get("enabled", False)
+        )
+        self.per_sample_loss_coefs_enabled = (
+            self.contact_loss_shift_enabled or self.teacher_termination_loss_override_enabled
+        )
+        if self.per_sample_loss_coefs_enabled and (
             self.action_chunk_enabled or self.compute_imgaug_bc_loss or not self.compute_aux_loss
         ):
-            raise ValueError("contact_loss_shift requires standard PPO with per-sample auxiliary BC")
+            raise ValueError("Per-sample loss coefficients require standard PPO with per-sample auxiliary BC")
+
+    def _init_teacher_termination_loss_override(self):
+        """Cache only the two stateless pose checks; never create a termination manager."""
+        from gear_sonic.envs.manager_env.mdp.terminations import (
+            exceeded_body_height,
+            object_pos_deviation,
+        )
+
+        checkpoint = self.config.get("teacher_checkpoint")
+        if not checkpoint:
+            raise ValueError("teacher_termination_loss_override requires teacher_checkpoint")
+        config_path = Path(checkpoint).expanduser().parent / "config.yaml"
+        teacher_config = OmegaConf.load(config_path)
+        self._teacher_loss_termination_terms = []
+        self._student_loss_termination_terms = []
+        for name, expected_func in (
+            ("ee_body_pos", exceeded_body_height),
+            ("object_pos_deviation", object_pos_deviation),
+        ):
+            teacher_term = OmegaConf.select(teacher_config, f"manager_env.terminations.{name}")
+            if teacher_term is None:
+                raise ValueError(f"Missing teacher termination {name} in {config_path}")
+            teacher_term = OmegaConf.to_container(teacher_term, resolve=True)
+            student_term = self.env.env.termination_manager.get_term_cfg(name)
+            for source, func, params, destination in (
+                ("teacher", teacher_term.get("func"), teacher_term.get("params"),
+                 self._teacher_loss_termination_terms),
+                ("student", student_term.func, student_term.params,
+                 self._student_loss_termination_terms),
+            ):
+                supported_names = (
+                    f"gear_sonic.envs.manager_env.mdp:{expected_func.__name__}",
+                    f"gear_sonic.envs.manager_env.mdp.terminations:{expected_func.__name__}",
+                )
+                if func is not expected_func and func not in supported_names:
+                    raise ValueError(f"Unsupported {source} termination {name}: {func}")
+                if not isinstance(params, dict):
+                    raise ValueError(f"Missing parameters for {source} termination {name}")
+                destination.append((expected_func, deepcopy(params)))
+
+    def _rollout_teacher_termination_mask(self):
+        """Evaluate the current observation's state, independently on every step."""
+        if not self.teacher_termination_loss_override_enabled:
+            return None
+        env = self.env.env
+        teacher_exceeded = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        student_exceeded = torch.zeros_like(teacher_exceeded)
+        for func, params in self._teacher_loss_termination_terms:
+            teacher_exceeded |= func(env, **params)
+        for func, params in self._student_loss_termination_terms:
+            student_exceeded |= func(env, **params)
+        return (teacher_exceeded & ~student_exceeded).detach().clone()
 
     def _rollout_loss_contact_mask(self):
         if not self.contact_loss_shift_enabled:
@@ -82,12 +149,16 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             )
         return (in_contact > 0.5).detach().clone()
 
-    def _contact_loss_coefs(self, mb_rollout_data):
-        """Shift scheduled coefficients per saved rollout label before reduction."""
+    def _sample_loss_coefs(self, mb_rollout_data):
+        """Apply contact shifts, then teacher overrides, before sample reduction."""
         ppo, bc = self._get_ppo_bc_loss_coefs()
-        mask = mb_rollout_data["loss_contact_mask"].float()
-        shift = mask * self.contact_loss_shift_amount
-        return (ppo + shift).clamp(0., 1.), (bc - shift).clamp(0., 1.)
+        if self.contact_loss_shift_enabled:
+            shift = mb_rollout_data["loss_contact_mask"].float() * self.contact_loss_shift_amount
+            ppo, bc = (ppo + shift).clamp(0., 1.), (bc - shift).clamp(0., 1.)
+        if self.teacher_termination_loss_override_enabled:
+            mask = mb_rollout_data["loss_teacher_termination_mask"]
+            bc = torch.where(mask, 0.0, bc)
+        return ppo, bc
 
     def _get_ppo_bc_loss_coefs(self):
         """Return the complementary PPO/BC coefficients for the current iteration.
@@ -119,8 +190,8 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
 
     def _get_ppo_loss_coef(self, mb_rollout_data=None):
         """Return the scheduled PPO coefficient used by the base trainer."""
-        if self.contact_loss_shift_enabled and mb_rollout_data is not None:
-            return self._contact_loss_coefs(mb_rollout_data)[0]
+        if self.per_sample_loss_coefs_enabled and mb_rollout_data is not None:
+            return self._sample_loss_coefs(mb_rollout_data)[0]
         ppo_coef, _ = self._get_ppo_bc_loss_coefs()
         return ppo_coef
 
@@ -213,8 +284,8 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         )
 
         if not aux_losses_dict:
-            if self.contact_loss_shift_enabled:
-                raise RuntimeError("contact_loss_shift requires auxiliary BC losses")
+            if self.per_sample_loss_coefs_enabled:
+                raise RuntimeError("Per-sample loss coefficients require auxiliary BC losses")
             # No auxiliary losses found
             return {
                 "aux_losses_dict": {},
@@ -232,8 +303,8 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         # Apply either the static auxiliary scale or the scheduled BC weight.
         _, bc_coef = self._get_ppo_bc_loss_coefs()
         total_aux_loss = total_aux_loss_unscaled * bc_coef
-        if self.contact_loss_shift_enabled:
-            _, sample_bc_coef = self._contact_loss_coefs(mb_rollout_data)
+        if self.per_sample_loss_coefs_enabled:
+            _, sample_bc_coef = self._sample_loss_coefs(mb_rollout_data)
             per_sample_losses = policy_results.get("aux_losses_per_sample", {})
             total_aux_loss = torch.tensor(0.0, device=device)
             for loss_name, loss_value in aux_losses_dict.items():
@@ -241,10 +312,10 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                 if coef == 0.0:
                     continue
                 if loss_name not in per_sample_losses:
-                    raise RuntimeError(f"contact_loss_shift requires per-sample loss: {loss_name}")
+                    raise RuntimeError(f"Per-sample loss coefficients require per-sample loss: {loss_name}")
                 sample_loss = per_sample_losses[loss_name]
                 if sample_loss.shape != sample_bc_coef.shape:
-                    raise ValueError("BC loss and rollout contact labels must have identical shapes")
+                    raise ValueError("BC loss and rollout loss coefficients must have identical shapes")
                 total_aux_loss = total_aux_loss + coef * masked_mean(
                     sample_loss * sample_bc_coef, ~mb_rollout_data["mb_padding_mask"]
                 )
@@ -256,7 +327,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             "total_aux_loss": total_aux_loss,
             "effective_bc_coef": (
                 masked_mean(sample_bc_coef, ~mb_rollout_data["mb_padding_mask"])
-                if self.contact_loss_shift_enabled else bc_coef
+                if self.per_sample_loss_coefs_enabled else bc_coef
             ),
         }
 
