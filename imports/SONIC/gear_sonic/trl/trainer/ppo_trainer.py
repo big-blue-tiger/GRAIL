@@ -1657,11 +1657,6 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 if getattr(self.storage, "residual_transition_weight", None) is None:
                     self.storage.register_key("residual_transition_weight", shape=())
                 self.storage.update_key("residual_transition_weight", transition_weight)
-                contact_mask = self._rollout_loss_contact_mask()
-                if contact_mask is not None:
-                    if getattr(self.storage, "loss_contact_mask", None) is None:
-                        self.storage.register_key("loss_contact_mask", shape=(), dtype=torch.bool)
-                    self.storage.update_key("loss_contact_mask", contact_mask)
                 teacher_mask = self._rollout_teacher_termination_mask()
                 if teacher_mask is not None:
                     if getattr(self.storage, "loss_teacher_termination_mask", None) is None:
@@ -2018,10 +2013,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         }
         if self.use_symmetry:
             rollout_data["next_critic_obs"] = next_critic_obs
-        for key in ("loss_contact_mask", "loss_teacher_termination_mask"):
-            if getattr(self.storage, key, None) is not None:
-                mask = self.storage.query_key(key).transpose(0, 1).to(device)
-                rollout_data[key] = mask.repeat(2, 1) if self.use_symmetry else mask
+        if getattr(self.storage, "loss_teacher_termination_mask", None) is not None:
+            mask = self.storage.query_key("loss_teacher_termination_mask").transpose(0, 1).to(device)
+            rollout_data["loss_teacher_termination_mask"] = mask.repeat(2, 1) if self.use_symmetry else mask
         return rollout_data
 
     def _get_mb_rollout_data(self, rollout_data, micro_batch_inds):
@@ -2077,9 +2071,8 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         if self.use_symmetry:
             mb_next_critic_obs = rollout_data["next_critic_obs"][micro_batch_inds]
             mb_rollout_data["mb_next_critic_obs"] = mb_next_critic_obs
-        for key in ("loss_contact_mask", "loss_teacher_termination_mask"):
-            if key in rollout_data:
-                mb_rollout_data[key] = rollout_data[key][micro_batch_inds]
+        if "loss_teacher_termination_mask" in rollout_data:
+            mb_rollout_data["loss_teacher_termination_mask"] = rollout_data["loss_teacher_termination_mask"][micro_batch_inds]
         return mb_rollout_data
 
     def _forward_model(self, model, mb_rollout_data):
@@ -2267,15 +2260,11 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
             )
         return torch.cat([target_latent.detach(), hand_action], dim=-1)
 
-    def _rollout_loss_contact_mask(self):
-        """Optional per-transition label captured before stepping/resetting the env."""
-        return None
-
     def _rollout_teacher_termination_mask(self):
         """Optional teacher pose-limit label for the current observation."""
         return None
 
-    def _get_ppo_loss_coef(self, mb_rollout_data=None):
+    def _get_ppo_loss_coef(self):
         """Return the effective coefficient applied to the PPO objective."""
         return float(self.config.get("ppo_loss_coef", 1.0))
 
@@ -2423,16 +2412,9 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         if getattr(self.env, "safe_nan", False):
             entropy_batch[entropy_batch.isnan()] = 0.0
         entropy_loss = -masked_mean(entropy_batch, ~padding_mask)
-        ppo_loss_coef = self._get_ppo_loss_coef(mb_rollout_data)
-        if isinstance(ppo_loss_coef, torch.Tensor):
-            weighted_pg_loss = masked_mean(ppo_loss_coef * pg_loss_max, ~padding_mask)
-            weighted_entropy_loss = -self.entropy_coef * masked_mean(
-                ppo_loss_coef * entropy_batch, ~padding_mask
-            )
-            ppo_loss_coef = masked_mean(ppo_loss_coef, ~padding_mask)
-        else:
-            weighted_pg_loss = ppo_loss_coef * pg_loss
-            weighted_entropy_loss = ppo_loss_coef * self.entropy_coef * entropy_loss
+        ppo_loss_coef = self._get_ppo_loss_coef()
+        weighted_pg_loss = ppo_loss_coef * pg_loss
+        weighted_entropy_loss = ppo_loss_coef * self.entropy_coef * entropy_loss
         weighted_vf_loss = args.vf_coef * vf_loss
         if self.use_symmetry:
             actor_sym_loss = torch.mean(

@@ -11,11 +11,6 @@ algo:
   config:
     teacher_termination_loss_override:
       enabled: true
-    contact_loss_shift:
-      enabled: false
-      amount: 0.05
-      command_name: motion
-      hand: right_hand
 
 manager_env:
   config:

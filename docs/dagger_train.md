@@ -28,8 +28,7 @@ DAgger 的教师执行动作和蒸馏目标均应用此系数（包括 action-ch
 使用拼接数据时，将训练命令的 `motion_file`、`object_motion_file`、`bps_dir` 和 `object_usd_path` 指向拼接数据集，并保留同级 `meta` 目录即可，无需额外开关。
 若希望每次都从行走第一帧开始，再加 `++manager_env.commands.motion.start_from_first_frame=True` 和 `++manager_env.commands.motion.sample_before_contact=False`。
 
-`joint_micro_step` 默认启用 `algo.config.contact_loss_shift`：按采样时当前参考帧的右手接触标签，逐样本将现有调度产生的 BC 系数减去 `0.05`、PPO 系数加上 `0.05`，各自截断到 `[0, 1]`。参考标签关闭时恢复基础系数，不是首次接触后永久切换。PPO 调整作用于策略梯度和熵项，价值损失仍使用原 `vf_coef`。标签在环境 step/reset 前保存，训练时随 rollout 和 minibatch 一起索引。
-通过 `algo.config.contact_loss_shift.amount=0.1` 修改偏移量，`algo.config.contact_loss_shift.hand=left_hand` 选择左手，或 `algo.config.contact_loss_shift.enabled=False` 关闭。`loss/lambda_ppo`、`loss/lambda_bc` 记录基础调度系数；`loss/ppo_coef`、`loss/effective_bc_coef` 记录实际参与训练的平均系数。该功能用于当前 MLP 的逐样本 BC 路径，不支持 action-chunk 或图像增强 BC 模式。
+`joint_micro_step` 启用 `algo.config.teacher_termination_loss_override`：超过教师终止阈值、但尚未超过学生终止阈值的状态不参与 BC loss。BC loss 按剩余有效样本数归一化，再乘基础调度的 BC 系数；全部被屏蔽时 loss 为零。PPO/BC 调度系数不随接触标签改变。
 
 `joint_micro_step` 继承的 `action_acc_l2` 对 `joint_pos.processed_actions`（已包含逐关节缩放、偏置和裁剪的目标角度）计算二阶差分，再除以控制周期 `step_dt` 的平方，最后平方求和。它与实际关节加速度惩罚 `joint_acc_l2` 具有相同单位，两项初始权重均为 `-2.5e-7`；这不保证实际奖励贡献相等。
 若需平均贡献接近 1:1，在同一训练窗口读取 `Episode_Reward/action_acc_l2` 和 `Episode_Reward/joint_acc_l2`，分别取平均值的绝对值 `P_action`、`P_joint`，使用 `w_action_new = w_action_current * P_joint / P_action` 校准，并在后续 rollout 复核。两项日志已包含权重和相同的时间归一化，无需再次乘权重；`P_action` 接近零时不能使用此比例。目标角度跳变、接触冲击和 PD 跟踪误差会使比例随策略变化。
@@ -139,8 +138,7 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   algo.config.num_learning_iterations=10000 \
   algo.config.num_mini_batches=4 \
   algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
-  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.1 \
-  algo.config.contact_loss_shift.amount=0
+  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.1
 ```
 
 ## 本机play
