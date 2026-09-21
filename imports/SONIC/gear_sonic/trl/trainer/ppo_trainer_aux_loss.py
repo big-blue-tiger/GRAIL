@@ -38,6 +38,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         super().__init__(*args, **kwargs)
         if self.teacher_termination_loss_override_enabled:
             self._init_teacher_termination_loss_override()
+        self._update_termination_thresholds()
 
     def _init_config(self):
         """Extend base config initialisation with auxiliary loss settings.
@@ -70,6 +71,35 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             self.config.get("teacher_termination_loss_override", {}).get("enabled", False)
         )
 
+        termination_schedule = self.config.get("termination_threshold_schedule", {})
+        self.termination_threshold_schedule_enabled = bool(
+            termination_schedule.get("enabled", False)
+        )
+        self.termination_threshold_schedules = termination_schedule.get("terms", {})
+        self._termination_thresholds = {}
+
+    def _update_termination_thresholds(self):
+        """Relax student pose limits using the checkpoint-restored iteration counter."""
+        if not self.termination_threshold_schedule_enabled:
+            return
+        iteration = float(self.state.global_step)
+        manager = self.env.env.termination_manager
+        for name, schedule in self.termination_threshold_schedules.items():
+            start, end = float(schedule["start"]), float(schedule["end"])
+            progress = min(iteration / float(schedule["end_iteration"]), 1.0)
+            threshold = start + (end - start) * progress
+            term = manager.get_term_cfg(name)
+            term.params["threshold"] = threshold
+            manager.set_term_cfg(name, term)
+            if self.teacher_termination_loss_override_enabled:
+                self._student_loss_termination_params[name]["threshold"] = threshold
+            self._termination_thresholds[name] = threshold
+
+    def _train_rollout_mode(self):
+        super()._train_rollout_mode()
+        # Update before any mask evaluation or environment step in this rollout.
+        self._update_termination_thresholds()
+
     def _init_teacher_termination_loss_override(self):
         """Cache only the two stateless pose checks; never create a termination manager."""
         from gear_sonic.envs.manager_env.mdp.terminations import (
@@ -84,6 +114,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         teacher_config = OmegaConf.load(config_path)
         self._teacher_loss_termination_terms = []
         self._student_loss_termination_terms = []
+        self._student_loss_termination_params = {}
         for name, expected_func in (
             ("ee_body_pos", exceeded_body_height),
             ("object_pos_deviation", object_pos_deviation),
@@ -107,7 +138,10 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                     raise ValueError(f"Unsupported {source} termination {name}: {func}")
                 if not isinstance(params, dict):
                     raise ValueError(f"Missing parameters for {source} termination {name}")
+                print(f"Registering {source} termination {name} wit h params {params} and expected function {expected_func}")
                 destination.append((expected_func, deepcopy(params)))
+                if source == "student":
+                    self._student_loss_termination_params[name] = destination[-1][1]
 
     def _rollout_teacher_termination_mask(self):
         """Evaluate the current observation's state, independently on every step."""
@@ -426,5 +460,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         ppo_coef, bc_coef = self._get_ppo_bc_loss_coefs()
         metrics["loss/lambda_ppo"] = ppo_coef
         metrics["loss/lambda_bc"] = bc_coef
+        for name, threshold in self._termination_thresholds.items():
+            metrics[f"termination/{name}_threshold"] = threshold
 
         return metrics

@@ -11,17 +11,37 @@ algo:
   config:
     teacher_termination_loss_override:
       enabled: true
+    # Each student termination and its BC-mask check use an independent schedule.
+    termination_threshold_schedule:
+      enabled: true
+      terms:
+        ee_body_pos:
+          start: 0.3
+          end: 0.8
+          end_iteration: 6000
+        object_pos_deviation:
+          start: 0.3
+          end: 0.8
+          end_iteration: 6000
 
 manager_env:
+  recorders:
+    # Metrics only: do not create or export trajectory datasets.
+    dataset_export_mode: 0
+    export_in_record_pre_reset: false
+    object_position_success:
+      _target_: gear_sonic.envs.manager_env.mdp.recorders.ObjectPositionSuccessRecorderCfg
+      command_name: motion
+      threshold: 0.1
   config:
     action_transform_active_encoders: [g1]
   terminations:
     ee_body_pos:
       params:
-        threshold: 0.3  # Student end-effector height error limit (meters).
+        threshold: ${algo.config.termination_threshold_schedule.terms.ee_body_pos.start}
     object_pos_deviation:
       params:
-        threshold: 0.3  # Student object position error limit (meters).
+        threshold: ${algo.config.termination_threshold_schedule.terms.object_pos_deviation.start}
   rewards:
     micro_step_penalty:
       _target_: isaaclab.managers.RewardTermCfg
