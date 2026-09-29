@@ -6,8 +6,6 @@
 
 defaults:
   - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs
-  # The base disables object tracking with null; restore its full definition.
-  - /manager_env/rewards/terms/object_tracking_reward@_global_.manager_env.rewards
   - _self_
 
 exp_var: robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_ema

@@ -17,12 +17,12 @@ algo:
       terms:
         ee_body_pos:
           start: 0.3
-          end: 0.8
-          end_iteration: 6000
+          end: 0.55
+          end_iteration: 3000
         object_pos_deviation:
           start: 0.3
-          end: 0.8
-          end_iteration: 6000
+          end: 0.55
+          end_iteration: 3000
 
 manager_env:
   recorders:
@@ -43,11 +43,24 @@ manager_env:
       params:
         threshold: ${algo.config.termination_threshold_schedule.terms.object_pos_deviation.start}
   rewards:
+    object_final_goal_success:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_success
+      weight: 2.0
+      params:
+        command_name: motion
+        threshold: ${manager_env.recorders.object_position_success.threshold}
+    object_final_goal_distance_after_contact:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:object_final_goal_distance_after_contact
+      weight: -1.5
+      params:
+        command_name: motion
     micro_step_penalty:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp.micro_step_reward:MicroStepPenalty
       # Each qualifying foot touchdown contributes weight * step_dt to the reward.
-      weight: -8.0
+      weight: -12.0
       params:
         # command_name: motion_velocity
         min_step_length: 0.13

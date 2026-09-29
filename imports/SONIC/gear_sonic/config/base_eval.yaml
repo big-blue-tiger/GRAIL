@@ -7,9 +7,18 @@ defaults:
 
 checkpoint: ???
 
-# Applied after loading a checkpoint's saved training config, so legacy
-# checkpoints also use the relaxed play threshold unless explicitly overridden.
-object_pos_deviation_threshold: 0.25
+reference_free:
+  enabled: false
+  dataset_dir: ../../data/hf_dataset/data_update/data/pickup_table_walk_concat
+  initial_pose_file: ../../outputs/pickup_table__alcohol_1__000_first_frame.pkl
+  success_threshold: 0.1
+  terminate_on_success: true
+  debug_vis: true
+
+# Override checkpoint termination parameters through their native config paths:
+# ++manager_env.terminations.ee_body_pos.params.threshold=0.8
+# ++manager_env.terminations.object_pos_deviation.params.threshold=25
+# Without overrides, use the checkpoint config (including its eval_overrides).
 log_reset_reasons: true
 # A run-once play only consumes one motion per environment. Cap the paired
 # motion/USD library before scene construction instead of indexing everything.

@@ -472,6 +472,12 @@ def main(override_config: omegaconf.OmegaConf):
     else:
         config = override_config
 
+    if config.get("reference_free", {}).get("enabled", False):
+        from gear_sonic.reference_free_eval import run
+
+        run(config)
+        return
+
     meta_path = Path(config.experiment_dir) / "meta.yaml"
     if meta_path.exists():
         meta = yaml.safe_load(open(meta_path))  # noqa: SIM115
@@ -493,24 +499,6 @@ def main(override_config: omegaconf.OmegaConf):
         for termination in config.manager_env.config.get("train_only_terminations", []):
             if termination in config.manager_env.terminations:
                 config.manager_env.terminations.pop(termination)
-
-        # Checkpoints embed their original environment config, so changing the
-        # source YAML alone would leave old checkpoints at 0.10 m during play.
-        # Apply the new evaluation default after merging the checkpoint config;
-        # users can still override it with
-        # ++object_pos_deviation_threshold=<meters>.
-        object_pos_term = config.manager_env.terminations.get(
-            "object_pos_deviation", None
-        )
-        if object_pos_term is not None:
-            object_pos_threshold = float(
-                config.get("object_pos_deviation_threshold", 25) # set to 25 彻底关闭此终止条件
-            )
-            object_pos_term.params.threshold = object_pos_threshold
-            logger.info(
-                "Evaluation object_pos_deviation threshold: "
-                f"{object_pos_threshold:.3f} m"
-            )
 
         # Paired-motion scene construction consumes the motion library config
         # before the command starts loading clips.  Cap it here so run-once
@@ -1316,19 +1304,10 @@ def main(override_config: omegaconf.OmegaConf):
                                 config.num_envs,
                             )
                         if log_reset_reasons:
-                            displayed_reasons = [
-                                (
-                                    f"{reason}(参考/真实物体位置偏差 > "
-                                    f"{object_pos_threshold:.3f} m)"
-                                    if reason == "object_pos_deviation"
-                                    else reason
-                                )
-                                for reason in reasons
-                            ]
                             logger.info(
                                 f"第 {env_id + 1} 条数据 "
                                 f"({episode_motion_keys[env_id]}) 因为 "
-                                f"{', '.join(displayed_reasons)} "
+                                f"{', '.join(reasons)} "
                                 f"在第 {result['elapsed_seconds']:.2f} 秒 reset；"
                                 f"清理状态={result['status']}"
                             )

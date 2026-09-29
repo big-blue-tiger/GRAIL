@@ -113,7 +113,7 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
   headless=True \
   num_envs=4096 \
-  experiment_name=0308Termination_walk \
+  experiment_name=03055Termination_walk \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
@@ -245,12 +245,12 @@ python gear_sonic/eval_agent_trl.py \
 ## 服务器端play
 ```bash
 python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/0308Termination_walk-20260920_115339/last.pt \
+  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/03055Termination_walk-20260923_172120/last.pt \
   +headless=True \
   ++num_envs=16 \
   +run_once=True \
   ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/0308Termination_walk-3200 \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/03055Termination_walk-4500 \
   "~manager_env/recorders=empty" \
   "+manager_env/recorders=render" \
   ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
@@ -258,42 +258,28 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
   ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
   ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  ++object_pos_deviation_threshold=25 \
-&& \
-python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/0308Termination_walk-20260920_115339/model_step_002000.pt \
-  +headless=True \
-  ++num_envs=16 \
-  +run_once=True \
-  ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/0308Termination_walk-model_step_002000 \
-  "~manager_env/recorders=empty" \
-  "+manager_env/recorders=render" \
-  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
-  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  ++object_pos_deviation_threshold=25 
+  ++manager_env.terminations.ee_body_pos.params.threshold=25 \
+  ++manager_env.terminations.object_pos_deviation.params.threshold=25
 
-
-
-python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/joint_micro_step_high_regularization-20260915_162103/last.pt \
-  +headless=True \
-  ++num_envs=16 \
-  +run_once=True \
-  ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/joint_micro_step_high_regularization-20260915_162103 \
-  "~manager_env/recorders=empty" \
-  "+manager_env/recorders=render" \
-  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
-  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
-  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
-  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/bps \
-  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  ++object_pos_deviation_threshold=25
 ```
+
+```bash
+python gear_sonic/eval_agent_trl.py \
+  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/03055Termination_walk-20260923_172120/last.pt \
+  +headless=True ++num_envs=8 +run_once=True \
+  ++manager_env.config.episode_length_s=13 \
+  reference_free.enabled=True \
+  reference_free.terminate_on_success=False \
+  reference_free.dataset_dir=/home/GRAIL/data/SBTO/pickup_book/pickup_table \
+  reference_free.initial_pose_file=/home/GRAIL/imports/SONIC/models/init_g1_state/pickup_table__alcohol_1__000_first_frame.pkl \
+  ++manager_env.config.render_results=True \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/03055Termination_walk-reference-free-book \
+  '~manager_env/recorders=empty' '+manager_env/recorders=render'
+```
+
+
+
+
 ```bash
 rsync -aP \
   --no-owner --no-group \

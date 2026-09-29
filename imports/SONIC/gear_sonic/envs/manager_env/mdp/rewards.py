@@ -85,6 +85,8 @@ class RewardsCfg:
     # Object motion tracking reward (OmniGrasp-style r_t^obj)
     object_tracking_reward = None
     object_final_goal_distance = None
+    object_final_goal_success = None
+    object_final_goal_distance_after_contact = None
     object_acc_l2 = None
     object_lift_contact_reward = None
     # Finger primitive action limit penalty
@@ -811,6 +813,46 @@ def anti_shake_ang_vel_l2(
 
 
 # ==================== HOI Manipulation Rewards ====================
+
+
+def _object_final_goal_distance(env, command_name, asset_cfg):
+    """Distance to the recorder's final world-frame object target, in meters."""
+    command = env.command_manager.get_term(command_name)
+    final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
+    target_pos_w = (
+        command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
+        + env.scene.env_origins
+    )
+    target_pos_w[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
+    return torch.norm(env.scene[asset_cfg.name].data.root_pos_w - target_pos_w, dim=-1)
+
+
+def reward_object_final_goal_success(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    threshold: float = 0.1,
+) -> torch.Tensor:
+    """Reward each step inside the success radius; use the recorder's strict bound."""
+    return (_object_final_goal_distance(env, command_name, asset_cfg) < threshold).float()
+
+
+def object_final_goal_distance_after_contact(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """Linear distance cost after first reference contact; use a negative weight.
+
+    Compare absolute motion steps, including randomized motion start offsets.
+    The gate stays active after reference contact is released.
+    """
+    command = env.command_manager.get_term(command_name)
+    after_contact = (
+        command.motion_start_time_steps + command.time_steps > command._per_env_first_contact
+    )
+    distance = _object_final_goal_distance(env, command_name, asset_cfg)
+    return torch.where(after_contact, distance, 0.0)
 
 
 def reward_object_final_goal_distance(
