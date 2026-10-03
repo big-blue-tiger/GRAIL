@@ -23,6 +23,10 @@ python -u -m grail.datatool.batch_filter_teacher_policy \
 训练会自动读取 `motion_file` 所在数据集的 `meta/<motion_key>.pkl`。
 若包含 `transition_start_frame` 和 `transition_end_frame`，则与 play 使用同一套残差过渡：
 起始帧之前为纯 SONIC，过渡区间内 GRAIL 残差系数从 0 线性递增至 1，结束帧之后为 SONIC + 完整 GRAIL 残差。
+若还有 `residual_fade_out_start_frame` 和 `residual_fade_out_end_frame`，则在此基础上乘以
+`1 - clamp((f - start) / (end - start), 0, 1)`：抓握后的过渡段从 1 递减至 0，
+第一帧 Kimodo 持物移动起保持为 0。两个渐出标签由 place 拼接器写入，按输出 motion FPS
+使用零基帧索引，包含两端，须成对提供且满足 `0 <= start < end < total_frames`。
 系数按各环境当前 motion 的实际帧计算，包含随机起始偏移与源数据帧率换算；没有过渡元数据的 motion 保持原行为。
 DAgger 的教师执行动作和蒸馏目标均应用此系数（包括 action-chunk）；学生的完整 latent 输出通过该目标学习，不直接乘残差系数。
 使用拼接数据时，将训练命令的 `motion_file`、`object_motion_file`、`bps_dir` 和 `object_usd_path` 指向拼接数据集，并保留同级 `meta` 目录即可，无需额外开关。
@@ -169,32 +173,68 @@ Play 自动读取动作对应的 `meta/<motion_key>.pkl`。若同时包含
 从当前仿真步数换算（包含 reset 的起始偏移）。起始帧系数为 0，结束帧为 1，
 结束后恢复原有 `latent_residual_scale`；缺少任一字段则保持原行为。
 两个字段须为从 0 开始的整数，且 `0 <= start < end`。
-仅缩放 latent 残差，不改变手指 primitive 输出；训练和 direct-latent 学生不受影响。
+若包含 `residual_fade_out_start_frame` 和 `residual_fade_out_end_frame`，上述系数再乘以
+`1 - clamp((f - start) / (end - start), 0, 1)`，在抓握后的拼接过渡内关闭残差，
+第一帧 Kimodo 生成数据起保持为 0。渐出字段须成对提供且为整数，满足
+`0 <= start < end < total_frames`；两个字段均缺失时渐出系数为 1，兼容旧数据。
+play 和训练的教师执行及蒸馏目标共用这套系数，无需额外开关。
+仅缩放 latent 残差，不改变手指 primitive 输出，也不直接缩放 direct-latent 学生动作。
 
 ```bash
+#本地play
+python gear_sonic/eval_agent_trl.py \
+  --config-name=base \
+  +exp=manager/universal_token/hoi/pnp_table \
+  +callbacks=im_eval \
+  checkpoint=/home/tide/robot/GRAIL/imports/SONIC/models/pnp_table/last.pt \
+  headless=True \
+  num_envs=4 \
+  ++run_once=True \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_shard_rank=0 \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_shard_world_size=1 \
+  ++manager_env.commands.motion.start_from_first_frame=True \
+  ++manager_env.commands.motion.sample_before_contact=False \
+  ++manager_env.config.object_usd_path=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot \
+  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects \
+  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps \
+  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/tide/robot/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  ++manager_env.config.gpu_collision_stack_size_exp=27 \
+  ++manager_env.config.render_results=True \
+  ++manager_env.config.save_rendering_dir=/home/tide/robot/GRAIL/outputs/pnp_table_place_concat_video \
+  ++manager_env.recorders.render_envs._target_=gear_sonic.envs.manager_env.mdp.recorders.RenderEnvsRecorderCfg \
+  ++manager_env.recorders.render_envs.video_save_path=/home/tide/robot/GRAIL/outputs/pnp_table_place_concat_video \
+  ++manager_env.recorders.render_envs.video_quality=5 \
+  ++manager_env.terminations.ee_body_pos.params.threshold=25 \
+  ++manager_env.terminations.object_pos_deviation.params.threshold=25
+
+#服务器play
 python gear_sonic/eval_agent_trl.py \
   --config-name=base \
   +exp=manager/universal_token/hoi/pnp_table \
   +callbacks=im_eval \
   checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   headless=True \
-  num_envs=15 \
+  num_envs=16 \
   ++run_once=True \
   ++manager_env.commands.motion.motion_lib_cfg.motion_shard_rank=0 \
   ++manager_env.commands.motion.motion_lib_cfg.motion_shard_world_size=1 \
   ++manager_env.commands.motion.start_from_first_frame=True \
   ++manager_env.commands.motion.sample_before_contact=False \
-  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
+  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot \
+  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects \
+  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps \
   ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   ++manager_env.config.gpu_collision_stack_size_exp=29 \
   ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/pnp_table_walk_concat_video \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/pnp_table_place_concat_video \
   ++manager_env.recorders.render_envs._target_=gear_sonic.envs.manager_env.mdp.recorders.RenderEnvsRecorderCfg \
-  ++manager_env.recorders.render_envs.video_save_path=/home/GRAIL/outputs/pnp_table_walk_concat_video \
-  ++manager_env.recorders.render_envs.video_quality=5
+  ++manager_env.recorders.render_envs.video_save_path=/home/GRAIL/outputs/pnp_table_place_concat_video \
+  ++manager_env.recorders.render_envs.video_quality=5 \
+  ++manager_env.terminations.ee_body_pos.params.threshold=25 \
+  ++manager_env.terminations.object_pos_deviation.params.threshold=25
+
 ```
 ### Teacher policy 检测整套数据成功率（不保存视频）
 

@@ -99,6 +99,7 @@ class EvalResidualTransition:
                     start = meta.get("transition_start_frame")
                     end = meta.get("transition_end_frame")
                     bound = (-1, -1)
+                    step_ratio = None
                     if start is not None and end is not None:
                         if not (
                             isinstance(start, numbers.Integral)
@@ -116,17 +117,48 @@ class EvalResidualTransition:
                         logging.getLogger(__name__).info(
                             "Residual transition %s: frames %s -> %s", key, start, end
                         )
-                    self._bounds[path] = bound
+                    fade_out_bound = (-1, -1)
+                    if ("residual_fade_out_start_frame" in meta
+                            or "residual_fade_out_end_frame" in meta):
+                        fade_out_start = meta.get("residual_fade_out_start_frame")
+                        fade_out_end = meta.get("residual_fade_out_end_frame")
+                        total = meta.get("total_frames")
+                        if not (
+                            all(isinstance(value, numbers.Integral) and not isinstance(value, bool)
+                                for value in (fade_out_start, fade_out_end, total))
+                            and 0 <= fade_out_start < fade_out_end < total
+                        ):
+                            raise ValueError(
+                                f"{path}: residual fade-out frames must be paired integers with "
+                                f"0 <= start < end < total_frames; got "
+                                f"{fade_out_start!r}, {fade_out_end!r}, {total!r}"
+                            )
+                        if step_ratio is None:
+                            step_ratio = motion_source_step_ratio(command, key)
+                        fade_out_bound = (
+                            int(fade_out_start) * step_ratio, int(fade_out_end) * step_ratio
+                        )
+                        logging.getLogger(__name__).info(
+                            "Residual fade-out %s: frames %s -> %s", key, fade_out_start, fade_out_end
+                        )
+                    self._bounds[path] = (*bound, *fade_out_bound)
                 bounds.append(self._bounds[path])
             self._frame_bounds = torch.tensor(bounds, device=device)
             self._keys = keys
 
-        start, end = self._frame_bounds[command.motion_ids].unbind(-1)
+        start, end, fade_out_start, fade_out_end = self._frame_bounds[command.motion_ids].unbind(-1)
         frame = command.motion_start_time_steps + command.time_steps
         duration = torch.where(start >= 0, end - start, torch.ones_like(start))
         weight = ((frame - start).float() / duration).clamp(0, 1)
         weight = torch.where(start >= 0, weight, torch.ones_like(weight))
-        return weight
+        fade_out_duration = torch.where(
+            fade_out_start >= 0, fade_out_end - fade_out_start, torch.ones_like(fade_out_start)
+        )
+        fade_out_weight = 1 - ((frame - fade_out_start).float() / fade_out_duration).clamp(0, 1)
+        fade_out_weight = torch.where(
+            fade_out_start >= 0, fade_out_weight, torch.ones_like(fade_out_weight)
+        )
+        return weight * fade_out_weight
 
     def apply(self, actions, *, weight=None, residual=False):
         """Blend residual actions; explicit residual=True also supports DAgger teachers."""
