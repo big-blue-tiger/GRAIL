@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import glob
 import os
+from pathlib import Path
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -674,6 +675,10 @@ class TrackingCommand(CommandTerm):
 
         # Cache for table metadata loaded from pkl files (loaded once per motion key)
         self._table_meta_cache = {}  # motion_key -> {'table_pos': tensor, 'table_quat': tensor}
+        self._place_meta_keys = None
+        self._carry_meta_keys = None
+        self._turn_direction_meta_keys = None
+        self.place_goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         if self.cfg.use_height_map:
             import omni  # noqa: PLC0415
@@ -2992,7 +2997,9 @@ class TrackingCommand(CommandTerm):
             meta_dir = os.path.join(os.path.dirname(os.path.dirname(motion_file)), "meta")
         else:
             meta_dir = "data/motion_lib_grab/meta"
-        meta_file = os.path.join(meta_dir, f"{motion_key}.pkl")
+        source = self.motion_lib._motion_data_load.get(motion_key, {})
+        name = Path(source["path"]).stem if "path" in source else motion_key
+        meta_file = os.path.join(meta_dir, f"{name}.pkl")
 
         if not os.path.exists(meta_file):
             raise FileNotFoundError(
@@ -3015,6 +3022,184 @@ class TrackingCommand(CommandTerm):
                 meta.get("table_size", [1.0, 0.6, 0.04]), device=self.device
             ).float(),
         }
+        # Extend the existing per-motion cache. Place experiments require these
+        # fields; old datasets can continue to load table metadata alone.
+        for field in ("grail_start_frame", "grail_end_frame_exclusive",
+                      "place_release_start_frame", "place_object_goal_pos_w",
+                      "place_object_goal_quat_w", "total_frames",
+                      "place_carry_source_frame", "place_object_carry_goal_pos_w",
+                      "place_object_carry_goal_quat_w", "place_turn_direction"):
+            if field in meta:
+                self._table_meta_cache[motion_key][field] = meta[field]
+
+    def _ensure_place_meta(self):
+        """Cache final goal poses and stage boundaries from the companion meta."""
+        keys = self.motion_lib.curr_motion_keys
+        if keys is self._place_meta_keys:
+            return
+        from gear_sonic.trl.modules.eval_residual_transition import motion_source_step_ratio
+
+        goals, quaternions, boundaries, goal_steps = [], [], [], []
+        for key in keys:
+            if key not in self._table_meta_cache:
+                self._load_table_meta(key)
+            meta = self._table_meta_cache[key]
+            fields = ("grail_start_frame", "grail_end_frame_exclusive",
+                      "place_release_start_frame", "total_frames", "place_object_goal_pos_w",
+                      "place_object_goal_quat_w")
+            missing = [field for field in fields if field not in meta]
+            if missing:
+                raise ValueError(f"{key}: missing place meta fields {missing}; rerun place concat")
+            gs, ge, release, total = (meta[field] for field in fields[:4])
+            if (not all(isinstance(value, (int, np.integer)) for value in (gs, ge, release, total))
+                    or not 0 <= gs < ge <= release < total):
+                raise ValueError(f"{key}: invalid place stage boundaries")
+            goal = torch.as_tensor(meta[fields[4]], device=self.device, dtype=torch.float32)
+            if goal.shape != (3,) or not torch.isfinite(goal).all():
+                raise ValueError(f"{key}: place_object_goal_pos_w must be a finite 3-vector")
+            quat = torch.as_tensor(meta[fields[5]], device=self.device, dtype=torch.float32)
+            if (quat.shape != (4,) or not torch.isfinite(quat).all()
+                    or abs(torch.linalg.vector_norm(quat).item() - 1.0) > 1e-3):
+                raise ValueError(f"{key}: place_object_goal_quat_w must be a unit wxyz quaternion")
+            ratio = motion_source_step_ratio(self, key)
+            goals.append(goal)
+            quaternions.append(quat / torch.linalg.vector_norm(quat))
+            boundaries.append([gs * ratio, ge * ratio, release * ratio])
+            goal_steps.append(int(np.ceil((release - 1) * ratio)))
+        self._place_goal_pos = torch.stack(goals)
+        self._place_goal_quat = torch.stack(quaternions)
+        self._place_stage_steps = torch.tensor(boundaries, device=self.device, dtype=torch.float64)
+        self._place_goal_steps = torch.tensor(goal_steps, device=self.device, dtype=torch.long)
+        self._place_meta_keys = keys
+
+    def _ensure_carry_meta(self):
+        """Cache original carry poses only for experiments requesting the second goal."""
+        self._ensure_place_meta()
+        keys = self.motion_lib.curr_motion_keys
+        if keys is self._carry_meta_keys:
+            return
+        from gear_sonic.trl.modules.eval_residual_transition import motion_source_step_ratio
+
+        positions, quaternions, steps = [], [], []
+        for key in keys:
+            meta = self._table_meta_cache[key]
+            fields = ("place_carry_source_frame", "place_object_carry_goal_pos_w",
+                      "place_object_carry_goal_quat_w")
+            missing = [field for field in fields if field not in meta]
+            if missing:
+                raise ValueError(f"{key}: missing carry meta fields {missing}; rerun place concat")
+            frame = meta[fields[0]]
+            if (not isinstance(frame, (int, np.integer))
+                    or not 0 <= frame < meta["grail_end_frame_exclusive"]):
+                raise ValueError(f"{key}: invalid place_carry_source_frame")
+            pos = torch.as_tensor(meta[fields[1]], device=self.device, dtype=torch.float32)
+            quat = torch.as_tensor(meta[fields[2]], device=self.device, dtype=torch.float32)
+            if pos.shape != (3,) or not torch.isfinite(pos).all():
+                raise ValueError(f"{key}: place_object_carry_goal_pos_w must be a finite 3-vector")
+            if (quat.shape != (4,) or not torch.isfinite(quat).all()
+                    or abs(torch.linalg.vector_norm(quat).item() - 1.0) > 1e-3):
+                raise ValueError(f"{key}: place_object_carry_goal_quat_w must be a unit wxyz quaternion")
+            positions.append(pos)
+            quaternions.append(quat / torch.linalg.vector_norm(quat))
+            steps.append(int(np.ceil(frame * motion_source_step_ratio(self, key))))
+        self._carry_goal_pos = torch.stack(positions)
+        self._carry_goal_quat = torch.stack(quaternions)
+        self._carry_goal_steps = torch.tensor(steps, device=self.device, dtype=torch.long)
+        self._carry_meta_keys = keys
+
+    def get_place_turn_direction(self) -> torch.Tensor:
+        """Return per-motion turn labels as [num_envs, 1]: left +1, right -1, straight 0."""
+        keys = self.motion_lib.curr_motion_keys
+        if keys is not self._turn_direction_meta_keys:
+            directions = []
+            for key in keys:
+                if key not in self._table_meta_cache:
+                    self._load_table_meta(key)
+                value = self._table_meta_cache[key].get("place_turn_direction")
+                if (not isinstance(value, (int, np.integer))
+                        or isinstance(value, (bool, np.bool_)) or value not in (-1, 0, 1)):
+                    raise ValueError(
+                        f"{key}: place_turn_direction must be -1, 0 or 1; rerun place concat"
+                    )
+                directions.append(value)
+            self._place_turn_directions = torch.tensor(
+                directions, device=self.device, dtype=torch.float32
+            )
+            self._turn_direction_meta_keys = keys
+        return self._place_turn_directions[self.motion_ids].unsqueeze(-1)
+
+    def before_place_carry(self):
+        """Whether the absolute reference frame precedes the source carry frame."""
+        self._ensure_carry_meta()
+        return (self.motion_start_time_steps + self.time_steps
+                < self._carry_goal_steps[self.motion_ids])
+
+    def before_place_release(self):
+        self._ensure_place_meta()
+        return (self.motion_start_time_steps + self.time_steps
+                < self._place_stage_steps[self.motion_ids, 2])
+
+    def before_place_transition(self):
+        self._ensure_place_meta()
+        return (self.motion_start_time_steps + self.time_steps
+                < self._place_stage_steps[self.motion_ids, 1])
+
+    def outside_grail(self):
+        self._ensure_place_meta()
+        step = self.motion_start_time_steps + self.time_steps
+        bounds = self._place_stage_steps[self.motion_ids]
+        return (step < bounds[:, 0]) | (step >= bounds[:, 1])
+
+    def get_object_goal_pos_w(self, target_source="final_frame"):
+        if target_source == "meta_place_goal":
+            self._ensure_place_meta()
+            pos = self._place_goal_pos[self.motion_ids].clone()
+        elif target_source == "meta_carry_goal":
+            self._ensure_carry_meta()
+            pos = self._carry_goal_pos[self.motion_ids].clone()
+        elif target_source == "final_frame":
+            steps = self.motion_lib.get_time_step_total(self.motion_ids) - 1
+            pos = self.motion_lib.get_object_root_pos(self.motion_ids, steps)[:, 0].clone()
+        else:
+            raise ValueError(f"Unknown object target_source: {target_source}")
+        if target_source in ("meta_place_goal", "meta_carry_goal"):
+            # Match the translation already applied to robot/object reference motions.
+            pos[:, :2] -= self.motion_lib._motion_root_xy_offset[self.motion_ids]
+        pos[:, 2] += getattr(self.cfg, "object_z_offset", 0.0)
+        return pos + self._env.scene.env_origins
+
+    def get_object_goal_quat_w(self, target_source="final_frame"):
+        if target_source == "meta_place_goal":
+            self._ensure_place_meta()
+            return self._place_goal_quat[self.motion_ids]
+        if target_source == "meta_carry_goal":
+            self._ensure_carry_meta()
+            return self._carry_goal_quat[self.motion_ids]
+        steps = self.get_object_goal_steps(target_source)
+        return self.motion_lib.get_object_root_quat(self.motion_ids, steps)[:, 0]
+
+    def get_object_goal_steps(self, target_source="final_frame"):
+        if target_source == "meta_place_goal":
+            self._ensure_place_meta()
+            return self._place_goal_steps[self.motion_ids]
+        if target_source == "meta_carry_goal":
+            self._ensure_carry_meta()
+            return self._carry_goal_steps[self.motion_ids]
+        if target_source != "final_frame":
+            raise ValueError(f"Unknown object target_source: {target_source}")
+        return self.motion_lib.get_time_step_total(self.motion_ids) - 1
+
+    def update_place_goal_reached(self, threshold=0.1):
+        """Latch reference-contact arrival in this episode; no phase state machine."""
+        contact = self.get_in_contact("right_hand")
+        if contact is None:
+            raise RuntimeError("Place success requires right-hand reference contact labels")
+        distance = torch.linalg.vector_norm(
+            self._env.scene["object"].data.root_pos_w
+            - self.get_object_goal_pos_w("meta_place_goal"), dim=-1
+        )
+        self.place_goal_reached |= (contact > 0.5) & (distance < threshold)
+        return self.place_goal_reached
 
     def _derive_first_contact_from_motion_lib(self):
         """Derive first contact frames from motion_lib's in_contact labels.
@@ -3200,6 +3385,7 @@ class TrackingCommand(CommandTerm):
             env_ids: Environment indices being reset.
         """
         self.time_steps[env_ids] = 0
+        self.place_goal_reached[env_ids] = False
         # Variable frames: resample per-env num_frames at episode reset
         if self.variable_frames_enabled and len(env_ids) > 0:
             idx = torch.randint(0, len(self._frame_choices), (len(env_ids),), device=self.device)

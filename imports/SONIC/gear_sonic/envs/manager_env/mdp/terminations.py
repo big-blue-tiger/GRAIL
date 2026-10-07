@@ -34,6 +34,7 @@ class TerminationsCfg:
 
     time_out = None
     motion_time_out = None
+    place_carry_time_out = None
     anchor_pos = None
     anchor_pos_adaptive = None
     anchor_pos_orig = None
@@ -266,6 +267,23 @@ def tracking_time_out(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor
     elapsed = command.time_steps + command.motion_start_time_steps + 1
     total = command.motion_lib.get_time_step_total(command.motion_ids)
     return elapsed >= total
+
+
+def place_carry_time_out(
+    env: ManagerBasedRLEnv, command_name: str, enabled: bool = True
+) -> torch.Tensor:
+    """Truncate pickup episodes before entering the source carry frame.
+
+    As with ``tracking_time_out``, stop on the last allowed reference step,
+    before the command advances. Configure this term with ``time_out=True``
+    so that it bootstraps the critic and does not incur a failure penalty.
+    Evaluation always runs without this training-only truncation.
+    """
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    if not enabled or command.is_evaluating:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    next_step = command.motion_start_time_steps + command.time_steps + 1
+    return next_step >= command.get_object_goal_steps("meta_carry_goal")
 
 
 def _resolve_matching_names(patterns: str | Sequence[str], candidates: Sequence[str]) -> list[str]:
@@ -503,6 +521,7 @@ def object_pos_deviation(
     env: ManagerBasedRLEnv,
     command_name: str,
     threshold: float = 0.2,
+    disable_after_release: bool = False,
 ) -> torch.Tensor:
     """Terminate if object position deviates from reference by more than threshold.
 
@@ -528,7 +547,10 @@ def object_pos_deviation(
     current_object_pos = obj.data.root_pos_w
 
     pos_error = torch.norm(ref_object_pos - current_object_pos, dim=-1)
-    return pos_error > threshold
+    exceeded = pos_error > threshold
+    if disable_after_release:
+        exceeded &= command.before_place_release()
+    return exceeded
 
 
 def object_z_pos_deviation(

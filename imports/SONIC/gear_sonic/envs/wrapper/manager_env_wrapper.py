@@ -1189,11 +1189,10 @@ class ManagerEnvWrapper:
         extras["time_outs"] = truncated
         extras["episode"] = {}
         extras["to_log"] = {}
-        if "object_position_success" in extras:
-            successes = extras["object_position_success"]
-            if successes.numel():
+        for metric in ("object_position_success", "object_release_success", "carry_goal_success"):
+            if metric in extras and extras[metric].numel():
                 # Preserve one sample per completed episode for correctly weighted means.
-                extras["to_log"]["object_position_success_rate"] = successes
+                extras["to_log"][f"{metric}_rate"] = extras[metric]
         for k, v in extras["log"].items():
             if isinstance(v, torch.Tensor):
                 extras["to_log"][k] = v

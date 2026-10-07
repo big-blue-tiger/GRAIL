@@ -39,6 +39,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         if self.teacher_termination_loss_override_enabled:
             self._init_teacher_termination_loss_override()
         self._update_termination_thresholds()
+        self._update_place_carry_curriculum()
 
     def _init_config(self):
         """Extend base config initialisation with auxiliary loss settings.
@@ -67,6 +68,9 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         if self.ppo_bc_end_iteration is not None and self.ppo_bc_end_iteration <= 0:
             raise ValueError("ppo_bc_loss_schedule.end_iteration must be positive")
 
+        self.after_carry_schedule = after_carry = schedule_cfg["after_carry"]
+        self.place_carry_curriculum = self.config["place_carry_curriculum"]
+    
         self.teacher_termination_loss_override_enabled = bool(
             self.config.get("teacher_termination_loss_override", {}).get("enabled", False)
         )
@@ -88,17 +92,51 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             start, end = float(schedule["start"]), float(schedule["end"])
             progress = min(iteration / float(schedule["end_iteration"]), 1.0)
             threshold = start + (end - start) * progress
+            if iteration >= self.place_carry_curriculum["switch_iteration"]:
+                threshold = float(schedule["after_threshold"])
             term = manager.get_term_cfg(name)
             term.params["threshold"] = threshold
             manager.set_term_cfg(name, term)
-            if self.teacher_termination_loss_override_enabled:
+            if (
+                self.teacher_termination_loss_override_enabled
+                and name in self._student_loss_termination_params
+            ):
                 self._student_loss_termination_params[name]["threshold"] = threshold
             self._termination_thresholds[name] = threshold
+
+    def _update_place_carry_curriculum(self):
+        """Keep the pickup timeout active until the restored switch iteration."""
+        self.place_carry_reset_enabled = (
+            self.state.global_step < self.place_carry_curriculum["switch_iteration"]
+        )
+        manager = self.env.env.termination_manager
+        term = manager.get_term_cfg("place_carry_time_out")
+        if not term.time_out:
+            raise ValueError("place_carry_time_out must have time_out=true to avoid failure penalties")
+        term.params["enabled"] = self.place_carry_reset_enabled
+        manager.set_term_cfg("place_carry_time_out", term)
 
     def _train_rollout_mode(self):
         super()._train_rollout_mode()
         # Update before any mask evaluation or environment step in this rollout.
         self._update_termination_thresholds()
+        self._update_place_carry_curriculum()
+
+    def _store_rollout_loss_context(self):
+        """Snapshot the action observation's phase, including its start offset."""
+        command = self.env.env.command_manager.get_term(self.place_carry_curriculum["command_name"])
+        self.storage.update_key("loss_after_carry_mask", ~command.before_place_carry())
+
+    def _get_rollout_data(self, obs_keys):
+        rollout_data = super()._get_rollout_data(obs_keys)
+        mask = self.storage.query_key("loss_after_carry_mask").transpose(0, 1).to(self.accelerator.device)
+        rollout_data["loss_after_carry_mask"] = mask.repeat(2, 1) if self.use_symmetry else mask
+        return rollout_data
+
+    def _get_mb_rollout_data(self, rollout_data, micro_batch_inds):
+        mb_rollout_data = super()._get_mb_rollout_data(rollout_data, micro_batch_inds)
+        mb_rollout_data["loss_after_carry_mask"] = rollout_data["loss_after_carry_mask"][micro_batch_inds]
+        return mb_rollout_data
 
     def _init_teacher_termination_loss_override(self):
         """Cache only the two stateless pose checks; never create a termination manager."""
@@ -138,6 +176,13 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                     raise ValueError(f"Unsupported {source} termination {name}: {func}")
                 if not isinstance(params, dict):
                     raise ValueError(f"Missing parameters for {source} termination {name}")
+                params = deepcopy(params)
+                if name == "object_pos_deviation":
+                    # Both BC checks follow the student's release boundary,
+                    # including teachers trained before place data existed.
+                    params["disable_after_release"] = student_term.params.get(
+                        "disable_after_release", False
+                    )
                 print(f"Registering {source} termination {name} wit h params {params} and expected function {expected_func}")
                 destination.append((expected_func, deepcopy(params)))
                 if source == "student":
@@ -184,10 +229,24 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         ppo_coef = 1.0 - bc_coef
         return ppo_coef, bc_coef
 
-    def _get_ppo_loss_coef(self):
-        """Return the scheduled PPO coefficient used by the base trainer."""
-        ppo_coef, _ = self._get_ppo_bc_loss_coefs()
-        return ppo_coef
+    def _get_after_carry_ppo_bc_loss_coefs(self):
+        """Linearly decay BC from the carry-stage start to its own minimum."""
+        schedule = self.after_carry_schedule
+        elapsed = self.state.global_step - schedule["start_iteration"]
+        duration = schedule["end_iteration"] - schedule["start_iteration"]
+        progress = min(max(elapsed / duration, 0.0), 1.0)
+        bc_coef = schedule["bc_start_coef"] + progress * (schedule["bc_min_coef"] - schedule["bc_start_coef"])
+        return 1.0 - bc_coef, bc_coef
+
+    def _get_sample_ppo_bc_loss_coefs(self, mb_rollout_data):
+        """Choose coefficients using stored phases, never the reset env state."""
+        ppo_coef, bc_coef = self._get_ppo_bc_loss_coefs()
+        after_ppo, after_bc = self._get_after_carry_ppo_bc_loss_coefs()
+        mask = mb_rollout_data["loss_after_carry_mask"]
+        return torch.where(mask, after_ppo, ppo_coef), torch.where(mask, after_bc, bc_coef)
+
+    def _get_ppo_loss_weights(self, mb_rollout_data):
+        return self._get_sample_ppo_bc_loss_coefs(mb_rollout_data)[0]
 
     def _register_stats_buffer(self):
         """Allocate per-step statistics tensors for auxiliary losses.
@@ -291,16 +350,16 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         if self.teacher_termination_loss_override_enabled:
             bc_loss_mask = ~mb_rollout_data["loss_teacher_termination_mask"]
         valid_count = bc_loss_mask.sum().clamp_min(1)
+        _, bc_coef = self._get_sample_ppo_bc_loss_coefs(mb_rollout_data)
         total_aux_loss_unscaled = torch.tensor(0.0, device=device)
-        for loss_name, loss_value in aux_losses_dict.items():
+        total_aux_loss = torch.tensor(0.0, device=device)
+        for loss_name in aux_losses_dict:
             coef = aux_loss_coef.get(loss_name, 0.0)
             if coef == 0.0:
                 continue
             sample_loss = per_sample_losses[loss_name] * bc_loss_mask
             total_aux_loss_unscaled += coef * sample_loss.sum() / valid_count
-
-        _, bc_coef = self._get_ppo_bc_loss_coefs()
-        total_aux_loss = total_aux_loss_unscaled * bc_coef
+            total_aux_loss += coef * (sample_loss * bc_coef).sum() / valid_count
 
         return {
             "aux_losses_dict": aux_losses_dict,
@@ -460,6 +519,10 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         ppo_coef, bc_coef = self._get_ppo_bc_loss_coefs()
         metrics["loss/lambda_ppo"] = ppo_coef
         metrics["loss/lambda_bc"] = bc_coef
+        after_ppo, after_bc = self._get_after_carry_ppo_bc_loss_coefs()
+        metrics["loss/lambda_ppo_after_carry"] = after_ppo
+        metrics["loss/lambda_bc_after_carry"] = after_bc
+        metrics["curriculum/place_carry_reset_enabled"] = float(self.place_carry_reset_enabled)
         for name, threshold in self._termination_thresholds.items():
             metrics[f"termination/{name}_threshold"] = threshold
 

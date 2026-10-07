@@ -201,6 +201,12 @@ def interpolate_quaternion_data(
     return data
 
 
+def resample_discrete_frames(values, source_fps, target_fps, num_frames):
+    """Sample source floor(s * source_fps / target_fps), holding each frame's interval."""
+    indices = np.floor(np.arange(num_frames) * source_fps / target_fps).astype(int)
+    return values[np.clip(indices, 0, len(values) - 1)]
+
+
 def interpolate_contact_center(
     contact_points_dict,
     source_fps,
@@ -234,8 +240,10 @@ def interpolate_contact_center(
         if not (hasattr(points, "shape") and len(points) > 0):
             continue
         # Scale source frame range to target frame space
-        t_start = max(0, int(src_idx * fps_ratio))
-        t_end = min(num_frames, int((src_idx + 1) * fps_ratio) + 1)
+        # Target step s belongs to source floor(s / ratio). Use half-open
+        # time intervals, also when the frame-rate ratio is not integral.
+        t_start = max(0, int(np.ceil(src_idx * fps_ratio)))
+        t_end = min(num_frames, int(np.ceil((src_idx + 1) * fps_ratio)))
         center = torch.from_numpy(points.mean(axis=0).astype(np.float32))
         contact_center[t_start:t_end] = center
         in_contact[t_start:t_end] = 1.0
@@ -1535,19 +1543,17 @@ class MotionLibBase:
                     _motion_object_in_contact_right.append(curr_motion["object_in_contact_right"])
                 if "hand_action_left" in motion_file_data:
                     raw_action = motion_file_data["hand_action_left"]
-                    # Nearest-neighbor interpolation to match target fps
-                    src_len = len(raw_action)
-                    if src_len != num_frames:
-                        indices = np.round(np.linspace(0, src_len - 1, num_frames)).astype(int)
-                        raw_action = raw_action[indices]
+                    # Discrete actions use the same half-open intervals as contact.
+                    raw_action = resample_discrete_frames(
+                        raw_action, float(motion_file_data["fps"]), motion_fps, num_frames
+                    )
                     _motion_hand_action_left.append(raw_action)
                 if "hand_action_right" in motion_file_data:
                     raw_action = motion_file_data["hand_action_right"]
-                    # Nearest-neighbor interpolation to match target fps
-                    src_len = len(raw_action)
-                    if src_len != num_frames:
-                        indices = np.round(np.linspace(0, src_len - 1, num_frames)).astype(int)
-                        raw_action = raw_action[indices]
+                    # Open the hand on the first release step, never one step early.
+                    raw_action = resample_discrete_frames(
+                        raw_action, float(motion_file_data["fps"]), motion_fps, num_frames
+                    )
                     _motion_hand_action_right.append(raw_action)
             del curr_motion
 
@@ -1684,6 +1690,8 @@ class MotionLibBase:
         self.length_starts = lengths_shifted.cumsum(0)
 
         # Zero out initial root XY so all motions start at origin
+        # Retain this per-motion shift so world-frame metadata goals use the same frame.
+        self._motion_root_xy_offset = torch.zeros((len(motions), 2), device=self._device)
         if self.m_cfg.get("zero_root_xy", False):
             print(  # noqa: T201
                 f"[zero_root_xy] Zeroing initial root XY for {len(motions)} motions"
@@ -1692,6 +1700,7 @@ class MotionLibBase:
                 start = self.length_starts[i]
                 end = start + self._motion_num_frames[i]
                 init_xy = self.body_pos_w[start, 0, :2].clone()  # root body, XY
+                self._motion_root_xy_offset[i] = init_xy
                 print(  # noqa: T201
                     f"  Motion {i}: init_xy=[{init_xy[0]:.3f}, {init_xy[1]:.3f}], frames={self._motion_num_frames[i]}"  # noqa: E501
                 )

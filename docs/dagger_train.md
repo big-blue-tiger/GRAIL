@@ -34,7 +34,7 @@ DAgger 的教师执行动作和蒸馏目标均应用此系数（包括 action-ch
 
 `joint_micro_step` 启用 `algo.config.teacher_termination_loss_override`：超过教师终止阈值、但尚未超过学生终止阈值的状态不参与 BC loss。BC loss 按剩余有效样本数归一化，再乘基础调度的 BC 系数；全部被屏蔽时 loss 为零。PPO/BC 调度系数不随接触标签改变。
 
-`joint_micro_step` 继承的 `action_acc_l2` 对 `joint_pos.processed_actions`（已包含逐关节缩放、偏置和裁剪的目标角度）计算二阶差分，再除以控制周期 `step_dt` 的平方，最后平方求和。它与实际关节加速度惩罚 `joint_acc_l2` 具有相同单位，两项初始权重均为 `-2.5e-7`；这不保证实际奖励贡献相等。
+`joint_micro_step` 继承的 `action_acc_l2` 对 `joint_pos.processed_actions`（已包含逐关节缩放、偏置和裁剪的目标角度）计算二阶差分并平方求和，不除以 `step_dt`，权重为 `-1`；实际关节加速度惩罚 `joint_acc_l2` 的权重为 `-5e-7`。两项单位与贡献不同。
 若需平均贡献接近 1:1，在同一训练窗口读取 `Episode_Reward/action_acc_l2` 和 `Episode_Reward/joint_acc_l2`，分别取平均值的绝对值 `P_action`、`P_joint`，使用 `w_action_new = w_action_current * P_joint / P_action` 校准，并在后续 rollout 复核。两项日志已包含权重和相同的时间归一化，无需再次乘权重；`P_action` 接近零时不能使用此比例。目标角度跳变、接触冲击和 PD 跟踪误差会使比例随策略变化。
 
 ```bash
@@ -54,6 +54,69 @@ python gear_sonic/train_agent_trl.py \
   num_envs=8
   
 ```
+
+### 新 place 实验的本地轻量验证
+
+新增实验继承旧 `joint_micro_step`，四个数据路径已经指向 `pickup_table_place_concat`。
+启动时保留这些配置路径；不加覆盖回 `walk_concat` 或 `cleaned_succeeded` 的参数。
+`motion_meta_info_path=null` 按运动加载配套 meta。接触、离散开手动作使用半开时间区间，
+`grasp_reward` 在参考接触前仍启用，只在最终释放起点关闭。
+到达及到达后释放分别写入 `Env/object_position_success_rate`、`Env/object_release_success_rate`。
+`Env/carry_goal_success_rate` 以中间 carry 位置为目标，沿用最终目标成功率的距离阈值和
+参考接触门控；episode 内一旦成功即保留标记，在 reset 时按已结束的 episode 统计。
+
+当前 place 配置同时观察最终目标和原始 `carry_source_frame` 的中间目标，两者都包含
+pelvis、手参考帧下的位置和旋转，并增加一维 `place_turn_direction`，左转为 1、右转为 -1、
+无转向为 0，`privileged_input_dim=85`。转向按拼接后 root_rot 从 carry 帧起累计的 yaw 变化判断。
+最终目标位置和姿态取释放前一帧，和 carry 目标一样直接读取 meta 保存的世界位置及 wxyz 四元数。
+训练前重新运行 place 拼接器，使各条 meta 包含 `place_object_goal_quat_w`、`place_object_carry_goal_pos_w`、
+`place_object_carry_goal_quat_w` 和 `place_turn_direction`；已有 66/84 维学生检查点不能
+直接作为本配置的普通续训检查点。
+
+place 实验另有 `object_carry_goal_success`（权重 2.0）和
+`object_carry_goal_distance_after_contact`（权重 -1.5），均以 meta 的 carry 位置为目标，
+仅在各环境绝对参考帧严格早于 `place_carry_source_frame` 时生效；距离项还要求已经超过
+首次参考接触帧。到达 carry 帧时两项关闭，现有最终 place 目标奖励继续保留。
+
+place 实验使用两阶段训练，原启动命令无需增加参数。调度使用 checkpoint 恢复的
+`global_step`：`0 <= iteration < 3000` 时，`place_carry_time_out` 在最后一个 carry 前的
+控制步提前 reset；它设置 `time_out=true`，不触发 `is_terminated` 的失败惩罚，critic
+沿用 timeout bootstrap。iteration 3000 起关闭该项，允许完整 motion 继续执行。
+评估和 play 不应用这个训练阶段的提前 reset。
+
+carry 前的 PPO/BC 系数保持继承的 `ppo_bc_loss_schedule`，命令行的 `bc_min_coef=0.04`
+和 `adaptive_after_iteration=1000` 继续适用。从 `place_carry_source_frame` 开始（含该帧），
+使用独立的 `ppo_bc_loss_schedule.after_carry`：BC 在 iteration 3000 为 1，线性下降至
+iteration 6000 的 0.05，之后保持 0.05；对应 PPO 系数为 `1 - BC`。两种阶段的样本在
+求平均前分别加权，阶段标记在 rollout 的动作执行前保存，包含随机起始偏移及 FPS 换算。
+教师终止 BC mask 仍生效，value loss 继续沿用原有系数。
+
+`ee_body_pos`、`object_pos_deviation` 在前 3000 iteration 从 0.2 线性增至接近 0.3，
+iteration 3000 起跳变为 1；学生 BC mask 同步使用新阈值。`anchor_ori_full` 在前段保持
+默认阈值 1，iteration 3000 起变为 100000。切换点由
+`algo.config.place_carry_curriculum.switch_iteration` 控制；后段 BC 的终点与最低系数
+分别由 `algo.config.ppo_bc_loss_schedule.after_carry.end_iteration` 和 `bc_min_coef` 控制。
+
+```bash
+cd /home/tide/robot/GRAIL/imports/SONIC
+WANDB_MODE=disabled python gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_place_mlp_decoder_latent_vector_obs_joint_micro_step \
+  headless=True num_envs=4 experiment_name=place_migration_smoke \
+  ++manager_env.config.gpu_collision_stack_size_exp=26 \
+  algo.config.num_mini_batches=1 algo.config.num_learning_epochs=1 \
+  algo.config.num_learning_iterations=50 \
+  manager_env.commands.motion.motion_lib_cfg.max_unique_motions=2 \
+  ++manager_env.commands.motion.start_from_first_frame=True \
+  ++manager_env.commands.motion.sample_before_contact=False
+```
+
+这只检查训练链路，随机初始化学生不保证完整走到释放段。新 place 实验从头训练，
+保留继承配置中的正常 latent moments 统计和冻结调度。普通续训本 place 实验使用 `resume=True`。
+
+可选 `manager_env.recorders.object_position_success.diagnostic_path=/absolute/path/trace.jsonl`
+只用于小规模完整 rollout，逐步记录源阶段、参考 contact、实际接触 link 数、目标距离及所有奖励的
+实际加权贡献。`weighted_reward_rates` 尚未乘 `step_dt`；累计控制步贡献需乘 trace 的 `step_dt`。
+阶段编码 0/1/2/3 对应首次参考接触前、原 GRAIL 抓握、新增搬运、最终释放；该 trace 不改变采样或奖励。
 
 ### 本地直接replay
 
@@ -77,8 +140,8 @@ bash grail/walk_data_tool/regenerate_kimodo_walk.sh \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash grail/visualization/scripts/visualize.sh \
-    data/hf_dataset/data_update/data/pickup_table_walk_concat \
-    16 1.5,-1.5,1.0 xyzw local 1
+    data/hf_dataset/data_update/data/pickup_table_place_concat \
+    32 1.5,-1.5,1.0 xyzw local 1
 ```
 
 ## 服务器端训练
@@ -86,9 +149,9 @@ CUDA_VISIBLE_DEVICES=0 bash grail/visualization/scripts/visualize.sh \
 cd /home/GRAIL/imports/SONIC
 
 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_place_mlp_decoder_latent_vector_obs_joint_micro_step \
   headless=True \
-  num_envs=1024 \
+  num_envs=5 \
   experiment_name=mlp_normalize_low_lr \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
@@ -98,51 +161,22 @@ python gear_sonic/train_agent_trl.py \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   algo.config.num_learning_iterations=10000 
 
-CUDA_VISIBLE_DEVICES=2 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
-  headless=True \
-  num_envs=1024 \
-  experiment_name=joint_micro_step_high_regularization \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/bps \
-  manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.num_learning_iterations=10000 \
-  algo.config.num_mini_batches=4 \
-  algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000
 
 CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_place_mlp_decoder_latent_vector_obs_joint_micro_step \
   headless=True \
-  num_envs=4096 \
-  experiment_name=03055Termination_walk \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
+  num_envs=5 \
+  experiment_name=GRASP_WALK_1007 \
+  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd \
+  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot \
+  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects \
+  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   algo.config.num_learning_iterations=15000 \
   algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
   algo.config.ppo_bc_loss_schedule.bc_min_coef=0.05
 
-CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
-  headless=True \
-  num_envs=1024 \
-  experiment_name=walk01bccoef00shiftbc \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
-  manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.num_learning_iterations=10000 \
-  algo.config.num_mini_batches=4 \
-  algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
-  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.1
 ```
 
 ## 本机play
@@ -285,18 +319,18 @@ python gear_sonic/eval_agent_trl.py \
 ## 服务器端play
 ```bash
 python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/03055Termination_walk-20260923_172120/last.pt \
+  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/GRASP_WALK_1006-20261005_170756/last.pt \
   +headless=True \
   ++num_envs=16 \
   +run_once=True \
   ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/03055Termination_walk-4500 \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/GRASP_WALK_1006-2000 \
   "~manager_env/recorders=empty" \
   "+manager_env/recorders=render" \
-  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
+  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot \
+  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects \
+  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps \
   ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   ++manager_env.terminations.ee_body_pos.params.threshold=25 \
   ++manager_env.terminations.object_pos_deviation.params.threshold=25
@@ -338,6 +372,26 @@ rsync -aP \
   -e "ssh -p 9989 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
   /home/tide/robot/GRAIL/ \
   cuixinru@202.120.37.249:/home/cuixinru/data0/GRAIL/
+
+  rsync -aP \
+  --no-owner --no-group \
+  --exclude='data/' \
+  --exclude='imports/blender/' \
+  --exclude='outputs/' \
+  -e "ssh -p 9980 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
+  /home/tide/robot/GRAIL/ \
+  yuguanchao@zz.irmv.top:/home/yuguanchao/data0/GRAIL/
+  
+    rsync -aP \
+  --no-owner --no-group \
+  --exclude='imports/blender/' \
+  --exclude='outputs/' \
+  -e "ssh -p 9980 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
+  /home/tide/robot/GRAIL/ \
+  yuguanchao@zz.irmv.top:/home/yuguanchao/data0/GRAIL/
+
+  ssh -p 9980 yuguanchao@zz.irmv.top
+
 ```
 
 ```text

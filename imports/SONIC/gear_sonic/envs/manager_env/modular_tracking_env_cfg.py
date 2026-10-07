@@ -135,6 +135,32 @@ def _robot_body_paths(link_names: list[str]) -> list[str]:
     return [f"{{ENV_REGEX_NS}}/Robot/{link_name}" for link_name in link_names]
 
 
+def _hand_body_contact_filters(usd_path, source_bodies, body_bodies):
+    """Validate the rigid-body partition and exclude directly connected USD pairs."""
+    from pxr import Sdf, Usd, UsdPhysics
+
+    layer = Sdf.Layer.FindOrOpen(usd_path)
+    if layer is None or not layer.defaultPrim:
+        raise ValueError(f"Cannot read robot USD default prim: {usd_path}")
+    mask = Usd.StagePopulationMask()
+    mask.Add(Sdf.Path(f"/{layer.defaultPrim}"))
+    stage = Usd.Stage.OpenMasked(layer, mask)
+    rigid = {prim.GetName() for prim in stage.Traverse() if prim.HasAPI(UsdPhysics.RigidBodyAPI)}
+    hands, bodies = set(source_bodies), set(body_bodies)
+    if (not hands or not bodies or hands & bodies or hands | bodies != rigid
+            or len(hands) != len(source_bodies) or len(bodies) != len(body_bodies)):
+        raise ValueError("Hand/wrist and body contact lists must partition the robot USD rigid bodies")
+    adjacent = set()
+    for prim in stage.Traverse():
+        if prim.IsA(UsdPhysics.Joint):
+            joint = UsdPhysics.Joint(prim)
+            a, b = joint.GetBody0Rel().GetTargets(), joint.GetBody1Rel().GetTargets()
+            if a and b:
+                adjacent.add(frozenset((a[0].name, b[0].name)))
+    return {hand: [body for body in body_bodies
+                   if frozenset((hand, body)) not in adjacent] for hand in source_bodies}
+
+
 def _frame_name_from_link(link_name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "_", link_name).strip("_").lower()
 
@@ -1738,6 +1764,19 @@ class ModularTrackingEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.robot = robot_mapping[robot_type]["robot_cfg"].replace(
             prim_path="{ENV_REGEX_NS}/Robot"
         )
+        if config.get("enable_hand_body_contact_sensors", False):
+            filters = _hand_body_contact_filters(
+                self.scene.robot.spawn.usd_path,
+                list(config["hand_body_contact_source_bodies"]),
+                list(config["table_to_robot_contact_bodies"]),
+            )
+            for source, targets in filters.items():
+                setattr(self.scene, f"hand_body_contact_{source}", ContactSensorCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/Robot/{source}",
+                    filter_prim_paths_expr=_robot_body_paths(targets),
+                    history_length=2,
+                    track_air_time=False,
+                ))
         self.actions.joint_pos.scale = robot_mapping[config["robot"].get("type", "g1")][
             "action_scale"
         ]

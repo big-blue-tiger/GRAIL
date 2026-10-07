@@ -1,0 +1,231 @@
+# @package _global_
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step
+  - _self_
+
+exp_var: robocasa_pickup_table_place_mlp_decoder_latent_vector_obs_joint_micro_step
+experiment_name: ${exp_base}_${exp_var}
+motion_shard_by_rank: false
+algo:
+  config:
+    latent_norm_freeze_after_iteration: 5000
+    actor:
+      backbone:
+        module_config_dict:
+          # Existing 48D object state + two 18D goals + 1D turn direction.
+          privileged_input_dim: 85
+    teacher_termination_loss_override:
+      enabled: true
+    # Learn pickup only until iteration 3000; the timeout incurs no failure reward.
+    place_carry_curriculum:
+      command_name: motion
+      switch_iteration: 3000
+    ppo_bc_loss_schedule:
+      # The inherited schedule and CLI overrides still govern the pickup prefix.
+      after_carry:
+        start_iteration: ${algo.config.place_carry_curriculum.switch_iteration}
+        end_iteration: 6000
+        bc_start_coef: 1.0
+        bc_min_coef: 0.05
+    # Each student termination and its BC-mask check use an independent schedule.
+    termination_threshold_schedule:
+      enabled: true
+      terms:
+        ee_body_pos:
+          start: 0.2
+          end: 0.3
+          end_iteration: 3000
+          after_threshold: 1.0
+        object_pos_deviation:
+          start: 0.2
+          end: 0.3
+          end_iteration: 3000
+          after_threshold: 1.0
+        anchor_ori_full:
+          start: 1.0
+          end: 1.0
+          end_iteration: 3000
+          after_threshold: 100000.0
+manager_env:
+  config:
+    episode_length_s: 30.0
+    object_usd_path: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd
+    motion_meta_info_path: null
+    enable_robot_table_contact_sensors: true
+    enable_hand_body_contact_sensors: true
+    table_to_hand_contact_bodies: &hand_bodies
+      [left_wrist_roll_link, left_wrist_pitch_link, left_wrist_yaw_link,
+       left_hand_palm_link, left_hand_index_0_link, left_hand_index_1_link,
+       left_hand_middle_0_link, left_hand_middle_1_link,
+       left_hand_thumb_0_link, left_hand_thumb_1_link, left_hand_thumb_2_link,
+       right_wrist_roll_link, right_wrist_pitch_link, right_wrist_yaw_link,
+       right_hand_palm_link, right_hand_index_0_link, right_hand_index_1_link,
+       right_hand_middle_0_link, right_hand_middle_1_link,
+       right_hand_thumb_0_link, right_hand_thumb_1_link, right_hand_thumb_2_link]
+    hand_body_contact_source_bodies: *hand_bodies
+    table_to_robot_contact_bodies:
+      [pelvis, imu_in_pelvis, pelvis_contour_link,
+       left_hip_pitch_link, left_hip_roll_link, left_hip_yaw_link, left_knee_link,
+       left_ankle_pitch_link, left_ankle_roll_link,
+       right_hip_pitch_link, right_hip_roll_link, right_hip_yaw_link, right_knee_link,
+       right_ankle_pitch_link, right_ankle_roll_link,
+       waist_yaw_link, waist_roll_link, torso_link, d435_link, head_link,
+       imu_in_torso, logo_link, mid360_link,
+       left_shoulder_pitch_link, left_shoulder_roll_link, left_shoulder_yaw_link, left_elbow_link,
+       right_shoulder_pitch_link, right_shoulder_roll_link, right_shoulder_yaw_link, right_elbow_link]
+  commands:
+    motion:
+      motion_lib_cfg:
+        motion_file: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot
+        object_motion_file: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects
+        bps_dir: /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps
+  observations:
+    privileged_obs:
+      target_object_poses_6d:
+        params:
+          target_source: meta_place_goal
+      carry_target_object_poses_6d:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: gear_sonic.envs.manager_env.mdp:target_object_poses_6d
+        params:
+          command_name: motion
+          target_source: meta_carry_goal
+          asset_cfg:
+            _target_: isaaclab.managers.SceneEntityCfg
+            name: object_to_hand_frame_transformer
+      place_turn_direction:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: gear_sonic.envs.manager_env.mdp:place_turn_direction
+        params:
+          command_name: motion
+  recorders:
+    carry_goal_success:
+      _target_: gear_sonic.envs.manager_env.mdp.recorders.ObjectPositionSuccessRecorderCfg
+      metric_name: carry_goal_success
+      command_name: ${manager_env.recorders.object_position_success.command_name}
+      threshold: ${manager_env.recorders.object_position_success.threshold}
+      target_source: meta_carry_goal
+      gate_with_contact_label: ${manager_env.recorders.object_position_success.gate_with_contact_label}
+    object_position_success:
+      target_source: meta_place_goal
+      gate_with_contact_label: true
+      track_release: true
+      diagnostic_path: null
+  terminations:
+    place_carry_time_out:
+      _target_: isaaclab.managers.TerminationTermCfg
+      func: gear_sonic.envs.manager_env.mdp:place_carry_time_out
+      time_out: true
+      params:
+        command_name: ${algo.config.place_carry_curriculum.command_name}
+        enabled: true
+    anchor_ori_full:
+      params:
+        threshold: ${algo.config.termination_threshold_schedule.terms.anchor_ori_full.start}
+    object_pos_deviation:
+      params:
+        disable_after_release: true
+  rewards:
+    tracking_relative_body_pos_upper:
+      params: &tracking_gate
+        gate_before_grail: false
+        gate_outside_grail: true
+    tracking_relative_body_pos_lower:
+      params: *tracking_gate
+    tracking_relative_body_ori_upper:
+      params: *tracking_gate
+    tracking_relative_body_ori_lower:
+      params: *tracking_gate
+    tracking_body_linvel_upper:
+      params: *tracking_gate
+    tracking_body_linvel_lower:
+      params: *tracking_gate
+    tracking_body_angvel_upper:
+      params: *tracking_gate
+    tracking_body_angvel_lower:
+      params: *tracking_gate
+    object_tracking_reward:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:object_position_tracking_reward
+      weight: 2.0
+      params:
+        command_name: motion
+        pos_exp_coeff: -10.0
+        contact_threshold: 1.0
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: object_to_hand_contact_sensor
+    grasp_reward:
+      weight: 10.0
+      params:
+        gate_with_contact_label: false
+        disable_after_release: true
+    hand_fingers_object_distance:
+      params:
+        gate_with_contact_label: false
+        disable_after_release: true
+    approach_velocity_penalty:
+      params:
+        command_name: motion
+        gate_before_place_transition: true
+    hand_body_contact_penalty:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_hand_body_contact_penalty
+      weight: -1.0
+      params:
+        source_bodies: *hand_bodies
+        force_saturation: 1.0
+    body_table_contact_penalty:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_hand_table_contact_penalty
+      weight: -1.0
+      params:
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: table_to_robot_contact_sensor
+        force_saturation: 1.0
+    # Restore the pickup-stage goals alongside the existing place-stage goals.
+    # Each environment's absolute reference frame must precede its carry frame.
+    object_carry_goal_success:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_success
+      weight: 10.0
+      params:
+        command_name: motion
+        threshold: ${manager_env.recorders.object_position_success.threshold}
+        target_source: meta_carry_goal
+        gate_with_contact_label: false
+        disable_after_carry: true
+    object_carry_goal_distance_after_contact:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:object_final_goal_distance_after_contact
+      weight: -1.5
+      params:
+        command_name: motion
+        target_source: meta_carry_goal
+        disable_after_carry: true
+    object_final_goal_success:
+      weight: 10.0
+      params:
+        target_source: meta_place_goal
+        gate_with_contact_label: true
+        hand: right_hand
+    object_final_goal_distance_after_contact:
+      weight: -1.5
+      params:
+        target_source: meta_place_goal
+        reference_goal_activation_distance: 2.0
+        disable_after_release: true
+    object_release_reward:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:object_release_reward
+      weight: 4.0
+      params:
+        command_name: motion
+        threshold: ${manager_env.recorders.object_position_success.threshold}
+        contact_threshold: 0.1
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: object_to_hand_contact_sensor
+    object_final_goal_distance: null

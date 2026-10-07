@@ -90,18 +90,18 @@ manager_env:
         asset_cfg:
           _target_: isaaclab.managers.SceneEntityCfg
           name: robot
-    object_final_goal_distance:
-      _target_: isaaclab.managers.RewardTermCfg
-      func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_distance
-      weight: 1.0
-      params:
-        command_name: motion
-        asset_cfg:
-          _target_: isaaclab.managers.SceneEntityCfg
-          name: object
-        exp_coeff: -1.0
-        gate_with_contact_label: false
-        hand: right_hand
+    # object_final_goal_distance:
+    #   _target_: isaaclab.managers.RewardTermCfg
+    #   func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_distance
+    #   weight: 1.0
+    #   params:
+    #     command_name: motion
+    #     asset_cfg:
+    #       _target_: isaaclab.managers.SceneEntityCfg
+    #       name: object
+    #     exp_coeff: -1.0
+    #     gate_with_contact_label: false
+    #     hand: right_hand
     object_acc_l2:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:object_acc_l2
@@ -138,4 +138,4 @@ algo:
     # Keep updating through iteration 3000, then freeze target latent statistics.
     latent_norm_freeze_after_iteration: 3000
     ppo_bc_loss_schedule:
-      bc_min_coef: 0.03
+      bc_min_coef: 0.05

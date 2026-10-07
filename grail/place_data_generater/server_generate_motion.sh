@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 在 yuguanchao_kimodo 中运行，使用 GPU 1 批量生成 manifest 中的全部动作。
+# 在 yuguanchao_kimodo 中运行，使用 GPU 0 批量生成 manifest 中的全部动作。
 # 用法：bash server_generate_motion.sh [BATCH_SIZE]；默认每批 16 条。
 set -eo pipefail
 batch_size=${1:-${BATCH_SIZE:-32}}
@@ -8,8 +8,8 @@ batch_size=${1:-${BATCH_SIZE:-32}}
 cd /workspace/kimodo
 source /workspace/kimodo/deployment/env.sh
 set -u
-# env.sh 设置 GPU 0，必须在 source 之后覆盖。
-export CUDA_VISIBLE_DEVICES=1
+# 在 source 之后显式指定使用 GPU 0。
+export CUDA_VISIBLE_DEVICES=0
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TEXT_ENCODER_MODE=local
@@ -18,7 +18,7 @@ export TEXT_ENCODER_DEVICE=cpu
 shared=/workspace/kimodo/data/wostep/place_walk
 mkdir -p "$shared/motions"
 
-echo "[2/3] 使用 GPU 1 batch 生成动作，每批 $batch_size 条"
+echo "[2/3] 使用 GPU 0 batch 生成动作，每批 $batch_size 条"
 python -u - "$shared/manifest.json" "$batch_size" <<'PY'
 import json
 from pathlib import Path
@@ -42,12 +42,12 @@ with open(manifest) as file:
 if not records:
     raise SystemExit("No constraints in manifest")
 if not torch.cuda.is_available():
-    raise SystemExit("GPU 1 is not available to Kimodo")
+    raise SystemExit("GPU 0 is not available to Kimodo")
 
 total = len(records)
 num_batches = (total + batch_size - 1) // batch_size
 print(f"[2/3] 加载模型一次；共 {total} 个文件、{num_batches} 个批次，每批 {batch_size} 条", flush=True)
-# CUDA_VISIBLE_DEVICES=1 后，进程内的 cuda:0 对应 GPU 1。
+# CUDA_VISIBLE_DEVICES=0 后，进程内的 cuda:0 对应 GPU 0。
 model = load_model("Kimodo-G1-RP-v1", device="cuda:0", text_encoder_fp32=True)
 converter = MujocoQposConverter(model.skeleton)
 
@@ -83,7 +83,7 @@ for start in range(0, total, batch_size):
         # 与官方 batch 示例一致：每个批次设置一次 seed。
         seed_everything(inputs["seed"])
 
-    print(f"{label} 开始批量生成（GPU 1）", flush=True)
+    print(f"{label} 开始批量生成（GPU 0）", flush=True)
     with torch.inference_mode():
         output = model(
             prompts=[job[2]["texts"][0] for job in jobs],

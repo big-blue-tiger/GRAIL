@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cv2
@@ -28,41 +29,94 @@ class RecordersCfg(recorder_manager.RecorderManagerBaseCfg):
     running_ref_root_height = None
     trajectory = None
     object_position_success = None
+    carry_goal_success = None
 
 
 class ObjectPositionSuccessRecorder(recorder_manager.RecorderTerm):
-    """Count an episode as successful once the object reaches its final reference position."""
+    """Count an episode as successful once the object reaches its configured goal."""
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
         self.succeeded = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.released = torch.zeros_like(self.succeeded)
+        self._diagnostic_file = None
+        if cfg.diagnostic_path:
+            path = Path(cfg.diagnostic_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._diagnostic_file = path.open("w", buffering=1)
 
     def record_post_step(self):
         command = self._env.command_manager.get_term(self.cfg.command_name)
-        # Match the final world-frame target used by reward_object_final_goal_distance.
-        final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
-        ref_object_pos = (
-            command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
-            + self._env.scene.env_origins
-        )
-        ref_object_pos[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
+        ref_object_pos = command.get_object_goal_pos_w(self.cfg.target_source)
         current_object_pos = self._env.scene["object"].data.root_pos_w
         pos_error = torch.norm(ref_object_pos - current_object_pos, dim=-1)
 
         # Called before automatic resets, including on the episode's terminal step.
-        self.succeeded |= pos_error < self.cfg.threshold
-        self._env.extras["object_position_success"] = self.succeeded[self._env.reset_buf].float()
+        arrival = pos_error < self.cfg.threshold
+        if self.cfg.gate_with_contact_label:
+            contact = command.get_in_contact("right_hand")
+            if contact is None:
+                raise RuntimeError("Object success recorder requires right-hand reference contacts")
+            arrival &= contact > 0.5
+        self.succeeded |= arrival
+        if self.cfg.track_release:
+            from .rewards import object_release_reward
+            from isaaclab.managers import SceneEntityCfg
+
+            released = object_release_reward(
+                self._env, SceneEntityCfg(self.cfg.release_sensor_name),
+                command_name=self.cfg.command_name, threshold=self.cfg.threshold,
+            )
+            self.released |= released > 0.5
+            self._env.extras["object_release_success"] = self.released[self._env.reset_buf].float()
+        self._env.extras[self.cfg.metric_name] = self.succeeded[self._env.reset_buf].float()
+        if self._diagnostic_file is not None:
+            # Optional small-rollout trace; weighted rates exclude RewardManager's dt.
+            command._ensure_place_meta()
+            steps = command.motion_start_time_steps + command.time_steps
+            bounds = command._place_stage_steps[command.motion_ids]
+            stage = torch.where(steps < command._per_env_first_contact, 0,
+                               torch.where(steps < bounds[:, 1], 1,
+                                           torch.where(steps < bounds[:, 2], 2, 3)))
+            force = self._env.scene[self.cfg.release_sensor_name].data.force_matrix_w
+            link_force = torch.linalg.vector_norm(force, dim=-1).squeeze(1)
+            trace = {
+                "step": steps.tolist(), "motion_ids": command.motion_ids.tolist(),
+                "motion_keys": list(command.motion_lib.curr_motion_keys),
+                "stage": stage.tolist(), "contact_label": command.get_in_contact("right_hand").tolist(),
+                "contact_link_count": (link_force > 0.1).sum(-1).tolist(),
+                "object_hand_force": link_force.sum(-1).tolist(),
+                "goal_distance": pos_error.tolist(), "reached": self.succeeded.tolist(),
+                "released": self.released.tolist(), "reset": self._env.reset_buf.tolist(),
+                "weighted_reward_rates": {
+                    name: self._env.reward_manager._step_reward[:, i].tolist()
+                    for i, name in enumerate(self._env.reward_manager.active_terms)
+                },
+                "step_dt": self._env.step_dt,
+            }
+            self._diagnostic_file.write(json.dumps(trace) + "\n")
         return None, None
+
+    def close(self, file_path):
+        if self._diagnostic_file is not None:
+            self._diagnostic_file.close()
 
     def reset(self, env_ids=None):
         self.succeeded[slice(None) if env_ids is None else env_ids] = False
+        self.released[slice(None) if env_ids is None else env_ids] = False
 
 
 @configclass
 class ObjectPositionSuccessRecorderCfg(manager_term_cfg.RecorderTermCfg):
     class_type = ObjectPositionSuccessRecorder
+    metric_name: str = "object_position_success"
     command_name: str = "motion"
     threshold: float = 0.1
+    target_source: str = "final_frame"
+    gate_with_contact_label: bool = False
+    track_release: bool = False
+    release_sensor_name: str = "object_to_hand_contact_sensor"
+    diagnostic_path: str | None = None
 
 
 class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):

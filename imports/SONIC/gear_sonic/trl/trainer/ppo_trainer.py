@@ -1051,6 +1051,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         self.storage.register_key("rewards", shape=(reward_dim,), dtype=torch.float)
         self.storage.register_key("dones", shape=(1,), dtype=torch.bool)
         self.storage.register_key("time_outs", shape=(1,), dtype=torch.bool)
+        self.storage.register_key("loss_after_carry_mask", shape=(), dtype=torch.bool)
         self.storage.register_key("values", shape=(reward_dim,), dtype=torch.float)
         self.storage.register_key("returns", shape=(reward_dim,), dtype=torch.float)
         self.storage.register_key("advantages", shape=(reward_dim,), dtype=torch.float)
@@ -1657,6 +1658,7 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
                 if getattr(self.storage, "residual_transition_weight", None) is None:
                     self.storage.register_key("residual_transition_weight", shape=())
                 self.storage.update_key("residual_transition_weight", transition_weight)
+                self._store_rollout_loss_context()
                 teacher_mask = self._rollout_teacher_termination_mask()
                 if teacher_mask is not None:
                     if getattr(self.storage, "loss_teacher_termination_mask", None) is None:
@@ -2268,6 +2270,13 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         """Return the effective coefficient applied to the PPO objective."""
         return float(self.config.get("ppo_loss_coef", 1.0))
 
+    def _store_rollout_loss_context(self):
+        """Hook to snapshot per-observation loss labels before stepping the env."""
+
+    def _get_ppo_loss_weights(self, mb_rollout_data):
+        """Return a scalar or per-sample PPO coefficient for this micro-batch."""
+        return self._get_ppo_loss_coef()
+
     def _should_update_latent_normalizer(self):
         """Keep target statistics fixed after the configured iteration.
 
@@ -2412,9 +2421,12 @@ class TRLPPOTrainer(PPOTrainer):  # noqa: F405
         if getattr(self.env, "safe_nan", False):
             entropy_batch[entropy_batch.isnan()] = 0.0
         entropy_loss = -masked_mean(entropy_batch, ~padding_mask)
-        ppo_loss_coef = self._get_ppo_loss_coef()
-        weighted_pg_loss = ppo_loss_coef * pg_loss
-        weighted_entropy_loss = ppo_loss_coef * self.entropy_coef * entropy_loss
+        ppo_loss_weights = self._get_ppo_loss_weights(mb_rollout_data)
+        weighted_pg_loss = masked_mean(pg_loss_max * ppo_loss_weights, ~padding_mask)
+        weighted_entropy_loss = -self.entropy_coef * masked_mean(
+            entropy_batch * ppo_loss_weights, ~padding_mask
+        )
+        ppo_loss_coef = masked_mean(ppo_loss_weights, ~padding_mask)
         weighted_vf_loss = args.vf_coef * vf_loss
         if self.use_symmetry:
             actor_sym_loss = torch.mean(

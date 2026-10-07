@@ -185,6 +185,8 @@ class StudentPrivilegedCfg(ObsGroup):
     hand_object_transform_6d = None
     hand_object_contact_force_magnitude = None
     target_object_poses_6d = None
+    carry_target_object_poses_6d = None
+    place_turn_direction = None
 
 
 @configclass
@@ -3026,21 +3028,19 @@ def hand_object_transform_6d(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) ->
 
 
 def target_object_poses_6d(
-    env: ManagerBasedEnv, command_name: str, asset_cfg: SceneEntityCfg
+    env: ManagerBasedEnv, command_name: str, asset_cfg: SceneEntityCfg,
+    target_source: str = "final_frame",
 ) -> torch.Tensor:
-    """Final reference object pose in live pelvis and hand frames (9D each).
+    """Object goal pose in live pelvis and hand frames (9D each).
 
     Recompute relative poses every step, keeping the world target at the motion's
-    last frame. The hand frame and 6D rotation layout match the live object terms.
+    last frame, meta place goal, or original meta carry pose. The existing hand
+    frame and 6D rotation layout are preserved; both meta goals use their saved
+    world-frame wxyz quaternion (before release for place, source carry for carry).
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-    final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
-    target_pos_w = (
-        command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
-        + env.scene.env_origins
-    )
-    target_pos_w[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
-    target_quat_w = command.motion_lib.get_object_root_quat(command.motion_ids, final_steps)[:, 0]
+    target_pos_w = command.get_object_goal_pos_w(target_source)
+    target_quat_w = command.get_object_goal_quat_w(target_source)
 
     transformer = env.scene[asset_cfg.name]
     hand_pos_in_obj, hand_quat_in_obj = _get_hand_pose_in_object_frame(transformer)
@@ -3059,6 +3059,12 @@ def target_object_poses_6d(
         rot_6d = matrix_from_quat(quat)[..., :2].reshape(env.num_envs, 6)
         poses.extend((pos, rot_6d))
     return torch.cat(poses, dim=-1)
+
+
+def place_turn_direction(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Static task direction for each environment's current motion, shape (num_envs, 1)."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    return command.get_place_turn_direction()
 
 
 def get_finger_tips_contact_force(env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:

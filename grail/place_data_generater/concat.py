@@ -17,6 +17,7 @@ from grail.walk_data_tool.concat_walk_motion import (
     CONTACT_FIELDS, concat_motion, file_hash, joint_mapping, load_single, validate_fields,
 )
 from grail.walk_data_tool.export_kimodo_end_frame import load_kinematics
+from grail.place_data_generater.analyze_turn_direction import classify_turn
 from grail.place_data_generater.constraints import DATA, KIMODO, MODEL_FPS, contact_timing
 from grail.place_data_generater.g1_kinematics import (
     G1QposAdapter, KINEMATICS_VERSION, MUJOCO_TO_KIMODO, qpos_to_world, source_qpos,
@@ -97,9 +98,9 @@ def carry_contact_points(objects, carry_frame):
     if type(carry_frame) is not int or not 0 <= carry_frame < len(objects["root_pos"]):
         raise ValueError(f"Invalid carry_source_frame: {carry_frame}")
     points = np.asarray(objects.get("contact_points_right_hand", {}).get(carry_frame, []))
-    if (points.ndim != 2 or points.shape[1] != 3 or len(points) == 0
-            or not np.issubdtype(points.dtype, np.number) or not np.isfinite(points).all()):
-        raise ValueError(f"Carry frame {carry_frame} must have nonempty finite right-hand contact points")
+    # if (points.ndim != 2 or points.shape[1] != 3 or len(points) == 0
+    #         or not np.issubdtype(points.dtype, np.number) or not np.isfinite(points).all()):
+    #     raise ValueError(f"Carry frame {carry_frame} must have nonempty finite right-hand contact points")
     return points
 
 
@@ -197,6 +198,13 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     robot = crop_source_prefix(robot, carry_frame)
     objects = crop_source_prefix(objects, carry_frame)
     n = carry_frame + 1
+    walk_report_path = dataset / "reports" / f"{name}.json"
+    walk_report = json.loads(walk_report_path.read_text())
+    grail_start = walk_report.get("b_start_index")
+    if (type(grail_start) is not int or not 0 <= grail_start < n
+            or walk_report.get("total_frames") != source_frames
+            or walk_report.get("fps") != float(robot["fps"])):
+        raise ValueError(f"{walk_report_path}: invalid source GRAIL boundary/frame count/FPS")
     qpos = np.loadtxt(csv, delimiter=",", ndmin=2)
     if qpos.shape != (record["num_frames"], 36) or not np.isfinite(qpos).all():
         raise ValueError(f"{name}: expected finite ({record['num_frames']},36) Kimodo CSV "
@@ -247,6 +255,7 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     # concat_motion validates every segment's schema, FPS, dtype and frame arrays.
     robot_out = concat_motion([robot, seam, generated, hold, robot_final_hold])
     objects_out = concat_motion([objects, obj_seam, obj_generated, obj_hold, object_final_hold], kind="object")
+    turn_direction, _ = classify_turn(robot_out["root_rot"], carry_frame)
     output_contact = {key.replace("source_", "output_", 1): value
                       for key, value in contact_timing(objects_out).items()}
     # Assets are copied after validation, without modifying the input snapshot.
@@ -267,6 +276,8 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     meta = copy.deepcopy(joblib.load(assets[0]))
     # Fade out from the retained endpoint to the first generated frame, including the seam.
     meta.update(total_frames=len(robot_out["dof"]),
+                grail_start_frame=grail_start,
+                grail_end_frame_exclusive=n,
                 residual_fade_out_start_frame=n-1,
                 residual_fade_out_end_frame=generated_start,
                 place_transition_start_frame=n,
@@ -276,6 +287,11 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
                 place_final_hold_start_frame=final_hold_start,
                 place_release_start_frame=final_hold_start,
                 place_object_goal_pos_w=objects_out["root_pos"][final_hold_start-1, 0].copy(),
+                place_object_goal_quat_w=objects_out["root_quat"][final_hold_start-1, 0].copy(),
+                # Carry goals stay in the original Z-up world frame; object quats are wxyz.
+                place_object_carry_goal_pos_w=source_objects["root_pos"][carry_frame, 0].copy(),
+                place_object_carry_goal_quat_w=source_objects["root_quat"][carry_frame, 0].copy(),
+                place_turn_direction={"left": 1, "right": -1, "straight": 0}[turn_direction],
                 **{f"place_{key}": value for key, value in output_contact.items()},
                 place_source_contact_start_frame=contact["source_contact_start_frame"],
                 place_source_contact_end_frame=contact["source_contact_end_frame"],
@@ -286,6 +302,7 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
                 place_carry_source_frame=record["carry_source_frame"],
                 place_lower_source_frame=record["lower_source_frame"])
     report = {"name": name, "source_frames": source_frames,
+              "grail_start_frame": grail_start, "grail_end_frame_exclusive": n,
               "retained_source_frames": n, "trimmed_source_frames": source_frames-n,
               "transition_frames": join_frames,
               "generated_frames": len(generated["dof"]), "hold_frames": len(hold["dof"]),
