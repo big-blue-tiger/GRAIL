@@ -1,0 +1,66 @@
+# Extend the tracking critic with 43D of carry/place goals and object dynamics.
+defaults:
+  # Keep the original tracking critic's shared terms.
+  - ../terms/command@_here_
+  - ../terms/motion_anchor_pos_b@_here_
+  - ../terms/motion_anchor_ori_b@_here_
+  - ../terms/body_pos@_here_
+  - ../terms/body_ori@_here_
+  - ../terms/base_lin_vel@_here_
+  - ../terms/base_ang_vel@_here_
+  - ../terms/joint_pos@_here_
+  - ../terms/joint_vel@_here_
+  - ../terms/actions@_here_
+  - ../terms/target_object_pos@_here_
+  - ../terms/hand_object_transform_6d@_here_
+  - ../terms/finger_tips_force@_here_
+  - ../terms/grab_contact_flag@_here_
+  - ../terms/object_pos_b@_here_
+  - ../terms/object_ori_b_6d@_here_
+  - ../terms/table_pos_b@_here_
+  - ../terms/table_ori_b@_here_
+  - ../terms/object_pos_delta_multi_future@_here_
+  - ../terms/object_ori_delta_multi_future_6d@_here_
+  - ../terms/command_multi_future@_here_
+  - ../terms/motion_anchor_ori_b_mf@_here_
+  - _self_
+
+_target_: gear_sonic.envs.manager_env.mdp.observations.PrivilegedCfg
+
+carry_target_object_poses_6d:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:target_object_poses_6d
+  params:
+    command_name: motion
+    target_source: meta_carry_goal
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: object_to_hand_frame_transformer
+
+target_object_poses_6d:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:target_object_poses_6d
+  params:
+    command_name: motion
+    target_source: meta_place_goal
+    asset_cfg:
+      _target_: isaaclab.managers.SceneEntityCfg
+      name: object_to_hand_frame_transformer
+
+place_turn_direction:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:place_turn_direction
+  params:
+    command_name: motion
+
+object_lin_vel_b:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:object_lin_vel_b
+  params:
+    command_name: motion
+
+object_ang_vel_b:
+  _target_: isaaclab.managers.ObservationTermCfg
+  func: gear_sonic.envs.manager_env.mdp:object_ang_vel_b
+  params:
+    command_name: motion

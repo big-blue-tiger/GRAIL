@@ -5,7 +5,7 @@ set -euo pipefail
 cd /home/GRAIL
 dataset=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat
 output=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat
-shared=/home/kimodo/data/wostep/place_walk
+shared=/home/kimodo/data/wostep/place_walk_1010
 
 /isaac-sim/python.sh - "$dataset" "$output" "$shared" <<'PY'
 import json

@@ -2,6 +2,7 @@
 
 defaults:
   - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step
+  - override /manager_env/observations/critic: hoi_manip/robocasa_pickup_table_place_critic
   - _self_
 
 exp_var: robocasa_pickup_table_place_mlp_decoder_latent_vector_obs_joint_micro_step
@@ -36,12 +37,12 @@ algo:
           start: 0.2
           end: 0.3
           end_iteration: 3000
-          after_threshold: 1.0
+          after_threshold: 3.0
         object_pos_deviation:
           start: 0.2
           end: 0.3
           end_iteration: 3000
-          after_threshold: 1.0
+          after_threshold: 3.0
         anchor_ori_full:
           start: 1.0
           end: 1.0
@@ -109,6 +110,7 @@ manager_env:
       gate_with_contact_label: ${manager_env.recorders.object_position_success.gate_with_contact_label}
     object_position_success:
       target_source: meta_place_goal
+      threshold: 0.2
       gate_with_contact_label: true
       track_release: true
       diagnostic_path: null
@@ -127,6 +129,15 @@ manager_env:
       params:
         disable_after_release: true
   rewards:
+    # Quadruple each anchor reward at/after carry: 0.25 -> 1.0, 0.5 -> 2.0.
+    tracking_anchor_pos:
+      weight: 0.25
+      params:
+        after_carry_scale: 12.0
+    tracking_anchor_ori:
+      weight: 0.5
+      params:
+        after_carry_scale: 4.0
     tracking_relative_body_pos_upper:
       params: &tracking_gate
         gate_before_grail: false
@@ -161,6 +172,9 @@ manager_env:
       params:
         gate_with_contact_label: false
         disable_after_release: true
+    grasp_finger_direction:
+      params:
+        use_contact_center: false
     hand_fingers_object_distance:
       params:
         gate_with_contact_label: false
@@ -185,37 +199,37 @@ manager_env:
           _target_: isaaclab.managers.SceneEntityCfg
           name: table_to_robot_contact_sensor
         force_saturation: 1.0
-    # Restore the pickup-stage goals alongside the existing place-stage goals.
-    # Each environment's absolute reference frame must precede its carry frame.
+    # Reward carry-goal proximity on every step before the reference carry frame.
     object_carry_goal_success:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_success
-      weight: 10.0
+      weight: 5.0
       params:
         command_name: motion
         threshold: ${manager_env.recorders.object_position_success.threshold}
         target_source: meta_carry_goal
         gate_with_contact_label: false
         disable_after_carry: true
+    # Dense carry distance shaping is still limited to the pickup prefix.
     object_carry_goal_distance_after_contact:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:object_final_goal_distance_after_contact
-      weight: -1.5
+      weight: -1
       params:
         command_name: motion
         target_source: meta_carry_goal
         disable_after_carry: true
     object_final_goal_success:
-      weight: 10.0
+      weight: 5.0
       params:
         target_source: meta_place_goal
         gate_with_contact_label: true
         hand: right_hand
     object_final_goal_distance_after_contact:
-      weight: -1.5
+      weight: -2
       params:
         target_source: meta_place_goal
-        reference_goal_activation_distance: 2.0
+        enable_after_carry: true
         disable_after_release: true
     object_release_reward:
       _target_: isaaclab.managers.RewardTermCfg

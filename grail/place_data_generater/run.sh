@@ -18,7 +18,7 @@ for arg in "$@"; do
 done
 
 dataset="$repo/data/hf_dataset/data_update/data/pickup_table_walk_concat"
-output="$repo/data/hf_dataset/data_update/data/pickup_table_place_concat"
+output="$repo/data/hf_dataset/data_update/data/pickup_table_place_left_right"
 constraints="$dataset/kimodo_place_constraints/$name"
 downloads="$dataset/kimodo_place"
 server=cuixinru@202.120.37.249
@@ -132,6 +132,7 @@ ln -s "$output/robot/$name.pkl" "$work/view/robot/$name.pkl"
 for dir in objects object_usd meta; do ln -s "$output/$dir" "$work/view/$dir"; done
 CUDA_VISIBLE_DEVICES=0 bash grail/visualization/scripts/visualize.sh \
   "$work/view" 0 1.5,-1.5,1.0 xyzw local 1
+  
 test -s "$work/view/vis/$name.mp4"
 mkdir -p "$output/vis"
 mv -f -- "$work/view/vis/$name.mp4" "$output/vis/$name.mp4"

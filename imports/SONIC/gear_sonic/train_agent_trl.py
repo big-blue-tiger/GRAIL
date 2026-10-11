@@ -594,6 +594,11 @@ def main(config: OmegaConf):
     trainer.train()
     _train_breadcrumb(config, "main: after trainer.train")
 
+    # Early stopping returns before the trainer's normal wandb.finish(), and
+    # os._exit() below skips Python shutdown hooks. Flush before a play/resume.
+    if wandb_run_exists():
+        wandb.finish()
+
     if simulator_type == "IsaacSim":
         os._exit(0)
 

@@ -189,7 +189,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                     self._student_loss_termination_params[name] = destination[-1][1]
 
     def _rollout_teacher_termination_mask(self):
-        """Evaluate the current observation's state, independently on every step."""
+        """Suppress BC for teacher-only pose failures strictly before carry."""
         if not self.teacher_termination_loss_override_enabled:
             return None
         env = self.env.env
@@ -199,7 +199,11 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             teacher_exceeded |= func(env, **params)
         for func, params in self._student_loss_termination_terms:
             student_exceeded |= func(env, **params)
-        return (teacher_exceeded & ~student_exceeded).detach().clone()
+        command = env.command_manager.get_term(self.place_carry_curriculum["command_name"])
+        # From the carry frame onward, keep corrective BC even outside the
+        # teacher's tighter pose limits. The phase includes random start offsets.
+        mask = teacher_exceeded & ~student_exceeded & command.before_place_carry()
+        return mask.detach().clone()
 
     def _get_ppo_bc_loss_coefs(self):
         """Return the complementary PPO/BC coefficients for the current iteration.

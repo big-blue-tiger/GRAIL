@@ -8,14 +8,14 @@ batch_size=${1:-${BATCH_SIZE:-32}}
 cd /workspace/kimodo
 source /workspace/kimodo/deployment/env.sh
 set -u
-# 在 source 之后显式指定使用 GPU 0。
-export CUDA_VISIBLE_DEVICES=0
+# 在 source 之后显式指定使用 GPU 1。
+export CUDA_VISIBLE_DEVICES=1
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TEXT_ENCODER_MODE=local
 export TEXT_ENCODER_DTYPE=float32
 export TEXT_ENCODER_DEVICE=cpu
-shared=/workspace/kimodo/data/wostep/place_walk
+shared=/workspace/kimodo/data/wostep/place_walk_1010
 mkdir -p "$shared/motions"
 
 echo "[2/3] 使用 GPU 0 batch 生成动作，每批 $batch_size 条"

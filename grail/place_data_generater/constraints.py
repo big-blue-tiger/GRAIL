@@ -118,7 +118,9 @@ def make_record(dataset, name, seed, kinematics, remote_dir):
     restored = parsed[1].global_joints_positions[0].numpy() @ c2w.T + origin
     source_pose_error = float(np.abs(restored-source_positions[0].numpy()).max())
     durations = repr((total + 0.001) / MODEL_FPS)
-    prompt = "A person turns very slowly and gradually without any sudden rotation, then walks slowly while holding an object in the right hand, gradually lowers the right hand while approaching the destination, and stops."
+    # Canonical +Z is forward and +X is left relative to the initial heading.
+    turn_direction = "left" if displacement[0] >= 0 else "right"
+    prompt = f"A person turns {turn_direction} very slowly and gradually, then walks slowly toward the destination while holding an object high overhead in the right hand."
     remote = f"{remote_dir}/{name}"
     command = shlex.join(["python", "-m", "kimodo.scripts.generate", prompt,
         "--model", "Kimodo-G1-RP-v1", "--duration", durations,

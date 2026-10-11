@@ -410,6 +410,13 @@ class PrivilegedCfg(ObsGroup):
     # Terrain observations
     height_map_flat = None
 
+    # Carry/place task goals and live object dynamics (43D).
+    carry_target_object_poses_6d = None
+    target_object_poses_6d = None
+    place_turn_direction = None
+    object_lin_vel_b = None
+    object_ang_vel_b = None
+
 
 @configclass
 class DiscriminatorCfg:
@@ -1173,6 +1180,22 @@ def object_ori_b_6d(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
 
     mat = matrix_from_quat(ori_b)
     return mat[..., :2].reshape(mat.shape[0], -1)  # (num_envs, 6)
+
+
+def object_lin_vel_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Simulated object world linear velocity expressed in the live pelvis frame (3D)."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    object_asset = utils.get_active_object(env)
+    pelvis_quat_w = command.robot.data.body_quat_w[:, command.robot_anchor_body_index]
+    return quat_apply_inverse(pelvis_quat_w, object_asset.data.root_lin_vel_w)
+
+
+def object_ang_vel_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
+    """Simulated object world angular velocity expressed in the live pelvis frame (3D)."""
+    command: commands.TrackingCommand = env.command_manager.get_term(command_name)
+    object_asset = utils.get_active_object(env)
+    pelvis_quat_w = command.robot.data.body_quat_w[:, command.robot_anchor_body_index]
+    return quat_apply_inverse(pelvis_quat_w, object_asset.data.root_ang_vel_w)
 
 
 def object_pos_b_multi_future(

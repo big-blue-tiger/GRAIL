@@ -20,23 +20,6 @@ python -u -m grail.datatool.batch_filter_teacher_policy \
 
 ### 在本地训练
 
-训练会自动读取 `motion_file` 所在数据集的 `meta/<motion_key>.pkl`。
-若包含 `transition_start_frame` 和 `transition_end_frame`，则与 play 使用同一套残差过渡：
-起始帧之前为纯 SONIC，过渡区间内 GRAIL 残差系数从 0 线性递增至 1，结束帧之后为 SONIC + 完整 GRAIL 残差。
-若还有 `residual_fade_out_start_frame` 和 `residual_fade_out_end_frame`，则在此基础上乘以
-`1 - clamp((f - start) / (end - start), 0, 1)`：抓握后的过渡段从 1 递减至 0，
-第一帧 Kimodo 持物移动起保持为 0。两个渐出标签由 place 拼接器写入，按输出 motion FPS
-使用零基帧索引，包含两端，须成对提供且满足 `0 <= start < end < total_frames`。
-系数按各环境当前 motion 的实际帧计算，包含随机起始偏移与源数据帧率换算；没有过渡元数据的 motion 保持原行为。
-DAgger 的教师执行动作和蒸馏目标均应用此系数（包括 action-chunk）；学生的完整 latent 输出通过该目标学习，不直接乘残差系数。
-使用拼接数据时，将训练命令的 `motion_file`、`object_motion_file`、`bps_dir` 和 `object_usd_path` 指向拼接数据集，并保留同级 `meta` 目录即可，无需额外开关。
-若希望每次都从行走第一帧开始，再加 `++manager_env.commands.motion.start_from_first_frame=True` 和 `++manager_env.commands.motion.sample_before_contact=False`。
-
-`joint_micro_step` 启用 `algo.config.teacher_termination_loss_override`：超过教师终止阈值、但尚未超过学生终止阈值的状态不参与 BC loss。BC loss 按剩余有效样本数归一化，再乘基础调度的 BC 系数；全部被屏蔽时 loss 为零。PPO/BC 调度系数不随接触标签改变。
-
-`joint_micro_step` 继承的 `action_acc_l2` 对 `joint_pos.processed_actions`（已包含逐关节缩放、偏置和裁剪的目标角度）计算二阶差分并平方求和，不除以 `step_dt`，权重为 `-1`；实际关节加速度惩罚 `joint_acc_l2` 的权重为 `-5e-7`。两项单位与贡献不同。
-若需平均贡献接近 1:1，在同一训练窗口读取 `Episode_Reward/action_acc_l2` 和 `Episode_Reward/joint_acc_l2`，分别取平均值的绝对值 `P_action`、`P_joint`，使用 `w_action_new = w_action_current * P_joint / P_action` 校准，并在后续 rollout 复核。两项日志已包含权重和相同的时间归一化，无需再次乘权重；`P_action` 接近零时不能使用此比例。目标角度跳变、接触冲击和 PD 跟踪误差会使比例随策略变化。
-
 ```bash
 cd /home/tide/robot/GRAIL/imports/SONIC
 
@@ -54,48 +37,6 @@ python gear_sonic/train_agent_trl.py \
   num_envs=8
   
 ```
-
-### 新 place 实验的本地轻量验证
-
-新增实验继承旧 `joint_micro_step`，四个数据路径已经指向 `pickup_table_place_concat`。
-启动时保留这些配置路径；不加覆盖回 `walk_concat` 或 `cleaned_succeeded` 的参数。
-`motion_meta_info_path=null` 按运动加载配套 meta。接触、离散开手动作使用半开时间区间，
-`grasp_reward` 在参考接触前仍启用，只在最终释放起点关闭。
-到达及到达后释放分别写入 `Env/object_position_success_rate`、`Env/object_release_success_rate`。
-`Env/carry_goal_success_rate` 以中间 carry 位置为目标，沿用最终目标成功率的距离阈值和
-参考接触门控；episode 内一旦成功即保留标记，在 reset 时按已结束的 episode 统计。
-
-当前 place 配置同时观察最终目标和原始 `carry_source_frame` 的中间目标，两者都包含
-pelvis、手参考帧下的位置和旋转，并增加一维 `place_turn_direction`，左转为 1、右转为 -1、
-无转向为 0，`privileged_input_dim=85`。转向按拼接后 root_rot 从 carry 帧起累计的 yaw 变化判断。
-最终目标位置和姿态取释放前一帧，和 carry 目标一样直接读取 meta 保存的世界位置及 wxyz 四元数。
-训练前重新运行 place 拼接器，使各条 meta 包含 `place_object_goal_quat_w`、`place_object_carry_goal_pos_w`、
-`place_object_carry_goal_quat_w` 和 `place_turn_direction`；已有 66/84 维学生检查点不能
-直接作为本配置的普通续训检查点。
-
-place 实验另有 `object_carry_goal_success`（权重 2.0）和
-`object_carry_goal_distance_after_contact`（权重 -1.5），均以 meta 的 carry 位置为目标，
-仅在各环境绝对参考帧严格早于 `place_carry_source_frame` 时生效；距离项还要求已经超过
-首次参考接触帧。到达 carry 帧时两项关闭，现有最终 place 目标奖励继续保留。
-
-place 实验使用两阶段训练，原启动命令无需增加参数。调度使用 checkpoint 恢复的
-`global_step`：`0 <= iteration < 3000` 时，`place_carry_time_out` 在最后一个 carry 前的
-控制步提前 reset；它设置 `time_out=true`，不触发 `is_terminated` 的失败惩罚，critic
-沿用 timeout bootstrap。iteration 3000 起关闭该项，允许完整 motion 继续执行。
-评估和 play 不应用这个训练阶段的提前 reset。
-
-carry 前的 PPO/BC 系数保持继承的 `ppo_bc_loss_schedule`，命令行的 `bc_min_coef=0.04`
-和 `adaptive_after_iteration=1000` 继续适用。从 `place_carry_source_frame` 开始（含该帧），
-使用独立的 `ppo_bc_loss_schedule.after_carry`：BC 在 iteration 3000 为 1，线性下降至
-iteration 6000 的 0.05，之后保持 0.05；对应 PPO 系数为 `1 - BC`。两种阶段的样本在
-求平均前分别加权，阶段标记在 rollout 的动作执行前保存，包含随机起始偏移及 FPS 换算。
-教师终止 BC mask 仍生效，value loss 继续沿用原有系数。
-
-`ee_body_pos`、`object_pos_deviation` 在前 3000 iteration 从 0.2 线性增至接近 0.3，
-iteration 3000 起跳变为 1；学生 BC mask 同步使用新阈值。`anchor_ori_full` 在前段保持
-默认阈值 1，iteration 3000 起变为 100000。切换点由
-`algo.config.place_carry_curriculum.switch_iteration` 控制；后段 BC 的终点与最低系数
-分别由 `algo.config.ppo_bc_loss_schedule.after_carry.end_iteration` 和 `bc_min_coef` 控制。
 
 ```bash
 cd /home/tide/robot/GRAIL/imports/SONIC
@@ -127,15 +68,6 @@ bash grail/walk_data_tool/regenerate_kimodo_walk.sh \
     data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/kimodo_end_frame/pickup_table__alcohol_1__000.json
 ```
 
-追加 `--dry-run` 可先检查匹配的生成命令和输出路径，不连接服务器、不修改数据。
-不传 JSON 时默认处理上述动作。脚本从 JSON 同目录的 `generate_commands.sh`
-精确匹配 `--constraints`，保留该动作的文本、时长和种子，仅改写远程输入/输出路径。
-服务器使用实际容器 `yuguanchao_kimodo`，每次工作目录为
-`/home/cuixinru/data0/kimodo/data/grail_single/<动作名>/<时间戳_PID>/`。
-回传的同名 CSV/NPZ 覆盖 `kimodo_walk/`，随后仅拼接该动作（过渡 10 帧），
-视频覆盖 `pickup_table_walk_concat/vis/<动作名>.mp4`。任一步失败即停止；
-渲染成功后才替换旧视频，其他动作的视频和已有合集不会更新。
-
 批量 replay：
 
 ```bash
@@ -145,10 +77,27 @@ CUDA_VISIBLE_DEVICES=0 bash grail/visualization/scripts/visualize.sh \
 ```
 
 ## 服务器端训练
+
+训练和 play 自动循环（先激活 Isaac Lab Python 环境，并登录 W&B）：
+
+```bash
+cd /home/GRAIL/imports/SONIC
+bash gear_sonic/scripts/train_play_grasp_walk_1008.sh --delay-hours 8 --delay-minutes 5
+# 只查看实际命令，不等待、不训练：
+bash gear_sonic/scripts/train_play_grasp_walk_1008.sh --dry-run
+```
+
+不传倒计时参数则立即开始。总训练长度保持 15000，分别在 3000、6000、9000、12000、15000
+暂停训练并生成视频；前四次 play 完成后，从该阶段最新的编号检查点 resume。
+实验目录只创建一次，W&B 使用该目录 `meta.yaml` 中的同一个 run ID。
+视频保存在 `/home/GRAIL/outputs/<本次实验目录名>/iteration_<六位iteration>/`，
+训练和 play 日志保存在实验目录的 `train_play_logs/`。任一阶段失败时脚本停止。
+服务器需同步脚本、`segment_stop_callback.py` 和 `train_agent_trl.py` 的日志收尾修改。
+
 ```bash
 cd /home/GRAIL/imports/SONIC
 
-python gear_sonic/train_agent_trl.py \
+CUDA_VISIBLE_DEVICES=1  python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_place_mlp_decoder_latent_vector_obs_joint_micro_step \
   headless=True \
   num_envs=5 \
@@ -161,12 +110,11 @@ python gear_sonic/train_agent_trl.py \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   algo.config.num_learning_iterations=10000 
 
-
-CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
+python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_pickup_table_place_mlp_decoder_latent_vector_obs_joint_micro_step \
   headless=True \
-  num_envs=5 \
-  experiment_name=GRASP_WALK_1007 \
+  num_envs=4096 \
+  experiment_name=GRASP_WALK_1009 \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects \
@@ -175,7 +123,32 @@ CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   algo.config.num_learning_iterations=15000 \
   algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
-  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.05
+  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.04
+
+```
+
+## 服务器resume训练
+```bash
+WANDB_MODE=online python gear_sonic/train_agent_trl.py \
+  +exp=manager/universal_token/distill/robocasa_pickup_table_place_mlp_decoder_latent_vector_obs_joint_micro_step \
+  headless=True \
+  num_envs=4096 \
+  experiment_name=GRASP_WALK_1009-resume4000 \
+  project_name=GRAB_Tracking \
+  resume=True \
+  fork_resume=False \
+  experiment_dir=logs_rl/GRAB_Tracking/GRASP_WALK_1009-resume4000 \
+  checkpoint=logs_rl/GRAB_Tracking/GRASP_WALK_1009-20261009_070508/model_step_004000.pt \
+  use_wandb=True \
+  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd \
+  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot \
+  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects \
+  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps \
+  manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
+  algo.config.num_learning_iterations=15000 \
+  algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
+  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.04
 
 ```
 
@@ -267,6 +240,7 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.recorders.render_envs.video_save_path=/home/GRAIL/outputs/pnp_table_place_concat_video \
   ++manager_env.recorders.render_envs.video_quality=5 \
   ++manager_env.terminations.ee_body_pos.params.threshold=25 \
+  ++manager_env.terminations.object_pos_deviation.params.threshold=25 \
   ++manager_env.terminations.object_pos_deviation.params.threshold=25
 
 ```
@@ -319,12 +293,12 @@ python gear_sonic/eval_agent_trl.py \
 ## 服务器端play
 ```bash
 python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/GRASP_WALK_1006-20261005_170756/last.pt \
+  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/GRASP_WALK_1009-20261009_070508/last.pt \
   +headless=True \
   ++num_envs=16 \
   +run_once=True \
   ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/GRASP_WALK_1006-2000 \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/GRASP_WALK_1009-20261009_070508 \
   "~manager_env/recorders=empty" \
   "+manager_env/recorders=render" \
   ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd \
@@ -333,7 +307,8 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps \
   ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   ++manager_env.terminations.ee_body_pos.params.threshold=25 \
-  ++manager_env.terminations.object_pos_deviation.params.threshold=25
+  ++manager_env.terminations.object_pos_deviation.params.threshold=25 \
+  ++manager_env.terminations.anchor_ori_full.params.threshold=2500
 
 ```
 
@@ -391,6 +366,7 @@ rsync -aP \
   yuguanchao@zz.irmv.top:/home/yuguanchao/data0/GRAIL/
 
   ssh -p 9980 yuguanchao@zz.irmv.top
+
 
 ```
 

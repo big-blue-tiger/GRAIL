@@ -119,7 +119,7 @@ class RewardsCfg:
 
 
 def tracking_anchor_pos_error(
-    env: ManagerBasedRLEnv, command_name: str, std: float
+    env: ManagerBasedRLEnv, command_name: str, std: float, after_carry_scale: float = 1.0
 ) -> torch.Tensor:
     """Compute anchor position tracking reward using a Gaussian kernel.
 
@@ -130,18 +130,22 @@ def tracking_anchor_pos_error(
         command_name: Name of the tracking command term.
         std: Standard deviation for the Gaussian kernel. Smaller values produce
             sharper falloff and stricter tracking.
+        after_carry_scale: Multiplier applied from each motion's carry frame onward.
 
     Returns:
-        Reward tensor of shape (num_envs,) in [0, 1].
+        Reward tensor of shape (num_envs,), scaled only at/after carry.
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
     diff = command.anchor_pos_w - command.robot_anchor_pos_w
     sq_dist = (diff * diff).sum(dim=-1)
-    return torch.exp(-sq_dist / (std * std))
+    reward = torch.exp(-sq_dist / (std * std))
+    if after_carry_scale != 1.0:
+        reward = torch.where(command.before_place_carry(), reward, reward * after_carry_scale)
+    return reward
 
 
 def tracking_anchor_ori_error(
-    env: ManagerBasedRLEnv, command_name: str, std: float
+    env: ManagerBasedRLEnv, command_name: str, std: float, after_carry_scale: float = 1.0
 ) -> torch.Tensor:
     """Compute anchor orientation tracking reward using a Gaussian kernel.
 
@@ -151,13 +155,17 @@ def tracking_anchor_ori_error(
         env: The environment.
         command_name: Name of the tracking command term.
         std: Standard deviation for the Gaussian kernel on the angular error.
+        after_carry_scale: Multiplier applied from each motion's carry frame onward.
 
     Returns:
-        Reward tensor of shape (num_envs,) in [0, 1].
+        Reward tensor of shape (num_envs,), scaled only at/after carry.
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
     angular_err = quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w)
-    return torch.exp(-angular_err.square() / (std * std))
+    reward = torch.exp(-angular_err.square() / (std * std))
+    if after_carry_scale != 1.0:
+        reward = torch.where(command.before_place_carry(), reward, reward * after_carry_scale)
+    return reward
 
 
 def upright_penalty(
@@ -860,14 +868,14 @@ def object_final_goal_distance_after_contact(
     command_name: str = "motion",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     target_source: str = "final_frame",
-    reference_goal_activation_distance: float | None = None,
+    enable_after_carry: bool = False,
     disable_after_release: bool = False,
     disable_after_carry: bool = False,
 ) -> torch.Tensor:
     """Linear distance cost after first reference contact; use a negative weight.
 
     Compare absolute motion steps, including randomized motion start offsets.
-    Place experiments can activate near the reference goal and stop at release.
+    Place experiments can activate at the reference carry frame and stop at release.
     Carry-goal experiments can stop at the source carry frame. Defaults retain
     the legacy gate after first reference contact.
     """
@@ -876,11 +884,8 @@ def object_final_goal_distance_after_contact(
         command.motion_start_time_steps + command.time_steps > command._per_env_first_contact
     )
     distance = _object_final_goal_distance(env, command_name, asset_cfg, target_source)
-    if reference_goal_activation_distance is not None:
-        ref_distance = torch.linalg.vector_norm(
-            command.object_root_pos[:, 0] - command.get_object_goal_pos_w(target_source), dim=-1
-        )
-        after_contact &= ref_distance < reference_goal_activation_distance
+    if enable_after_carry:
+        after_contact &= ~command.before_place_carry()
     if disable_after_release:
         after_contact &= command.before_place_release()
     if disable_after_carry:

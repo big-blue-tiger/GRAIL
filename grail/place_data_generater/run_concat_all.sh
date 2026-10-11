@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-concat existing place motions using the local inputs from run.sh.
+# Re-concat cached place motions using the local inputs from run.sh.
 # Usage: bash grail/place_data_generater/run_concat_all.sh [--dry-run]
 set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -33,10 +33,11 @@ from grail.walk_data_tool.export_kimodo_end_frame import load_kinematics
 
 repo = Path(sys.argv[1])
 dataset = repo / "data/hf_dataset/data_update/data/pickup_table_walk_concat"
-output = repo / "data/hf_dataset/data_update/data/pickup_table_place_concat"
-names = sorted(path.stem for path in (output / "robot").glob("*.pkl"))
+output = repo / "data/hf_dataset/data_update/data/pickup_table_place_left_right"
+downloads = dataset / "kimodo_place"
+names = sorted(path.stem for path in downloads.glob("*.csv"))
 if not names:
-    raise SystemExit(f"No existing robot PKLs in {output}")
+    raise SystemExit(f"No cached place CSVs in {downloads}")
 
 # Check every cached CSV and its source snapshot before overwriting any motion.
 inputs = []
@@ -59,7 +60,7 @@ for name in names:
     if not np.allclose(np.linalg.norm(qpos[:, 3:7], axis=1), 1, atol=1e-3):
         raise ValueError(f"{name}: invalid cached CSV root quaternions")
     inputs.append((name, manifest, csv))
-print(f"Preflight passed: {len(inputs)} existing place motions", flush=True)
+print(f"Preflight passed: {len(inputs)} cached place motions", flush=True)
 if sys.argv[2] == "true":
     raise SystemExit(0)
 
