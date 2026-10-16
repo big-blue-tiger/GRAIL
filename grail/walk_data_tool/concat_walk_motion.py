@@ -45,7 +45,7 @@ VELOCITY_FIELDS = {"root_lin_vel", "root_ang_vel", "body_lin_vel", "body_ang_vel
 LOCAL_FIELDS = {"dof", "dof_pos", "joint_pos", "dof_vel", "hand_dof_pos",
                 "hand_action_left", "hand_action_right"}
 ROBOT_FIELDS = POSITION_FIELDS | QUAT_FIELDS | VELOCITY_FIELDS | LOCAL_FIELDS | {
-    "pose_aa", "smpl_joints"}
+    "pose_aa", "smpl_joints", "policy_command_x_yaw", "policy_command_drop_button"}
 CONTACT_FIELDS = {"contact_points_left_hand", "contact_points_right_hand"}
 OBJECT_FIELDS = {"root_pos", "root_quat"} | CONTACT_FIELDS
 WALK_FIELDS = {"root_trans_offset", "root_rot", "dof", "pose_aa", "smpl_joints",
@@ -108,11 +108,15 @@ def validate_fields(motion, kind):
             raise ValueError(f"Invalid frame array {key}; expected {n} finite frames")
     shapes = ({"root_trans_offset": (n, 3), "root_rot": (n, 4), "dof": (n, 29),
                "pose_aa": (n, 30, 3), "smpl_joints": (n, 24, 3),
-               "hand_dof_pos": (n, 14), "hand_action_left": (n,), "hand_action_right": (n,)}
+               "hand_dof_pos": (n, 14), "hand_action_left": (n,), "hand_action_right": (n,),
+               "policy_command_x_yaw": (n, 2), "policy_command_drop_button": (n, 1)}
               if kind == "robot" else {})
     for key, shape in shapes.items():
         if key in motion and motion[key].shape != shape:
             raise ValueError(f"{key} must have shape {shape}, got {motion[key].shape}")
+    for key in {"policy_command_x_yaw", "policy_command_drop_button"} & set(motion):
+        if motion[key].dtype != np.float32:
+            raise ValueError(f"{key} must be float32")
     for key in ((QUAT_FIELDS & set(motion)) if kind == "robot" else {"root_quat"}):
         if motion[key].shape[-1] != 4 or not np.allclose(
             np.linalg.norm(motion[key], axis=-1), 1, atol=1e-4

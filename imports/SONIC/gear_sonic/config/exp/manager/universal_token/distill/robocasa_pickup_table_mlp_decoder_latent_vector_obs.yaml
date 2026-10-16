@@ -163,7 +163,6 @@ manager_env:
         body_names: &tracking_upper_bodies
           [torso_link, left_shoulder_roll_link, left_elbow_link, left_wrist_yaw_link,
            right_shoulder_roll_link, right_elbow_link, right_wrist_yaw_link]
-        gate_before_grail: true
     tracking_relative_body_pos_lower:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_pos_error
@@ -174,7 +173,6 @@ manager_env:
         body_names: &tracking_lower_bodies
           [pelvis, left_hip_roll_link, left_knee_link, left_ankle_roll_link,
            right_hip_roll_link, right_knee_link, right_ankle_roll_link]
-        gate_before_grail: true
     tracking_relative_body_ori_upper:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_ori_error
@@ -183,7 +181,6 @@ manager_env:
         command_name: motion
         std: 0.4
         body_names: *tracking_upper_bodies
-        gate_before_grail: true
     tracking_relative_body_ori_lower:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_ori_error
@@ -192,7 +189,6 @@ manager_env:
         command_name: motion
         std: 0.4
         body_names: *tracking_lower_bodies
-        gate_before_grail: true
     tracking_body_linvel_upper:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_linvel_error
@@ -201,7 +197,6 @@ manager_env:
         command_name: motion
         std: 1.0
         body_names: *tracking_upper_bodies
-        gate_before_grail: true
     tracking_body_linvel_lower:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_linvel_error
@@ -210,7 +205,6 @@ manager_env:
         command_name: motion
         std: 1.0
         body_names: *tracking_lower_bodies
-        gate_before_grail: true
     tracking_body_angvel_upper:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
@@ -219,7 +213,6 @@ manager_env:
         command_name: motion
         std: 3.14
         body_names: *tracking_upper_bodies
-        gate_before_grail: true
     tracking_body_angvel_lower:
       _target_: isaaclab.managers.RewardTermCfg
       func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
@@ -228,7 +221,6 @@ manager_env:
         command_name: motion
         std: 3.14
         body_names: *tracking_lower_bodies
-        gate_before_grail: true
     object_tracking_reward: null
 
     finger_primitive_limit: null

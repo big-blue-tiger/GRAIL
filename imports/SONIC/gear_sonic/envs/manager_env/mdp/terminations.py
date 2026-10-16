@@ -218,6 +218,7 @@ def exceeded_body_height(
     down_threshold: float = 0.5,
     body_names: list[str] | None = None,
     root_height_threshold: float = 0.5,
+    place_generated_threshold: float | None = None,
 ) -> torch.Tensor:
     """Terminate if any tracked body Z-height error exceeds a threshold.
 
@@ -233,6 +234,7 @@ def exceeded_body_height(
         body_names: Optional list of body names to check. If ``None``, all
             tracked bodies from the command are used.
         root_height_threshold: Height below which ``down_threshold`` is used.
+        place_generated_threshold: Override the distance limit during the generated place phase.
 
     Returns:
         Boolean tensor of shape ``(num_envs,)``.
@@ -242,9 +244,12 @@ def exceeded_body_height(
     height_err = (
         command.body_pos_relative_w[:, tracked, 2] - command.robot_body_pos_w[:, tracked, 2]
     ).abs()
-    if threshold_adaptive:
+    if threshold_adaptive or place_generated_threshold is not None:
         thresh = torch.full_like(height_err, threshold)
-        thresh[command.running_ref_root_height < root_height_threshold] = down_threshold
+        if threshold_adaptive:
+            thresh[command.running_ref_root_height < root_height_threshold] = down_threshold
+        if place_generated_threshold is not None:
+            thresh[command.is_place_generated_phase()] = place_generated_threshold
         return height_err.gt(thresh).any(dim=-1)
     return height_err.gt(threshold).any(dim=-1)
 
@@ -503,6 +508,8 @@ def object_pos_deviation(
     env: ManagerBasedRLEnv,
     command_name: str,
     threshold: float = 0.2,
+    disable_after_release: bool = False,
+    place_generated_threshold: float | None = None,
 ) -> torch.Tensor:
     """Terminate if object position deviates from reference by more than threshold.
 
@@ -528,7 +535,14 @@ def object_pos_deviation(
     current_object_pos = obj.data.root_pos_w
 
     pos_error = torch.norm(ref_object_pos - current_object_pos, dim=-1)
-    return pos_error > threshold
+    if place_generated_threshold is not None:
+        threshold = torch.where(
+            command.is_place_generated_phase(), place_generated_threshold, threshold
+        )
+    exceeded = pos_error > threshold
+    if disable_after_release:
+        exceeded &= ~command.is_release_phase()
+    return exceeded
 
 
 def object_z_pos_deviation(

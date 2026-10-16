@@ -2,8 +2,8 @@
 
 from pathlib import Path
 import logging
+import math
 import numbers
-import json
 
 import joblib
 import torch
@@ -20,18 +20,26 @@ def motion_source_step_ratio(command, key):
     return command.motion_lib._sim_fps / source_fps
 
 
-class KimodoTrackingBoundary:
-    """Cache report boundaries; ordinary motions remain tracked throughout.
-
-    b_start_index is the first GRAIL frame, not the beginning or end of the
-    PCHIP replacement window. Rebuild the tensor when the library reloads keys.
-    """
+class PlaceCarryBoundary:
+    """Cache carry steps for BC masking; non-place motions keep the legacy mask."""
 
     def __init__(self):
-        self._keys = None
-        self._boundaries = {}
+        """Create an empty carry-boundary cache for teacher BC masking.
 
-    def before_grail(self, command, device):
+        The first before_carry call loads metadata. Replacing the motion
+        library's current key list invalidates the cached step boundaries.
+        """
+        self._keys = None
+
+    def before_carry(self, command, device):
+        """Return which environments precede the annotated source carry frame.
+
+        Convert source frame indices to simulation steps using source FPS and
+        ceil, then compare against motion_start_time_steps + time_steps.
+        Return a boolean [N] mask on device and rebuild it on library reload.
+        Motions without a carry annotation retain an infinite boundary; invalid
+        annotated frame/total-frame pairs raise ValueError.
+        """
         keys = command.motion_lib.curr_motion_keys
         if keys is not self._keys:
             motion_file = Path(command.cfg.motion_lib_cfg["motion_file"])
@@ -39,33 +47,27 @@ class KimodoTrackingBoundary:
             bounds = []
             for key in keys:
                 source = command.motion_lib._motion_data_load[key]
-                # Directory mode keys are PKL stems, not internal motion keys.
-                source_path = Path(source["path"]) if "path" in source else motion_file
-                name = source_path.stem if source_path.is_file() else str(key)
-                path = robot_dir.parent / "reports" / f"{name}.json"
-                if path not in self._boundaries:
-                    boundary = float("inf")
-                    if path.is_file():
-                        report = json.loads(path.read_text())
-                        if report.get("sources", {}).get("walk_csv") is not None:
-                            start = report.get("b_start_index")
-                            total = report.get("total_frames")
-                            fps = report.get("fps")
-                            if (type(start) is not int or type(total) is not int
-                                    or not 0 <= start < total
-                                    or not isinstance(fps, (int, float))
-                                    or not 0 < fps < float("inf")):
-                                raise ValueError(f"{path}: invalid Kimodo boundary/frame count/fps")
-                            ratio = motion_source_step_ratio(command, key)
-                            if abs(ratio * fps - command.motion_lib._sim_fps) > 1e-5:
-                                raise ValueError(f"{path}: report fps does not match source motion")
-                            boundary = start * ratio
-                    self._boundaries[path] = boundary
-                bounds.append(self._boundaries[path])
-            self._frame_bounds = torch.tensor(bounds, device=device, dtype=torch.float64)
+                if "path" in source:
+                    name = Path(source["path"]).stem
+                else:
+                    name = motion_file.stem if motion_file.is_file() else str(key)
+                path = robot_dir.parent / "meta" / f"{name}.pkl"
+                meta = joblib.load(path) if path.is_file() else {}
+                boundary = float("inf")
+                if "place_carry_source_frame" in meta:
+                    frame = meta["place_carry_source_frame"]
+                    total = meta.get("total_frames")
+                    if (isinstance(frame, bool) or isinstance(total, bool)
+                            or not isinstance(frame, numbers.Integral)
+                            or not isinstance(total, numbers.Integral)
+                            or not 0 <= frame < total):
+                        raise ValueError(f"{path}: invalid carry frame/total_frames")
+                    boundary = math.ceil(frame * motion_source_step_ratio(command, key))
+                bounds.append(boundary)
+            self._carry_steps = torch.tensor(bounds, device=device, dtype=torch.float64)
             self._keys = keys
-        frame = command.motion_start_time_steps + command.time_steps
-        return frame < self._frame_bounds[command.motion_ids]
+        absolute_steps = command.motion_start_time_steps + command.time_steps
+        return absolute_steps < self._carry_steps[command.motion_ids]
 
 
 class EvalResidualTransition:

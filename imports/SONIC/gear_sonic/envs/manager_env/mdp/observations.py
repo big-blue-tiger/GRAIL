@@ -176,7 +176,7 @@ class StudentProprioCfg(ObsGroup):
 
 @configclass
 class StudentPrivilegedCfg(ObsGroup):
-    """Current-frame object, table, and contact state for the vector student."""
+    """Current-frame object, table, contact, and goal state for the vector student."""
 
     object_bps = None
     table_corners_b = None
@@ -185,6 +185,9 @@ class StudentPrivilegedCfg(ObsGroup):
     hand_object_transform_6d = None
     hand_object_contact_force_magnitude = None
     target_object_poses_6d = None
+    target_object_carry_poses_6d = None
+    sparse_target_root_trajectory_command_contact_aware = None
+    drop_button = None
 
 
 @configclass
@@ -3026,21 +3029,25 @@ def hand_object_transform_6d(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg) ->
 
 
 def target_object_poses_6d(
-    env: ManagerBasedEnv, command_name: str, asset_cfg: SceneEntityCfg
+    env: ManagerBasedEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    goal_type: str = "release",
 ) -> torch.Tensor:
-    """Final reference object pose in live pelvis and hand frames (9D each).
+    """Metadata object goal in live pelvis and hand frames (9D each).
 
-    Recompute relative poses every step, keeping the world target at the motion's
-    last frame. The hand frame and 6D rotation layout match the live object terms.
+    Select place_object_goal for release or place_object_carry_goal for carry.
+    Recompute relative poses every observation from current simulated frames;
+    only the metadata world pose stays fixed. The rotation layout matches the
+    live object terms, with 3D position followed by 6D rotation in each frame.
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
-    final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
-    target_pos_w = (
-        command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
-        + env.scene.env_origins
-    )
-    target_pos_w[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
-    target_quat_w = command.motion_lib.get_object_root_quat(command.motion_ids, final_steps)[:, 0]
+    if goal_type == "release":
+        target_pos_w, target_quat_w = command.get_release_target_pose()
+    elif goal_type == "carry":
+        target_pos_w, target_quat_w = command.get_carry_target_pose()
+    else:
+        raise ValueError(f"Unknown object goal type: {goal_type!r}")
 
     transformer = env.scene[asset_cfg.name]
     hand_pos_in_obj, hand_quat_in_obj = _get_hand_pose_in_object_frame(transformer)
@@ -3059,6 +3066,29 @@ def target_object_poses_6d(
         rot_6d = matrix_from_quat(quat)[..., :2].reshape(env.num_envs, 6)
         poses.extend((pos, rot_6d))
     return torch.cat(poses, dim=-1)
+
+
+def sparse_target_root_trajectory_command_contact_aware(env: ManagerBasedEnv, command_name: str):
+    """Observe carry displacements only while physical hand contact permits carrying.
+
+    Return float32 [N,2] reference-heading-frame dx and turn-stage total dyaw commands in
+    meters/radians. Gate to zero before confirmed pickup, while hand
+    contact is absent or when the drop button is at least 0.5. Reading this
+    observation does not update pickup/release counters or normalize by time.
+    """
+    command = env.command_manager.get_term(command_name)
+    x_yaw, drop = command.get_sparse_policy_commands()
+    return command.sparse_command_state.command(x_yaw, drop)
+
+
+def drop_button(env: ManagerBasedEnv, command_name: str):
+    """Observe the current offline reference release request as float32 [N,1].
+
+    Read the same absolute motion frame as the robot trajectory. Labels are
+    zero before the annotated release boundary and one from that boundary
+    onward; the button expresses a request, not measured physical release.
+    """
+    return env.command_manager.get_term(command_name).get_sparse_policy_commands()[1]
 
 
 def get_finger_tips_contact_force(env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:

@@ -338,8 +338,19 @@ rsync -aP \
   -e "ssh -p 9989 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
   /home/tide/robot/GRAIL/ \
   cuixinru@202.120.37.249:/home/cuixinru/data0/GRAIL/
+
+
+  rsync -aP \
+  --no-owner --no-group \
+  --exclude='data/' \
+  --exclude='imports/blender/' \r
+  --exclude='outputs/' \
+  -e "ssh -p 9980 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
+  /home/tide/robot/GRAIL/ \
+  yuguanchao@zz.irmv.top:/home/yuguanchao/data0/GRAIL/
 ```
 
+imports/SONIC/gear_sonic/config/exp/manager/universal_token/distill/robocasa_carry_table.yaml的配置是将要使用data/hf_dataset/data_update/data/pickup_table_place_left_right的数据进行训练，imports/SONIC/gear_sonic/config/exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step.yaml是使用data/hf_dataset/data_update/data/pickup_table_place_concat中的数据进行训练；前者相对后者的数据中最后多了一个拿着物体走动的阶段；对imports/SONIC/gear_sonic/config/exp/manager/universal_token/distill/robocasa_carry_table.yaml对应的代码进行修改，对于其中的meta数据中的place_transition_end_frame的前一帧
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
 │                              MODIFIED STUDENT ACTOR                                          │

@@ -31,31 +31,44 @@ class RecordersCfg(recorder_manager.RecorderManagerBaseCfg):
 
 
 class ObjectPositionSuccessRecorder(recorder_manager.RecorderTerm):
-    """Count an episode as successful once the object reaches its final reference position."""
+    """Record target arrival and optionally confirmed physical release separately."""
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
         self.succeeded = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self.release_succeeded = torch.zeros_like(self.succeeded)
 
     def record_post_step(self):
         command = self._env.command_manager.get_term(self.cfg.command_name)
-        # Match the final world-frame target used by reward_object_final_goal_distance.
-        final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
-        ref_object_pos = (
-            command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
-            + self._env.scene.env_origins
-        )
-        ref_object_pos[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
+        ref_object_pos, _ = command.get_release_target_pose()
         current_object_pos = self._env.scene["object"].data.root_pos_w
         pos_error = torch.norm(ref_object_pos - current_object_pos, dim=-1)
 
         # Called before automatic resets, including on the episode's terminal step.
-        self.succeeded |= pos_error < self.cfg.threshold
+        in_goal = pos_error < self.cfg.threshold
+        if self.cfg.track_release_success:
+            # Arrival requires carrying the object to the final target before release.
+            self.succeeded |= (
+                in_goal & command.is_place_generated_phase()
+                & ~command.is_release_phase() & command.sparse_command_state.carrying
+            )
+            # Check proximity at confirmed release too: arrival followed by a drop
+            # elsewhere must not count, nor may an early drop or continued grasp.
+            self.release_succeeded |= (
+                self.succeeded & in_goal & command.is_physically_released()
+            )
+            completed = self._env.reset_buf
+            self._env.extras["object_carry_arrival_success"] = self.succeeded[completed].float()
+            self._env.extras["object_release_success"] = self.release_succeeded[completed].float()
+        else:
+            self.succeeded |= in_goal
+        # Keep the existing position metric as an alias for arrival.
         self._env.extras["object_position_success"] = self.succeeded[self._env.reset_buf].float()
         return None, None
 
     def reset(self, env_ids=None):
         self.succeeded[slice(None) if env_ids is None else env_ids] = False
+        self.release_succeeded[slice(None) if env_ids is None else env_ids] = False
 
 
 @configclass
@@ -63,6 +76,7 @@ class ObjectPositionSuccessRecorderCfg(manager_term_cfg.RecorderTermCfg):
     class_type = ObjectPositionSuccessRecorder
     command_name: str = "motion"
     threshold: float = 0.1
+    track_release_success: bool = False
 
 
 class RenderEnvsRecorderTerm(recorder_manager.RecorderTerm):

@@ -102,6 +102,77 @@ class MotionVelocityCommandCfg(CommandTermCfg):
     debug_vis: bool = False
 
 
+class SparseCommandState:
+    """Track per-environment physical pickup, release and carry eligibility.
+
+    TrackingCommand advances this state once per simulation step and clears
+    selected environments on reset. Observation reads only apply the resulting
+    contact gate; they never advance the stable-contact counters.
+    """
+
+    def __init__(self, num_envs, device, *, force_threshold=0.1, stable_steps=3):
+        """Allocate zeroed contact counters and phase flags on the environment device.
+
+        Keep one entry per environment. force_threshold is in newtons and
+        stable_steps is the number of consecutive simulation steps required
+        to confirm pickup, physical release or an unintended loss of contact.
+        """
+        self.force_threshold = force_threshold
+        self.stable_steps = stable_steps
+        self.pickup_count = torch.zeros(num_envs, dtype=torch.long, device=device)
+        self.release_count = torch.zeros_like(self.pickup_count)
+        self.lost_contact_count = torch.zeros_like(self.pickup_count)
+        self.picked_up = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        self.released = torch.zeros_like(self.picked_up)
+        self.dropped = torch.zeros_like(self.picked_up)
+        self.carrying = torch.zeros_like(self.picked_up)
+        # The staged goal reward latches arrival before the release request.
+        self.release_goal_reached = torch.zeros_like(self.picked_up)
+
+    def reset(self, env_ids):
+        """Clear pickup, release, drop and goal-arrival history for selected environments.
+
+        Reset all counters and carry flags at episode or motion resampling.
+        Entries outside env_ids retain their state; no observation is sampled.
+        """
+        for value in (self.pickup_count, self.release_count, self.lost_contact_count,
+                      self.picked_up, self.released, self.dropped, self.carrying,
+                      self.release_goal_reached):
+            value[env_ids] = 0
+
+    def update(self, hand_force, table_force, drop_button):
+        """Advance contact state once from the current physics measurements.
+
+        Read hand/table force magnitudes [N] in newtons and drop buttons [N,1].
+        Confirm pickup after stable hand contact without table support. After
+        pickup, distinguish contact loss following a button press from contact
+        loss before release, and latch each event after stable_steps. Carrying
+        requires current hand contact, no release request and no latched release.
+        """
+        contact = hand_force >= self.force_threshold
+        drop = drop_button.reshape(-1) >= 0.5
+        lifted = contact & (table_force < self.force_threshold) & ~drop
+        self.pickup_count = torch.where(lifted, self.pickup_count + 1, 0)
+        self.picked_up |= self.pickup_count >= self.stable_steps
+        releasing = self.picked_up & drop & ~contact
+        self.release_count = torch.where(releasing, self.release_count + 1, 0)
+        self.released |= self.release_count >= self.stable_steps
+        lost = self.picked_up & ~drop & ~contact
+        self.lost_contact_count = torch.where(lost, self.lost_contact_count + 1, 0)
+        self.dropped |= self.lost_contact_count >= self.stable_steps
+        self.carrying = self.picked_up & contact & ~drop & ~self.released
+
+    def command(self, x_yaw, drop_button):
+        """Return contact-gated carry commands without changing phase state.
+
+        Preserve the input [N,2] dx/turn-stage yaw command only while carrying and the [N,1]
+        drop button is below 0.5. Return zero for every other environment,
+        including release frames; pickup and release counters remain unchanged.
+        """
+        enabled = self.carrying & (drop_button.reshape(-1) < 0.5)
+        return torch.where(enabled[:, None], x_yaw, 0.0)
+
+
 class TrackingCommand(CommandTerm):
     """Provide reference motion trajectories for motion-tracking RL.
 
@@ -674,6 +745,8 @@ class TrackingCommand(CommandTerm):
 
         # Cache for table metadata loaded from pkl files (loaded once per motion key)
         self._table_meta_cache = {}  # motion_key -> {'table_pos': tensor, 'table_quat': tensor}
+        # ObservationManager probes term shapes before the first environment reset.
+        self._reset_sparse_command_state(torch.arange(self.num_envs, device=self.device))
 
         if self.cfg.use_height_map:
             import omni  # noqa: PLC0415
@@ -923,6 +996,7 @@ class TrackingCommand(CommandTerm):
             self.motion_ids[env_ids]
         )
         self.time_steps[env_ids] = 0
+        self._reset_sparse_command_state(env_ids)
         self.body_pos_relative_w[env_ids] = self.motion_lib.get_body_pos_w(
             self.motion_ids[env_ids], self.motion_start_time_steps[env_ids]
         )
@@ -3200,6 +3274,7 @@ class TrackingCommand(CommandTerm):
             env_ids: Environment indices being reset.
         """
         self.time_steps[env_ids] = 0
+        self._reset_sparse_command_state(env_ids)
         # Variable frames: resample per-env num_frames at episode reset
         if self.variable_frames_enabled and len(env_ids) > 0:
             idx = torch.randint(0, len(self._frame_choices), (len(env_ids),), device=self.device)
@@ -3676,6 +3751,103 @@ class TrackingCommand(CommandTerm):
             delta_ori_w, self.body_pos_w - anchor_pos_w_repeat
         )
 
+    def _reset_sparse_command_state(self, env_ids):
+        """Initialize carry-contact state if needed and clear selected environments.
+
+        Create the state before ObservationManager first probes term shapes.
+        Reuse it on later episode/motion resets, clearing only env_ids and
+        retaining the configured hand/table force threshold in newtons.
+        """
+        if not hasattr(self, "sparse_command_state"):
+            self.sparse_command_state = SparseCommandState(
+                self.num_envs, self.device,
+                force_threshold=self._env.cfg.config.get("lift_contact_force_threshold", 0.1),
+            )
+        self.sparse_command_state.reset(env_ids)
+
+    def get_sparse_policy_commands(self):
+        """Read the current offline carry command and drop button for each environment.
+
+        Return [N,2] dx/turn-stage yaw commands in meters/radians and [N,1] buttons
+        using motion_start_time_steps + time_steps. Random starts and motion
+        reloads use the same frame lookup as the robot reference trajectory.
+        This accessor does not apply contact gating or advance phase counters.
+        """
+        return self.motion_lib.get_sparse_commands(
+            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        )
+
+    def get_release_target_pose(self):
+        """Return the shared release-before-fall target in simulation world coordinates.
+
+        Read each motion's source-frame b - 1 object position and wxyz attitude.
+        Add environment origins and the configured object_z_offset to positions,
+        returning [N,3] meters and [N,4] quaternions for observations, rewards
+        and success records without changing the library's stored target.
+        """
+        pos, quat = self.motion_lib.get_release_target_pose(self.motion_ids)
+        pos = pos + self._env.scene.env_origins
+        pos[:, 2] += self.cfg.object_z_offset
+        return pos, quat
+
+    def get_carry_target_pose(self):
+        """Return the metadata carry goal in simulation world coordinates.
+
+        Apply the same environment origin and object height offset as the
+        release target. Relative-frame conversion is performed by observations
+        using the current simulated pelvis and hand poses on every call.
+        """
+        pos, quat = self.motion_lib.get_carry_target_pose(self.motion_ids)
+        pos = pos + self._env.scene.env_origins
+        pos[:, 2] += self.cfg.object_z_offset
+        return pos, quat
+
+    def is_place_generated_phase(self):
+        """Whether each current reference frame is at or after the generated start.
+
+        Use loaded-motion steps, including random episode start offsets. The
+        library aligns the source metadata boundary with FPS resampling and
+        any source clip cropping when loading each motion.
+        """
+        return self.motion_lib.is_place_generated_phase(
+            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        )
+
+    def is_grail_tracking_phase(self):
+        """Whether the current frame is inside the GRAIL-only tracking interval.
+
+        Suppress tracking from grail_start_frame, inclusive, until
+        place_generated_start_frame, exclusive, on the loaded motion timeline.
+        """
+        return self.motion_lib.is_grail_tracking_phase(
+            self.motion_ids, self.motion_start_time_steps + self.time_steps
+        )
+
+    def is_release_phase(self):
+        """Return a per-environment mask for the annotated reference release phase.
+
+        A current drop button of at least 0.5 marks release. Use the same
+        absolute frame lookup as observations, independent of whether the
+        simulated hand has physically released the object yet.
+        """
+        return self.get_sparse_policy_commands()[1].reshape(-1) >= 0.5
+
+    def is_physically_released(self):
+        """Confirm stable release after pickup, excluding premature drops and recontact.
+
+        SparseCommandState requires three consecutive contact-free control steps
+        after a drop request. Read current forces as well so a latched release
+        cannot count as success while the hand is touching the object again.
+        """
+        state = self.sparse_command_state
+        hand_force = torch.linalg.vector_norm(
+            self._env.scene["object_to_hand_contact_sensor"].data.force_matrix_w, dim=-1
+        ).sum(dim=(1, 2))
+        return (
+            self.is_release_phase() & state.released & ~state.dropped
+            & (hand_force < state.force_threshold)
+        )
+
     def _update_command(self):
         """Advance the motion time cursor by one step and handle episode wrap-around.
 
@@ -3691,6 +3863,14 @@ class TrackingCommand(CommandTerm):
                 self.motion_lib.update_adaptive_sampling(
                     self._env.reset_terminated, self.motion_ids, cur_time_steps
                 )
+        # Contact state changes here only; observation reads remain pure.
+        hand_force = torch.linalg.vector_norm(
+            self._env.scene["object_to_hand_contact_sensor"].data.force_matrix_w, dim=-1
+        ).sum(dim=(1, 2))
+        table_force = torch.linalg.vector_norm(
+            self._env.scene["object_to_table_contact_sensor"].data.force_matrix_w, dim=-1
+        ).sum(dim=(1, 2))
+        self.sparse_command_state.update(hand_force, table_force, self.get_sparse_policy_commands()[1])
         self.time_steps += 1
         env_ids = torch.where(
             self.time_steps + self.motion_start_time_steps

@@ -1,0 +1,257 @@
+# @package _global_
+# Carry-table training with sparse commands and the pickup/place concatenated dataset.
+
+defaults:
+  - /exp/manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step
+  - _self_
+
+exp_var: robocasa_carry_table
+experiment_name: ${exp_base}_${exp_var}
+
+algo:
+  config:
+    num_learning_iterations: 15000
+    termination_threshold_schedule:
+      enabled: true
+      terms:
+        ee_body_pos:
+          start: 0.2
+          end: 0.3
+          end_iteration: 3000
+        object_pos_deviation:
+          start: 0.2
+          end: 0.3
+          end_iteration: 3000
+    actor:
+      backbone:
+        module_config_dict:
+          # Base state(48) + release/carry goals(18 each) + sparse commands(3).
+          privileged_input_dim: 87
+
+manager_env:
+  recorders:
+    object_position_success:
+      track_release_success: true
+  observations:
+    privileged_obs:
+      target_object_poses_6d:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: gear_sonic.envs.manager_env.mdp:target_object_poses_6d
+        params:
+          command_name: motion
+          goal_type: release
+          asset_cfg:
+            _target_: isaaclab.managers.SceneEntityCfg
+            name: object_to_hand_frame_transformer
+      target_object_carry_poses_6d:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: gear_sonic.envs.manager_env.mdp:target_object_poses_6d
+        params:
+          command_name: motion
+          goal_type: carry
+          asset_cfg:
+            _target_: isaaclab.managers.SceneEntityCfg
+            name: object_to_hand_frame_transformer
+      sparse_target_root_trajectory_command_contact_aware:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: gear_sonic.envs.manager_env.mdp:sparse_target_root_trajectory_command_contact_aware
+        params:
+          command_name: motion
+      drop_button:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: gear_sonic.envs.manager_env.mdp:drop_button
+        params:
+          command_name: motion
+  commands:
+    motion:
+      motion_lib_cfg:
+        load_carry_target_pose: true
+        load_place_generated_phase: true
+        load_grail_tracking_phase: true
+        motion_file: /home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot
+        object_motion_file: /home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects
+        bps_dir: /home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps
+  config:
+    episode_length_s: 30.0
+    object_usd_path: /home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd
+    enable_robot_table_contact_sensors: true
+    enable_hand_body_contact_sensors: true
+    table_to_hand_contact_bodies: &hand_bodies
+      [left_wrist_roll_link, left_wrist_pitch_link, left_wrist_yaw_link,
+       left_hand_palm_link, left_hand_index_0_link, left_hand_index_1_link,
+       left_hand_middle_0_link, left_hand_middle_1_link,
+       left_hand_thumb_0_link, left_hand_thumb_1_link, left_hand_thumb_2_link,
+       right_wrist_roll_link, right_wrist_pitch_link, right_wrist_yaw_link,
+       right_hand_palm_link, right_hand_index_0_link, right_hand_index_1_link,
+       right_hand_middle_0_link, right_hand_middle_1_link,
+       right_hand_thumb_0_link, right_hand_thumb_1_link, right_hand_thumb_2_link]
+    hand_body_contact_source_bodies: *hand_bodies
+    table_to_robot_contact_bodies:
+      [pelvis, imu_in_pelvis, pelvis_contour_link,
+       left_hip_pitch_link, left_hip_roll_link, left_hip_yaw_link, left_knee_link,
+       left_ankle_pitch_link, left_ankle_roll_link,
+       right_hip_pitch_link, right_hip_roll_link, right_hip_yaw_link, right_knee_link,
+       right_ankle_pitch_link, right_ankle_roll_link,
+       waist_yaw_link, waist_roll_link, torso_link, d435_link, head_link,
+       imu_in_torso, logo_link, mid360_link,
+       left_shoulder_pitch_link, left_shoulder_roll_link, left_shoulder_yaw_link, left_elbow_link,
+       right_shoulder_pitch_link, right_shoulder_roll_link, right_shoulder_yaw_link, right_elbow_link]
+  terminations:
+    ee_body_pos:
+      params:
+        place_generated_threshold: 1.0
+    object_pos_deviation:
+      params:
+        place_generated_threshold: 1.0
+        disable_after_release: true
+    anchor_ori_full:
+      params:
+        # exceeded_anchor_ori compares squared angular error: (60 deg in radians)^2.
+        threshold: 1.0
+  rewards:
+    grasp_reward:
+      params:
+        disable_after_release: true
+    grasp_finger_direction:
+      params:
+        use_contact_center: false
+    approach_velocity_penalty:
+      params:
+        command_name: motion
+        disable_after_generated_start: true
+    object_final_goal_distance: null
+    tracking_anchor_pos:
+      weight: 0.5
+    tracking_anchor_ori:
+      weight: 2.5
+    # Suppress body tracking only in [grail_start_frame, place_generated_start_frame).
+    tracking_relative_body_pos_upper:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_pos_error
+      weight: 0.125
+      params:
+        command_name: motion
+        std: 0.3
+        body_names: &tracking_upper_bodies
+          [torso_link, left_shoulder_roll_link, left_elbow_link, left_wrist_yaw_link,
+           right_shoulder_roll_link, right_elbow_link, right_wrist_yaw_link]
+        gate_during_grail: true
+    tracking_relative_body_pos_lower:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_pos_error
+      weight: 0.125
+      params:
+        command_name: motion
+        std: 0.3
+        body_names: &tracking_lower_bodies
+          [pelvis, left_hip_roll_link, left_knee_link, left_ankle_roll_link,
+           right_hip_roll_link, right_knee_link, right_ankle_roll_link]
+        gate_during_grail: true
+    tracking_relative_body_ori_upper:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_ori_error
+      weight: 0.25
+      params:
+        command_name: motion
+        std: 0.4
+        body_names: *tracking_upper_bodies
+        gate_during_grail: true
+    tracking_relative_body_ori_lower:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_relative_body_ori_error
+      weight: 0.25
+      params:
+        command_name: motion
+        std: 0.4
+        body_names: *tracking_lower_bodies
+        gate_during_grail: true
+    tracking_body_linvel_upper:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_body_linvel_error
+      weight: 0.125
+      params:
+        command_name: motion
+        std: 1.0
+        body_names: *tracking_upper_bodies
+        gate_during_grail: true
+    tracking_body_linvel_lower:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_body_linvel_error
+      weight: 0.125
+      params:
+        command_name: motion
+        std: 1.0
+        body_names: *tracking_lower_bodies
+        gate_during_grail: true
+    tracking_body_angvel_upper:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
+      weight: 0.125
+      params:
+        command_name: motion
+        std: 3.14
+        body_names: *tracking_upper_bodies
+        gate_during_grail: true
+    tracking_body_angvel_lower:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:tracking_body_angvel_error
+      weight: 0.125
+      params:
+        command_name: motion
+        std: 3.14
+        body_names: *tracking_lower_bodies
+        gate_during_grail: true
+    # Before place_generated_start_frame, reward the lifted carry goal.
+    object_carry_goal_success:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_success
+      weight: 2.0
+      params:
+        command_name: motion
+        goal_type: carry
+        phase: before_generated
+        threshold: ${manager_env.recorders.object_position_success.threshold}
+    object_carry_goal_distance_after_contact:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:object_final_goal_distance_after_contact
+      weight: -1.5
+      params:
+        command_name: motion
+        goal_type: carry
+        phase: before_generated
+    # From place_generated_start_frame onward, reward target_object_poses_6d's goal.
+    object_final_goal_success:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_object_final_goal_success
+      weight: 4.0
+      params:
+        command_name: motion
+        goal_type: release
+        phase: after_generated
+        require_physical_release_after_request: true
+        threshold: ${manager_env.recorders.object_position_success.threshold}
+    object_final_goal_distance_after_contact: null
+    # Penalize distance throughout [generated start, release), without contact gating.
+    object_final_goal_distance_after_generated_start:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:object_final_goal_distance_after_generated_start
+      weight: -1.5
+      params:
+        command_name: motion
+        goal_type: release
+    hand_body_contact_penalty:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_hand_body_contact_penalty
+      weight: -1.0
+      params:
+        source_bodies: *hand_bodies
+        force_saturation: 1.0
+    body_table_contact_penalty:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:reward_hand_table_contact_penalty
+      weight: -1.0
+      params:
+        sensor_cfg:
+          _target_: isaaclab.managers.SceneEntityCfg
+          name: table_to_robot_contact_sensor
+        force_saturation: 1.0

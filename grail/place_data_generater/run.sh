@@ -135,4 +135,7 @@ CUDA_VISIBLE_DEVICES=0 bash grail/visualization/scripts/visualize.sh \
 test -s "$work/view/vis/$name.mp4"
 mkdir -p "$output/vis"
 mv -f -- "$work/view/vis/$name.mp4" "$output/vis/$name.mp4"
+python -m grail.visualization.batch_sparse_command_vis "$output" \
+  --motion "$name" --existing-only
 echo "Done: $output/vis/$name.mp4"
+echo "Sparse command video: $output/vis_sparse_command/$name.mp4"

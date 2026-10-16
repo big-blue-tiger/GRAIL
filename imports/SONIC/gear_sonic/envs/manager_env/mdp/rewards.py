@@ -82,11 +82,16 @@ class RewardsCfg:
     lift_reward = None
     lift_z_elevation = None
     hand_table_contact_penalty = None
+    hand_body_contact_penalty = None
+    body_table_contact_penalty = None
     # Object motion tracking reward (OmniGrasp-style r_t^obj)
     object_tracking_reward = None
     object_final_goal_distance = None
     object_final_goal_success = None
     object_final_goal_distance_after_contact = None
+    object_final_goal_distance_after_generated_start = None
+    object_carry_goal_success = None
+    object_carry_goal_distance_after_contact = None
     object_acc_l2 = None
     object_lift_contact_reward = None
     # Finger primitive action limit penalty
@@ -475,21 +480,16 @@ def tracking_body_ori_error(
     return torch.exp(-angular_err.square().mean(dim=-1) / (std * std))
 
 
-def _gate_tracking_before_grail(command, reward, gate_before_grail):
-    """Disable a tracking term at the reported GRAIL start of Kimodo motions."""
-    if not gate_before_grail:
+def _gate_tracking_during_grail(command, reward, gate_during_grail):
+    """Suppress tracking only in the metadata GRAIL interval."""
+    if not gate_during_grail:
         return reward
-    from gear_sonic.trl.modules.eval_residual_transition import KimodoTrackingBoundary
-
-    if not hasattr(command, "_kimodo_tracking_boundary"):
-        command._kimodo_tracking_boundary = KimodoTrackingBoundary()
-    active = command._kimodo_tracking_boundary.before_grail(command, reward.device)
-    return torch.where(active, reward, 0.0)
+    return torch.where(command.is_grail_tracking_phase(), 0.0, reward)
 
 
 def tracking_relative_body_pos_error(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None,
-    gate_before_grail: bool = False,
+    gate_during_grail: bool = False,
 ) -> torch.Tensor:
     """Compute body position tracking reward using anchor-relative reference positions.
 
@@ -510,12 +510,12 @@ def tracking_relative_body_pos_error(
     pos_diff = command.body_pos_relative_w[:, tracked] - command.robot_body_pos_w[:, tracked]
     per_body_err = (pos_diff * pos_diff).sum(dim=-1)
     reward = torch.exp(-per_body_err.mean(dim=-1) / (std * std))
-    return _gate_tracking_before_grail(command, reward, gate_before_grail)
+    return _gate_tracking_during_grail(command, reward, gate_during_grail)
 
 
 def tracking_relative_body_ori_error(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None,
-    gate_before_grail: bool = False,
+    gate_during_grail: bool = False,
 ) -> torch.Tensor:
     """Compute body orientation tracking reward using anchor-relative reference orientations.
 
@@ -538,7 +538,7 @@ def tracking_relative_body_ori_error(
         command.robot_body_quat_w[:, tracked],
     )
     reward = torch.exp(-angular_err.square().mean(dim=-1) / (std * std))
-    return _gate_tracking_before_grail(command, reward, gate_before_grail)
+    return _gate_tracking_during_grail(command, reward, gate_during_grail)
 
 
 def tracking_relative_body_ori_weighted_error(
@@ -589,7 +589,7 @@ def tracking_relative_body_ori_weighted_error(
 
 def tracking_body_linvel_error(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None,
-    gate_before_grail: bool = False,
+    gate_during_grail: bool = False,
 ) -> torch.Tensor:
     """Compute body linear velocity tracking reward using a Gaussian kernel.
 
@@ -609,12 +609,12 @@ def tracking_body_linvel_error(
     vel_diff = command.body_lin_vel_w[:, tracked] - command.robot_body_lin_vel_w[:, tracked]
     per_body_err = (vel_diff * vel_diff).sum(dim=-1)
     reward = torch.exp(-per_body_err.mean(dim=-1) / (std * std))
-    return _gate_tracking_before_grail(command, reward, gate_before_grail)
+    return _gate_tracking_during_grail(command, reward, gate_during_grail)
 
 
 def tracking_body_angvel_error(
     env: ManagerBasedRLEnv, command_name: str, std: float, body_names: list[str] | None = None,
-    gate_before_grail: bool = False,
+    gate_during_grail: bool = False,
 ) -> torch.Tensor:
     """Compute body angular velocity tracking reward using a Gaussian kernel.
 
@@ -634,7 +634,7 @@ def tracking_body_angvel_error(
     vel_diff = command.body_ang_vel_w[:, tracked] - command.robot_body_ang_vel_w[:, tracked]
     per_body_err = (vel_diff * vel_diff).sum(dim=-1)
     reward = torch.exp(-per_body_err.mean(dim=-1) / (std * std))
-    return _gate_tracking_before_grail(command, reward, gate_before_grail)
+    return _gate_tracking_during_grail(command, reward, gate_during_grail)
 
 
 def feet_contact_duration(
@@ -815,16 +815,24 @@ def anti_shake_ang_vel_l2(
 # ==================== HOI Manipulation Rewards ====================
 
 
-def _object_final_goal_distance(env, command_name, asset_cfg):
-    """Distance to the recorder's final world-frame object target, in meters."""
+def _object_final_goal_distance(env, command_name, asset_cfg, goal_type="release"):
+    """Distance to the selected metadata world target, in meters."""
     command = env.command_manager.get_term(command_name)
-    final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
-    target_pos_w = (
-        command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
-        + env.scene.env_origins
-    )
-    target_pos_w[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
+    if goal_type == "release":
+        target_pos_w, _ = command.get_release_target_pose()
+    elif goal_type == "carry":
+        target_pos_w, _ = command.get_carry_target_pose()
+    else:
+        raise ValueError(f"Unknown object goal type: {goal_type!r}")
     return torch.norm(env.scene[asset_cfg.name].data.root_pos_w - target_pos_w, dim=-1)
+
+
+def _object_goal_phase_mask(command, phase):
+    """Gate at the metadata generated-start frame; the boundary belongs to after."""
+    if phase not in ("before_generated", "after_generated"):
+        raise ValueError(f"Unknown object goal phase: {phase!r}")
+    generated = command.is_place_generated_phase()
+    return ~generated if phase == "before_generated" else generated
 
 
 def reward_object_final_goal_success(
@@ -832,27 +840,72 @@ def reward_object_final_goal_success(
     command_name: str = "motion",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     threshold: float = 0.1,
+    goal_type: str = "release",
+    phase: str | None = None,
+    require_physical_release_after_request: bool = False,
 ) -> torch.Tensor:
-    """Reward each step inside the success radius; use the recorder's strict bound."""
-    return (_object_final_goal_distance(env, command_name, asset_cfg) < threshold).float()
+    """Reward goal proximity before release and successful release afterward.
+
+    With release checking enabled, remember reaching the goal during the selected
+    phase before the drop request. From the release frame onward, reward requires
+    that arrival history and current confirmed physical release; the object may
+    fall outside the goal radius. Arrival history resets with each environment.
+    Without release checking, retain the original per-step distance criterion.
+    """
+    command = env.command_manager.get_term(command_name)
+    in_goal = _object_final_goal_distance(env, command_name, asset_cfg, goal_type) < threshold
+    active = _object_goal_phase_mask(command, phase) if phase is not None else torch.ones_like(in_goal)
+    if require_physical_release_after_request:
+        release = command.is_release_phase()
+        state = command.sparse_command_state
+        state.release_goal_reached |= active & ~release & in_goal
+        success = torch.where(
+            release, state.release_goal_reached & command.is_physically_released(), in_goal
+        )
+    else:
+        success = in_goal
+    return (active & success).float()
 
 
 def object_final_goal_distance_after_contact(
     env: ManagerBasedRLEnv,
     command_name: str = "motion",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    goal_type: str = "release",
+    phase: str | None = None,
 ) -> torch.Tensor:
     """Linear distance cost after first reference contact; use a negative weight.
 
     Compare absolute motion steps, including randomized motion start offsets.
-    The gate stays active after reference contact is released.
+    The contact gate stays active after reference contact is released. An
+    optional generated-start phase gate also restricts the selected goal.
     """
     command = env.command_manager.get_term(command_name)
     after_contact = (
         command.motion_start_time_steps + command.time_steps > command._per_env_first_contact
     )
-    distance = _object_final_goal_distance(env, command_name, asset_cfg)
+    if phase is not None:
+        after_contact &= _object_goal_phase_mask(command, phase)
+    distance = _object_final_goal_distance(env, command_name, asset_cfg, goal_type)
     return torch.where(after_contact, distance, 0.0)
+
+
+def object_final_goal_distance_after_generated_start(
+    env: ManagerBasedRLEnv,
+    command_name: str = "motion",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    goal_type: str = "release",
+) -> torch.Tensor:
+    """Linear distance cost from generated start until reference release.
+
+    Include the generated-start frame and stop at the first release frame
+    (drop button >= 0.5), independently of reference or physical hand contact.
+    Use a negative weight. Both phase queries include random start offsets.
+    """
+    command = env.command_manager.get_term(command_name)
+    active = command.is_place_generated_phase() & ~command.is_release_phase()
+    distance = _object_final_goal_distance(env, command_name, asset_cfg, goal_type)
+    return torch.where(active, distance, 0.0)
 
 
 def reward_object_final_goal_distance(
@@ -863,7 +916,7 @@ def reward_object_final_goal_distance(
     gate_with_contact_label: bool = False,
     hand: str = "right_hand",
 ) -> torch.Tensor:
-    """Reward proximity to the last-frame object position.
+    """Reward proximity to the release-before-fall object position.
 
     Match target_object_poses_6d's world-frame target, including environment
     origins and the configured object height offset. Distance is in meters.
@@ -871,12 +924,7 @@ def reward_object_final_goal_distance(
     reward becomes zero again when that label turns off.
     """
     command: TrackingCommand = env.command_manager.get_term(command_name)
-    final_steps = command.motion_lib.get_time_step_total(command.motion_ids) - 1
-    target_pos_w = (
-        command.motion_lib.get_object_root_pos(command.motion_ids, final_steps)[:, 0]
-        + env.scene.env_origins
-    )
-    target_pos_w[:, 2] += getattr(command.cfg, "object_z_offset", 0.0)
+    target_pos_w, _ = command.get_release_target_pose()
     current_pos_w = env.scene[asset_cfg.name].data.root_pos_w[:, :3]
     distance = torch.norm(current_pos_w - target_pos_w, dim=-1)
     reward = torch.exp(exp_coeff * distance)
@@ -990,6 +1038,7 @@ def reward_grasp(
     anti_contact_factor: float | None = None,
     hand: str = "right_hand",
     command_name: str = "motion",
+    disable_after_release: bool = False,
 ) -> torch.Tensor:
     """Compute reward for successful grasp based on finger contact count.
 
@@ -1007,6 +1056,7 @@ def reward_grasp(
             contact label is active for the given hand.
         hand: Which hand's contact label to use ("left_hand" or "right_hand").
         command_name: Name of the tracking command term.
+        disable_after_release: Stop rewarding grasp at the reference drop request.
 
     Returns:
         Reward tensor of shape (num_envs,) in [0, 1].
@@ -1045,6 +1095,9 @@ def reward_grasp(
         else:
             reward_out = reward * in_contact_f
 
+    if disable_after_release:
+        command = env.command_manager.get_term(command_name)
+        reward_out = torch.where(command.is_release_phase(), 0.0, reward_out)
     return reward_out
 
 
@@ -1483,8 +1536,25 @@ def reward_lift_z_elevation(env: ManagerBasedRLEnv) -> torch.Tensor:
     return torch.clamp(obj_z - 0.8, min=0, max=0.3)
 
 
+def filtered_contact_force_sum(env, sensor_names):
+    """Sum pair-filtered contact-force magnitudes across configured sensors.
+
+    Return one nonnegative force magnitude [N] in newtons per environment.
+    Take the vector norm of each filtered contact pair and sum across sensor
+    bodies, filtered bodies and sensors. A missing force matrix raises an
+    error; unfiltered net forces are never substituted.
+    """
+    total = torch.zeros(env.num_envs, device=env.device)
+    for name in sensor_names:
+        force = env.scene[name].data.force_matrix_w
+        if force is None:
+            raise RuntimeError(f"{name}: a pair-filtered contact force matrix is required")
+        total += torch.linalg.vector_norm(force, dim=-1).sum(dim=(-1, -2))
+    return total
+
+
 def reward_hand_table_contact_penalty(
-    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, force_saturation: float = 1.0,
 ) -> torch.Tensor:
     """Compute penalty for hand contacting the table surface.
 
@@ -1499,11 +1569,21 @@ def reward_hand_table_contact_penalty(
     Returns:
         Penalty tensor of shape (num_envs,) in [0, 1]. Clamped total force magnitude.
     """
-    sensor: ContactSensor = env.scene[sensor_cfg.name]
-    # force_matrix_w: [num_envs, num_sensor_bodies, num_filter_bodies, 3]
-    contact_force = sensor.data.force_matrix_w
-    force_magnitude = torch.norm(contact_force, dim=-1).sum(dim=(-1, -2))
-    return torch.clamp(force_magnitude, max=1.0)
+    return (filtered_contact_force_sum(env, [sensor_cfg.name]) / force_saturation).clamp(max=1.0)
+
+
+def reward_hand_body_contact_penalty(
+    env: ManagerBasedRLEnv, source_bodies: list[str], force_saturation: float = 1.0,
+) -> torch.Tensor:
+    """Penalize filtered contacts between configured hand links and robot bodies.
+
+    Read one hand_body_contact_<body> sensor for each source link and sum
+    pairwise force magnitudes in newtons. Divide by force_saturation and clamp
+    to one, returning a dimensionless cost [N]. Use a negative reward weight;
+    robot-body filters and joint-neighbor exclusions are set by the scene.
+    """
+    sensors = [f"hand_body_contact_{body}" for body in source_bodies]
+    return (filtered_contact_force_sum(env, sensors) / force_saturation).clamp(max=1.0)
 
 
 def object_tracking_reward(
@@ -1819,6 +1899,8 @@ def reward_approach_velocity_penalty(
     contact_threshold: float = 0.1,
     min_contacts: int = 3,
     disable_after_contact: bool = True,
+    command_name: str = "motion",
+    disable_after_generated_start: bool = False,
 ) -> torch.Tensor:
     """Penalize high wrist velocity near the object to prevent swatting.
 
@@ -1841,6 +1923,8 @@ def reward_approach_velocity_penalty(
         min_contacts: Minimum finger contacts to count as "grasping".
         disable_after_contact: If True, penalty turns off after grasp. If False,
             penalty stays active during grasp.
+        command_name: Name of the tracking command term.
+        disable_after_generated_start: Disable from the generated place boundary onward.
 
     Returns:
         Penalty tensor of shape (num_envs,). Positive values (use negative weight).
@@ -1890,6 +1974,9 @@ def reward_approach_velocity_penalty(
 
     # Final penalty: velocity^2 * distance_factor * contact_gate
     penalty = velocity_sq * distance_factor * contact_gate
+    if disable_after_generated_start:
+        command = env.command_manager.get_term(command_name)
+        penalty = torch.where(command.is_place_generated_phase(), 0.0, penalty)
 
     return penalty
 

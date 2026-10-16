@@ -22,6 +22,79 @@ from gear_sonic.trl.utils import common
 from gear_sonic.utils.motion_lib import skeleton
 
 
+def source_frame_indices(start, end, target_frames, source_fps, target_fps):
+    """Map target frame times to source indices within a cropped motion.
+
+    Return an integer array of length target_frames. Use zero-order hold at
+    floor(t * source_fps), offset by start and clamped to end - 1. Source
+    intervals retain their duration when changing FPS; no timeline stretching
+    or interpolation across carry/release boundaries is performed.
+    """
+    indices = start + np.floor(np.arange(target_frames) * source_fps / target_fps + 1e-9).astype(int)
+    return np.minimum(indices, end - 1)
+
+
+def sample_sparse_labels(motion, start, end, target_frames, target_fps, name):
+    """Validate and sample offline commands on the cropped robot timeline.
+
+    Require finite float32 source arrays [T,2] for dx/turn-stage yaw commands and
+    [T,1] for the drop button. Return copies sampled at actual target frame
+    times using zero-order hold over [start,end). Invalid shapes, missing
+    labels or invalid timing raise ValueError including the motion name.
+    """
+    total = len(motion["root_trans_offset"])
+    fps = float(motion["fps"])
+    if (not 0 <= start < end <= total or target_frames < 1
+            or not np.isfinite(fps) or not np.isfinite(target_fps) or fps <= 0 or target_fps <= 0):
+        raise ValueError(f"{name}: invalid sparse label time interval")
+    indices = source_frame_indices(start, end, target_frames, fps, target_fps)
+    result = {}
+    for field, dim in (("policy_command_x_yaw", 2), ("policy_command_drop_button", 1)):
+        if field not in motion:
+            raise ValueError(f"{name}: missing required {field}")
+        values = motion[field]
+        if (not isinstance(values, np.ndarray) or values.shape != (total, dim)
+                or values.dtype != np.float32 or not np.isfinite(values).all()):
+            raise ValueError(f"{name}: {field} must be finite float32 [{total},{dim}]")
+        result[field] = values[indices].copy()
+    return result
+
+
+def read_object_goal_pose(meta, prefix, motion_name, meta_path):
+    """Read a finite world position and unit wxyz quaternion from metadata."""
+    values = []
+    for suffix, dim in (("pos_w", 3), ("quat_w", 4)):
+        field = f"{prefix}_{suffix}"
+        if field not in meta:
+            raise ValueError(f"{motion_name}: missing required {field} in {meta_path}")
+        value = np.asarray(meta[field], dtype=np.float32)
+        if value.shape != (dim,) or not np.isfinite(value).all():
+            raise ValueError(f"{motion_name}: invalid {field} in {meta_path}")
+        values.append(value.copy())
+    if not np.isclose(np.linalg.norm(values[1]), 1, atol=1e-4):
+        raise ValueError(f"{motion_name}: {prefix} must have a unit wxyz quaternion in {meta_path}")
+    return tuple(values)
+
+
+def read_place_generated_start_frame(meta, total_frames, motion_name, meta_path):
+    """Require a generated-start source frame inside the complete motion."""
+    frame = meta.get("place_generated_start_frame")
+    if (isinstance(frame, (bool, np.bool_)) or not isinstance(frame, (int, np.integer))
+            or not 0 <= frame < total_frames):
+        raise ValueError(f"{motion_name}: invalid or missing place_generated_start_frame in {meta_path}")
+    return int(frame)
+
+
+def read_grail_start_frame(meta, total_frames, motion_name, meta_path):
+    """Require a GRAIL start no later than the place-generated source start."""
+    generated_start = read_place_generated_start_frame(meta, total_frames, motion_name, meta_path)
+    frame = meta.get("grail_start_frame")
+    if (isinstance(frame, (bool, np.bool_)) or not isinstance(frame, (int, np.integer))
+            or not 0 <= frame <= generated_start):
+        raise ValueError(f"{motion_name}: invalid or missing grail_start_frame in {meta_path}")
+    return int(frame)
+
+
 def interleave_keys_by_object(keys):
     """Reorder motion keys so objects are interleaved: Oa_m0, Ob_m0, ..., Oa_m1, Ob_m1, ...
 
@@ -644,6 +717,51 @@ class MotionLibBase:
     def get_time_step_total(self, motion_ids):
         return self._motion_num_frames[motion_ids]
 
+    def get_sparse_commands(self, motion_ids, motion_steps):
+        """Read current displacement commands and drop buttons from loaded motions.
+
+        Return device tensors [N,2] in meters/radians and [N,1] buttons.
+        motion_steps are absolute frame indices within each loaded motion,
+        including the caller's random start offset. Read the current library
+        tensors so motion reloads do not leave cached labels behind.
+        """
+        indices = self.length_starts[motion_ids] + motion_steps
+        return self._policy_command_x_yaw[indices], self._policy_command_drop_button[indices]
+
+    def get_release_target_pose(self, motion_ids):
+        """Read the annotated object target immediately before reference release.
+
+        Return positions [N,3] in meters and wxyz quaternions [N,4] for source
+        frame b - 1. Positions follow the library's world frame, including
+        zero_root_xy translation when enabled, but exclude environment origins
+        and the configured object height offset applied by TrackingCommand.
+        """
+        return self._release_target_pos[motion_ids], self._release_target_quat[motion_ids]
+
+    def get_carry_target_pose(self, motion_ids):
+        """Read place_object_carry_goal from meta in the library's world frame.
+
+        Like the release goal, positions include zero_root_xy translation but
+        exclude environment origins and the configured object height offset.
+        """
+        if not self.m_cfg.get("load_carry_target_pose", False):
+            raise ValueError("Carry goal observations require load_carry_target_pose=True")
+        return self._carry_target_pos[motion_ids], self._carry_target_quat[motion_ids]
+
+    def is_place_generated_phase(self, motion_ids, motion_steps):
+        """Compare current loaded-motion steps with the resampled metadata boundary."""
+        if not self.m_cfg.get("load_place_generated_phase", False):
+            raise ValueError("Staged object rewards require load_place_generated_phase=True")
+        return motion_steps >= self._place_generated_start_steps[motion_ids]
+
+    def is_grail_tracking_phase(self, motion_ids, motion_steps):
+        """Mask the resampled/cropped interval [GRAIL start, generated start)."""
+        if not self.m_cfg.get("load_grail_tracking_phase", False):
+            raise ValueError("GRAIL tracking gates require load_grail_tracking_phase=True")
+        return (motion_steps >= self._grail_start_steps[motion_ids]) & (
+            motion_steps < self._place_generated_start_steps[motion_ids]
+        )
+
     @property
     def body_indexes(self):
         return self.m_cfg.get("body_indexes_data", None)
@@ -1209,6 +1327,14 @@ class MotionLibBase:
         _motion_object_in_contact_right = []
         _motion_hand_action_left = []
         _motion_hand_action_right = []
+        sparse_x_yaw = []
+        sparse_drop = []
+        release_target_pos = []
+        release_target_quat = []
+        carry_target_pos = []
+        carry_target_quat = []
+        place_generated_start_steps = []
+        grail_start_steps = []
 
         total_len = 0.0
         self.num_joints = len(self.skeleton_tree.node_names)
@@ -1249,6 +1375,25 @@ class MotionLibBase:
         logger.info(f"Current motion keys: {self.curr_motion_keys[:10]}, ....")
 
         motion_data_list = self._motion_data_list[sample_idxes.cpu().numpy()]
+        # Validate selected labels and goals in the parent process: missing data must
+        # raise directly, rather than kill an FK worker while its queue is awaited.
+        for source in motion_data_list:
+            if "path" in source:
+                name = Path(source["path"]).stem
+                raw = next(iter(joblib.load(source["path"]).values()))
+            else:
+                name, raw = str(self.m_cfg.motion_file), source
+            sample_sparse_labels(raw, 0, len(raw["root_trans_offset"]), 1, self.target_fps, name)
+            source_path = Path(source["path"]) if "path" in source else Path(self.m_cfg.motion_file)
+            meta_path = source_path.parent.parent / "meta" / f"{source_path.stem}.pkl"
+            meta = joblib.load(meta_path)
+            read_object_goal_pose(meta, "place_object_goal", source_path.stem, meta_path)
+            if self.m_cfg.get("load_carry_target_pose", False):
+                read_object_goal_pose(meta, "place_object_carry_goal", source_path.stem, meta_path)
+            if self.m_cfg.get("load_place_generated_phase", False):
+                read_place_generated_start_frame(meta, len(raw["root_trans_offset"]), source_path.stem, meta_path)
+            if self.m_cfg.get("load_grail_tracking_phase", False):
+                read_grail_start_frame(meta, len(raw["root_trans_offset"]), source_path.stem, meta_path)
         if self.smpl_data is not None:
             smpl_data_list = [self.smpl_data[idx] for idx in sample_idxes.cpu().numpy()]
         else:
@@ -1486,6 +1631,17 @@ class MotionLibBase:
             motion_fps = int(curr_motion.fps * self.motion_fps_scale)
             curr_dt = 1.0 / motion_fps
             num_frames = curr_motion.global_rotation.shape[0]
+            sparse_x_yaw.append(curr_motion.policy_command_x_yaw)
+            sparse_drop.append(curr_motion.policy_command_drop_button)
+            release_target_pos.append(curr_motion.release_target_pos)
+            release_target_quat.append(curr_motion.release_target_quat)
+            if self.m_cfg.get("load_carry_target_pose", False):
+                carry_target_pos.append(curr_motion.carry_target_pos)
+                carry_target_quat.append(curr_motion.carry_target_quat)
+            if self.m_cfg.get("load_place_generated_phase", False) or self.m_cfg.get("load_grail_tracking_phase", False):
+                place_generated_start_steps.append(curr_motion.place_generated_start_step)
+            if self.m_cfg.get("load_grail_tracking_phase", False):
+                grail_start_steps.append(curr_motion.grail_start_step)
 
             curr_len = 1.0 / motion_fps * (num_frames - 1)
 
@@ -1534,27 +1690,28 @@ class MotionLibBase:
                 if "object_in_contact_right" in curr_motion:
                     _motion_object_in_contact_right.append(curr_motion["object_in_contact_right"])
                 if "hand_action_left" in motion_file_data:
-                    raw_action = motion_file_data["hand_action_left"]
-                    # Nearest-neighbor interpolation to match target fps
-                    src_len = len(raw_action)
-                    if src_len != num_frames:
-                        indices = np.round(np.linspace(0, src_len - 1, num_frames)).astype(int)
-                        raw_action = raw_action[indices]
-                    _motion_hand_action_left.append(raw_action)
+                    _motion_hand_action_left.append(curr_motion.hand_action_left)
                 if "hand_action_right" in motion_file_data:
-                    raw_action = motion_file_data["hand_action_right"]
-                    # Nearest-neighbor interpolation to match target fps
-                    src_len = len(raw_action)
-                    if src_len != num_frames:
-                        indices = np.round(np.linspace(0, src_len - 1, num_frames)).astype(int)
-                        raw_action = raw_action[indices]
-                    _motion_hand_action_right.append(raw_action)
+                    _motion_hand_action_right.append(curr_motion.hand_action_right)
             del curr_motion
 
         self._motion_lengths = torch.tensor(
             _motion_lengths, device=self._device, dtype=torch.float32
         )
         self._motion_fps = torch.tensor(_motion_fps, device=self._device, dtype=torch.float32)
+        self._policy_command_x_yaw = torch.as_tensor(np.concatenate(sparse_x_yaw), device=self._device)
+        self._policy_command_drop_button = torch.as_tensor(np.concatenate(sparse_drop), device=self._device)
+        self._release_target_pos = torch.as_tensor(np.stack(release_target_pos), device=self._device)
+        self._release_target_quat = torch.as_tensor(np.stack(release_target_quat), device=self._device)
+        if self.m_cfg.get("load_carry_target_pose", False):
+            self._carry_target_pos = torch.as_tensor(np.stack(carry_target_pos), device=self._device)
+            self._carry_target_quat = torch.as_tensor(np.stack(carry_target_quat), device=self._device)
+        if self.m_cfg.get("load_place_generated_phase", False) or self.m_cfg.get("load_grail_tracking_phase", False):
+            self._place_generated_start_steps = torch.tensor(
+                place_generated_start_steps, device=self._device, dtype=torch.long
+            )
+        if self.m_cfg.get("load_grail_tracking_phase", False):
+            self._grail_start_steps = torch.tensor(grail_start_steps, device=self._device, dtype=torch.long)
         self._motion_bodies = torch.stack(_motion_bodies).to(self._device).type(torch.float32)
         self._motion_aa = torch.tensor(
             np.concatenate(_motion_aa), device=self._device, dtype=torch.float32
@@ -1692,6 +1849,9 @@ class MotionLibBase:
                 start = self.length_starts[i]
                 end = start + self._motion_num_frames[i]
                 init_xy = self.body_pos_w[start, 0, :2].clone()  # root body, XY
+                self._release_target_pos[i, :2] -= init_xy
+                if self.m_cfg.get("load_carry_target_pose", False):
+                    self._carry_target_pos[i, :2] -= init_xy
                 print(  # noqa: T201
                     f"  Motion {i}: init_xy=[{init_xy[0]:.3f}, {init_xy[1]:.3f}], frames={self._motion_num_frames[i]}"  # noqa: E501
                 )
@@ -1925,6 +2085,8 @@ class MotionLibBase:
             curr_id = ids[f]  # id for this datasample
 
             curr_file = motion_data_list[f]
+            source_path = Path(curr_file["path"]) if "path" in curr_file else Path(self.m_cfg.motion_file)
+            motion_name = source_path.stem
             if "path" in curr_file:
                 curr_file, *_ = joblib.load(
                     curr_file["path"]
@@ -2294,6 +2456,34 @@ class MotionLibBase:
                         for k, v in curr_motion.items()
                     }
                 )
+                labels = sample_sparse_labels(
+                    curr_file, start, end, curr_motion.global_rotation.shape[0],
+                    self.target_fps, motion_name,
+                )
+                curr_motion.update(labels)
+                label_indices = source_frame_indices(
+                    start, end, curr_motion.global_rotation.shape[0], curr_file["fps"], self.target_fps
+                )
+                for hand_field in ("hand_action_left", "hand_action_right"):
+                    if hand_field in curr_file:
+                        curr_motion[hand_field] = curr_file[hand_field][label_indices]
+                meta_path = source_path.parent.parent / "meta" / f"{motion_name}.pkl"
+                meta = joblib.load(meta_path)
+                curr_motion.release_target_pos, curr_motion.release_target_quat = read_object_goal_pose(
+                    meta, "place_object_goal", motion_name, meta_path
+                )
+                if self.m_cfg.get("load_carry_target_pose", False):
+                    curr_motion.carry_target_pos, curr_motion.carry_target_quat = read_object_goal_pose(
+                        meta, "place_object_carry_goal", motion_name, meta_path
+                    )
+                if self.m_cfg.get("load_place_generated_phase", False) or self.m_cfg.get("load_grail_tracking_phase", False):
+                    generated_start = read_place_generated_start_frame(meta, seq_len, motion_name, meta_path)
+                    # First loaded frame whose source index reaches the boundary.
+                    # A crop wholly after/before it yields 0/num_frames respectively.
+                    curr_motion.place_generated_start_step = int(np.searchsorted(label_indices, generated_start))
+                if self.m_cfg.get("load_grail_tracking_phase", False):
+                    grail_start = read_grail_start_frame(meta, seq_len, motion_name, meta_path)
+                    curr_motion.grail_start_step = int(np.searchsorted(label_indices, grail_start))
                 # add "action" to curr_motion
                 if self.has_action:
                     curr_motion.action = to_torch(curr_file["action"]).clone()[start:end]

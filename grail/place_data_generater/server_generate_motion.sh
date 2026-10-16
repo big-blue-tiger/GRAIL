@@ -15,7 +15,7 @@ export HF_HUB_OFFLINE=1
 export TEXT_ENCODER_MODE=local
 export TEXT_ENCODER_DTYPE=float32
 export TEXT_ENCODER_DEVICE=cpu
-shared=/workspace/kimodo/data/wostep/place_walk
+shared=/workspace/kimodo/data/wostep/place_walk_1010
 mkdir -p "$shared/motions"
 
 echo "[2/3] 使用 GPU 1 batch 生成动作，每批 $batch_size 条"

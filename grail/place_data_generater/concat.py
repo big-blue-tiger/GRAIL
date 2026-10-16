@@ -23,6 +23,137 @@ from grail.place_data_generater.g1_kinematics import (
 )
 
 
+COMMAND_FIELDS = {"policy_command_x_yaw", "policy_command_xy_yaw", "policy_command_drop_button"}
+YAW_TURN_THRESHOLD_RAD = 0.2
+YAW_JITTER_RAD = 0.02
+YAW_PAUSE_S = 0.2
+YAW_LIMIT_RAD = 1.5 * np.pi
+
+
+def turn_stage_commands(yaw, fps):
+    """Fill each same-direction turn with its signed total angle.
+
+    Unwrap headings, merge same-direction runs across gaps of at most 0.2 s
+    with at most 0.02 rad deviation, and retain turns strictly above 0.2 rad.
+    A stage spans [start,end): end is the heading endpoint, not another turn
+    frame. Small pauses/reversals inside a merged stage share its command.
+    """
+    yaw = np.unwrap(yaw)
+    delta = np.diff(yaw)
+    signs = np.sign(np.where(np.abs(delta) > 1e-6, delta, 0))
+    edges = np.r_[0, np.flatnonzero(np.diff(signs)) + 1, len(delta)]
+    runs = [(int(s), int(e)) for s, e in zip(edges[:-1], edges[1:]) if s < e]
+    commands = np.zeros(len(yaw), dtype=np.float32)
+    stages = []
+    i = 0
+    while i < len(runs):
+        start, end = runs[i]
+        direction = signs[start]
+        if direction == 0:
+            i += 1
+            continue
+        j = i + 1
+        while j < len(runs):
+            next_start, next_end = runs[j]
+            if next_start - end > round(YAW_PAUSE_S * fps):
+                break
+            if np.max(np.abs(yaw[end:next_start + 1] - yaw[end])) > YAW_JITTER_RAD:
+                break
+            if signs[next_start] == direction:
+                end = next_end
+                i = j
+            j += 1
+        total = float(yaw[end] - yaw[start])
+        if abs(total) > YAW_TURN_THRESHOLD_RAD:
+            commands[start:end] = np.clip(total, -YAW_LIMIT_RAD, YAW_LIMIT_RAD)
+            stages.append({"start_frame": start, "end_frame_exclusive": end,
+                           "total_yaw_rad": total})
+        i += 1
+    return commands, stages
+
+
+def generate_sparse_commands(robot, objects, meta, name, *, lookahead_s=0.5):
+    """Generate carry displacements and release buttons on the final timeline.
+
+    Read robot positions [T,3] and xyzw root quaternions [T,4]. Require annotated
+    boundaries 0 <= a < b < T. Return float32 [dx,dyaw] commands [T,2] in meters/
+    radians and buttons [T,1]; commands are active only in [a,b), and buttons
+    become one from b onward. Only dx looks ahead by lookahead_s; yaw is the
+    signed total of each turn stage above 0.2 rad, limited to +/-1.5*pi.
+    Preserve the previous XY deadzone/length limit before selecting dx.
+
+    Also return generation parameters, the object's position and wxyz attitude
+    at b - 1, and nonzero-command counts. Inputs are not mutated, commands are
+    not divided by time, and invalid data raise ValueError with the motion name.
+    """
+    try:
+        pos = np.asarray(robot["root_trans_offset"])
+        quat = np.asarray(robot["root_rot"])
+        fps = float(robot["fps"])
+        a = meta["place_generated_start_frame"]
+        b = meta["place_release_start_frame"]
+        total = len(pos)
+        if (any(isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, np.integer))
+                for v in (a, b)) or not 0 <= a < b < total):
+            raise ValueError(f"require 0 <= a < b < T; got {a}, {b}, {total}")
+        if (pos.shape != (total, 3) or quat.shape != (total, 4)
+                or not np.isfinite(pos).all() or not np.isfinite(quat).all()
+                or not np.allclose(np.linalg.norm(quat, axis=1), 1, atol=1e-4)):
+            raise ValueError("invalid root positions or xyzw unit quaternions")
+        if not np.isfinite(fps) or fps <= 0 or not np.isfinite(lookahead_s) or lookahead_s <= 0:
+            raise ValueError("fps and lookahead_s must be finite and positive")
+        obj_pos = np.asarray(objects["root_pos"])
+        obj_quat = np.asarray(objects["root_quat"])
+        if (obj_pos.shape != (total, 1, 3) or obj_quat.shape != (total, 1, 4)
+                or float(objects["fps"]) != fps or not np.isfinite(obj_pos).all()
+                or not np.isfinite(obj_quat).all()
+                or not np.allclose(np.linalg.norm(obj_quat, axis=-1), 1, atol=1e-4)):
+            raise ValueError("expected matching finite single-object trajectory with unit wxyz quaternions")
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"{name}: {error}") from error
+
+    horizon = max(1, round(lookahead_s * fps))
+    rot = Rotation.from_quat(quat).as_matrix()
+    yaw = np.arctan2(rot[:, 1, 0], rot[:, 0, 0])
+    t = np.arange(a, b)
+    j = np.minimum(t + horizon, b - 1)
+    delta = pos[j, :2] - pos[t, :2]
+    c, s = np.cos(yaw[t]), np.sin(yaw[t])
+    xy = np.column_stack((c * delta[:, 0] + s * delta[:, 1],
+                          -s * delta[:, 0] + c * delta[:, 1]))
+    length = np.linalg.norm(xy, axis=1)
+    xy[length < 0.02] = 0
+    xy *= np.minimum(1, 0.15 / np.maximum(length, 1e-12))[:, None]
+    dyaw, stages = turn_stage_commands(yaw[a:b], fps)
+    for stage in stages:
+        stage["start_frame"] += a
+        stage["end_frame_exclusive"] += a
+    command = np.zeros((total, 2), dtype=np.float32)
+    command[t] = np.column_stack((xy[:, 0], dyaw))
+    drop = np.zeros((total, 1), dtype=np.float32)
+    drop[b:] = 1
+    translation = command[:, 0] != 0
+    turning = command[:, 1] != 0
+    additions = {
+        "place_object_goal_pos_w": obj_pos[b - 1, 0].copy(),
+        "place_object_goal_quat_w": obj_quat[b - 1, 0].copy(),
+        "sparse_command_parameters": {
+            "lookahead_s": lookahead_s, "horizon_frames": horizon,
+            "xy_deadzone_m": 0.02, "xy_limit_m": 0.15,
+            "command_channels": ["dx", "dyaw"], "yaw_mode": "turn_stage_total",
+            "yaw_turn_threshold_rad": YAW_TURN_THRESHOLD_RAD,
+            "yaw_jitter_rad": YAW_JITTER_RAD, "yaw_pause_s": YAW_PAUSE_S,
+            "yaw_limit_rad": float(YAW_LIMIT_RAD),
+            "root_quaternion_order": "xyzw", "goal_frame": b - 1,
+        },
+    }
+    stats = {"nonzero_translation_frames": int(translation.sum()),
+             "nonzero_yaw_frames": int(turning.sum()),
+             "combined_command_frames": int((translation & turning).sum()),
+             "release_frames": total - b, "turn_stages": stages}
+    return {"policy_command_x_yaw": command, "policy_command_drop_button": drop}, additions, stats
+
+
 def resample_qpos(qpos, source_fps, output_fps):
     """重采样 Z-up/wxyz qpos (T,36):位置和关节角线性插值,root 旋转用 SLERP。"""
     times = np.arange(len(qpos)) / source_fps
@@ -177,6 +308,8 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     robot_path = dataset / "robot" / f"{name}.pkl"
     object_path = dataset / "objects" / f"{name}.pkl"
     motion_key, robot = load_single(robot_path)
+    # Derived labels belong to the final timeline, never to an input segment.
+    robot = {key: value for key, value in robot.items() if key not in COMMAND_FIELDS}
     object_key, objects = load_single(object_path)
     source_frames = validate_fields(robot, "robot")
     if motion_key != object_key or str(motion_key) != record["motion_key"] or validate_fields(objects, "object") != source_frames:
@@ -285,6 +418,10 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
                 place_trimmed_source_frames=source_frames-n,
                 place_carry_source_frame=record["carry_source_frame"],
                 place_lower_source_frame=record["lower_source_frame"])
+    labels, sparse_meta, sparse_stats = generate_sparse_commands(robot_out, objects_out, meta, name)
+    robot_out.update(labels)
+    meta.update(sparse_meta)
+    validate_fields(robot_out, "robot")
     report = {"name": name, "source_frames": source_frames,
               "retained_source_frames": n, "trimmed_source_frames": source_frames-n,
               "transition_frames": join_frames,
@@ -317,6 +454,7 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
               "contact_points_policy": "carry-frame right-hand contact points through transition, generated motion and hold; no appended left-hand or release contacts",
               "right_hand_hold_action": 1}
     report["grasp_orientation_policy"] = "generated palm rotation; no local IK correction"
+    report["sparse_command"] = sparse_stats
     report["right_hand_opening_policy"] = "final 0.7 s: open action and zero right finger joint positions"
     for path in outputs:
         path.parent.mkdir(parents=True, exist_ok=True)

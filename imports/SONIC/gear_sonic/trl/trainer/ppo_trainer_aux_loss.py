@@ -107,6 +107,12 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             object_pos_deviation,
         )
 
+        from gear_sonic.trl.modules.eval_residual_transition import PlaceCarryBoundary
+
+        self._teacher_loss_carry_boundary = PlaceCarryBoundary()
+        self._teacher_loss_command_name = self.config.get(
+            "teacher_termination_loss_override", {}
+        ).get("command_name", "motion")
         checkpoint = self.config.get("teacher_checkpoint")
         if not checkpoint:
             raise ValueError("teacher_termination_loss_override requires teacher_checkpoint")
@@ -144,7 +150,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                     self._student_loss_termination_params[name] = destination[-1][1]
 
     def _rollout_teacher_termination_mask(self):
-        """Evaluate the current observation's state, independently on every step."""
+        """Suppress BC for teacher-only pose failures strictly before carry."""
         if not self.teacher_termination_loss_override_enabled:
             return None
         env = self.env.env
@@ -154,7 +160,10 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
             teacher_exceeded |= func(env, **params)
         for func, params in self._student_loss_termination_terms:
             student_exceeded |= func(env, **params)
-        return (teacher_exceeded & ~student_exceeded).detach().clone()
+        command = env.command_manager.get_term(self._teacher_loss_command_name)
+        before_carry = self._teacher_loss_carry_boundary.before_carry(command, env.device)
+        mask = teacher_exceeded & ~student_exceeded & before_carry
+        return mask.detach().clone()
 
     def _get_ppo_bc_loss_coefs(self):
         """Return the complementary PPO/BC coefficients for the current iteration.
