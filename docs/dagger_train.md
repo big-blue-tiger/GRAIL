@@ -101,16 +101,17 @@ python gear_sonic/train_agent_trl.py \
 CUDA_VISIBLE_DEVICES=2 python gear_sonic/train_agent_trl.py \
   +exp=manager/universal_token/distill/robocasa_carry_table \
   headless=True \
-  num_envs=9216 \
-  experiment_name=1016robocasa_carry_table \
+  num_envs=10240 \
+  experiment_name=1020robocasa_carry_table \
   manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/object_usd \
   manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/robot \
   manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/objects \
   manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.num_learning_iterations=15000 \
+  algo.config.num_learning_iterations=30000 \
   algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
+    ++manager_env.config.gpu_collision_stack_size_exp=31 \
   algo.config.ppo_bc_loss_schedule.bc_min_coef=0.04
 ```
 
@@ -335,15 +336,14 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.config.render_results=True \
   ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/03055Termination_walk-reference-free-book \
   '~manager_env/recorders=empty' '+manager_env/recorders=render'
-```
-
-
-
-
-```bash
-rsync -aP \
+```  rsync -aP \
   --no-owner --no-group \
-  -e "ssh -p 9991 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
+    --exclude='data/' \
+  --exclude='imports/blender/' \
+  --exclude='outputs/' \
+  -e "ssh -p 9980 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
+  /home/tide/robot/GRAIL/ \
+  yuguanchao@zz.irmv.top:/home/yuguanchao/data0/GRAIL/
   /home/tide/robot/GRAIL/ \
   ygc@202.120.37.249:/home/ygc/data0/GRAIL/
 
@@ -360,9 +360,12 @@ rsync -aP \
 
   rsync -aP \
   --no-owner --no-group \
+    --exclude='data/' \
+  --exclude='imports/blender/' \
+  --exclude='outputs/' \
   -e "ssh -p 9980 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
-  /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/ \
-  yuguanchao@zz.irmv.top:/home/yuguanchao/data0/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/
+  /home/tide/robot/GRAIL/ \
+  yuguanchao@zz.irmv.top:/home/yuguanchao/data0/GRAIL/
 
 data/hf_dataset/data_update/data/pickup_table_place_concat
 

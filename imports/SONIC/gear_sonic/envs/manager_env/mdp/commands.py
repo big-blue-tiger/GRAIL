@@ -3354,6 +3354,12 @@ class TrackingCommand(CommandTerm):
                 self.motion_start_time_steps[env_ids] = torch.minimum(
                     requested_start_frames, max_start_frames
                 )
+            elif self.cfg.first_frame_reset_ratio > 0.0:
+                # Independently select first-frame starts among the envs resetting now.
+                first_frame = torch.rand(len(env_ids), device=self.device) < self.cfg.first_frame_reset_ratio
+                self.motion_start_time_steps[env_ids] = torch.where(
+                    first_frame, 0, self.motion_start_time_steps[env_ids]
+                )
 
             if self.encoder_sample_probs is not None:
                 has_smpl = self.motion_lib.motion_has_smpl[self.motion_ids[env_ids]]
@@ -4766,6 +4772,10 @@ class TrackingCommandCfg(CommandTermCfg):
     # Always start from the first frame of the motion file during resampling
     # Useful for debugging and replaying specific motions from the beginning
     start_from_first_frame: bool = False
+
+    # Training-only probability of replacing a sampled start with frame zero.
+    # The trainer may update it each iteration; zero preserves random sampling.
+    first_frame_reset_ratio: float = 0.0
 
     # Deterministic start frame used only while is_evaluating=True.  Values
     # beyond a motion's length are clamped to its final valid frame.

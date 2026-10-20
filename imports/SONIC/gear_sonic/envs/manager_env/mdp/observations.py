@@ -1470,14 +1470,35 @@ def table_geometry(
     return torch.cat([mins[:, 0:1], maxs[:, 0:1], mins[:, 1:2], maxs[:, 1:2]], dim=-1)
 
 
+def _mask_observation_by_place_phase(
+    observation: torch.Tensor, command: commands.TrackingCommand, phase: str | None
+) -> torch.Tensor:
+    """Keep an observation only in the requested absolute-motion-frame phase.
+
+    Opt in per observation term; existing teacher/decoder terms remain ungated.
+    The generated start frame belongs to ``after_generated``, matching rewards.
+    """
+    if phase is None:
+        return observation
+    if phase not in ("before_generated", "after_generated"):
+        raise ValueError(f"Unknown observation place phase: {phase!r}")
+    generated = command.is_place_generated_phase()
+    inactive = generated if phase == "before_generated" else ~generated
+    return observation.masked_fill(inactive.unsqueeze(-1), 0.0)
+
+
 def table_corners_b(
-    env: ManagerBasedEnv, command_name: str, table_size: tuple[float, float, float]
+    env: ManagerBasedEnv,
+    command_name: str,
+    table_size: tuple[float, float, float],
+    phase: str | None = None,
 ) -> torch.Tensor:
     """Return all four table-top corners in the current pelvis frame.
 
     Corner order in the table-local frame is ``(-x,-y)``, ``(-x,+y)``,
     ``(+x,-y)``, ``(+x,+y)``. The xyz coordinates are flattened to 12D in
     that order. ``table_size`` is ``[width, depth, thickness]``.
+    If ``phase`` is set, return zeros outside that place-generation phase.
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
 
@@ -1511,7 +1532,7 @@ def table_corners_b(
         quat_inv(pelvis_quat_w)[:, None, :].expand(-1, 4, -1).reshape(-1, 4),
         (corners_w - pelvis_pos_w[:, None, :]).reshape(-1, 3),
     )
-    return corners_b.reshape(env.num_envs, 12)
+    return _mask_observation_by_place_phase(corners_b.reshape(env.num_envs, 12), command, phase)
 
 
 def table_ori_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
@@ -3033,6 +3054,7 @@ def target_object_poses_6d(
     command_name: str,
     asset_cfg: SceneEntityCfg,
     goal_type: str = "release",
+    phase: str | None = None,
 ) -> torch.Tensor:
     """Metadata object goal in live pelvis and hand frames (9D each).
 
@@ -3040,6 +3062,7 @@ def target_object_poses_6d(
     Recompute relative poses every observation from current simulated frames;
     only the metadata world pose stays fixed. The rotation layout matches the
     live object terms, with 3D position followed by 6D rotation in each frame.
+    If ``phase`` is set, zero all 18 values outside that generation phase.
     """
     command: commands.TrackingCommand = env.command_manager.get_term(command_name)
     if goal_type == "release":
@@ -3065,7 +3088,7 @@ def target_object_poses_6d(
         pos, quat = subtract_frame_transforms(pos_w, quat_w, target_pos_w, target_quat_w)
         rot_6d = matrix_from_quat(quat)[..., :2].reshape(env.num_envs, 6)
         poses.extend((pos, rot_6d))
-    return torch.cat(poses, dim=-1)
+    return _mask_observation_by_place_phase(torch.cat(poses, dim=-1), command, phase)
 
 
 def sparse_target_root_trajectory_command_contact_aware(env: ManagerBasedEnv, command_name: str):

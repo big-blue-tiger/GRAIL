@@ -51,10 +51,17 @@ class OfflineCarryTask:
         for values in self.event_steps.values():
             values[env_ids] = -1
 
+    def has_playback_started(self):
+        """Enter the carry-plan phase at its first playback step, until reset.
+
+        Contact loss, zero sparse commands and release do not rewind this phase.
+        """
+        return (self.start_step >= 0) & (self.steps >= self.start_step)
+
     def read(self):
         """Pure zero-order hold lookup, including a latched final drop button."""
         elapsed = self.steps - self.start_step
-        playing = (self.start_step >= 0) & (elapsed >= 0)
+        playing = self.has_playback_started()
         frames = torch.floor(elapsed * (self.step_dt * PLAN_FPS) + 1e-6).long()
         frames = torch.minimum(frames.clamp_min(0), self.release_frame)
         ids = torch.arange(len(self.steps), device=self.device)

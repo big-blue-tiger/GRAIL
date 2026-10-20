@@ -50,6 +50,8 @@ def prepare_config(config, objects, initial_pose):
                 del manager.observations[name]
         for name in ("proprio_obs", "privileged_obs", "policy_atm"):
             manager.observations[name].enable_corruption = False
+        # Keep observation phase gates; ReferenceFreeCommand uses sparse playback
+        # start as the online counterpart of the training generated-start frame.
         manager.observations.privileged_obs.target_object_poses_6d.func = "gear_sonic.envs.manager_env.mdp:target_object_poses_6d"
         manager.observations.privileged_obs.table_corners_b.params.table_size = objects[0]["table_size"]
         manager.rewards = {"_target_": "builtins.dict"}

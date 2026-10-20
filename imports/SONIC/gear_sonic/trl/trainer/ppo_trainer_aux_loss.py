@@ -39,6 +39,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         if self.teacher_termination_loss_override_enabled:
             self._init_teacher_termination_loss_override()
         self._update_termination_thresholds()
+        self._update_first_frame_reset_ratio()
 
     def _init_config(self):
         """Extend base config initialisation with auxiliary loss settings.
@@ -77,6 +78,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         )
         self.termination_threshold_schedules = termination_schedule.get("terms", {})
         self._termination_thresholds = {}
+        self.first_frame_reset_schedule = self.config.get("first_frame_reset_schedule", {})
 
     def _update_termination_thresholds(self):
         """Relax student pose limits using the checkpoint-restored iteration counter."""
@@ -95,10 +97,20 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
                 self._student_loss_termination_params[name]["threshold"] = threshold
             self._termination_thresholds[name] = threshold
 
+    def _update_first_frame_reset_ratio(self):
+        """Mix in first-frame resets using the checkpoint-restored iteration."""
+        schedule = self.first_frame_reset_schedule
+        if not schedule.get("enabled", False):
+            return
+        progress = min(self.state.global_step / schedule["end_iteration"], 1.0)
+        ratio = schedule["start"] + (schedule["end"] - schedule["start"]) * progress
+        self.env.motion_command.cfg.first_frame_reset_ratio = ratio
+
     def _train_rollout_mode(self):
         super()._train_rollout_mode()
         # Update before any mask evaluation or environment step in this rollout.
         self._update_termination_thresholds()
+        self._update_first_frame_reset_ratio()
 
     def _init_teacher_termination_loss_override(self):
         """Cache only the two stateless pose checks; never create a termination manager."""
@@ -471,5 +483,7 @@ class TRLAuxLossPPOTrainer(TRLPPOTrainer):
         metrics["loss/lambda_bc"] = bc_coef
         for name, threshold in self._termination_thresholds.items():
             metrics[f"termination/{name}_threshold"] = threshold
+        if self.first_frame_reset_schedule.get("enabled", False):
+            metrics["reset/first_frame_ratio"] = self.env.motion_command.cfg.first_frame_reset_ratio
 
         return metrics

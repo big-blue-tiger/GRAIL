@@ -122,6 +122,12 @@ class ReferenceFreeCommand(CommandTerm):
     def get_sparse_policy_commands(self):
         return self.task.read()
 
+    def is_place_generated_phase(self):
+        """Use sparse playback's first step as the online generated-phase boundary."""
+        if self.task is None:
+            raise ValueError("Place phase observations require carry_task=True")
+        return self.task.has_playback_started()
+
     def advance_task(self):
         """Called by the termination term after physics and before auto-reset."""
         hand_force = torch.linalg.vector_norm(

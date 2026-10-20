@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
@@ -84,6 +84,7 @@ class RewardsCfg:
     hand_table_contact_penalty = None
     hand_body_contact_penalty = None
     body_table_contact_penalty = None
+    object_table_contact_after_grasp_penalty = None
     # Object motion tracking reward (OmniGrasp-style r_t^obj)
     object_tracking_reward = None
     object_final_goal_distance = None
@@ -1552,6 +1553,39 @@ def filtered_contact_force_sum(env, sensor_names):
             raise RuntimeError(f"{name}: a pair-filtered contact force matrix is required")
         total += torch.linalg.vector_norm(force, dim=-1).sum(dim=(-1, -2))
     return total
+
+
+class ObjectTableContactAfterGraspPenalty(ManagerTermBase):
+    """Penalize table contact after a grace period from first physical hand contact.
+
+    Latch the first simulated hand-object contact once per episode, independently
+    of reference labels, grasp stability or later loss of hand contact. Return a
+    binary cost on every table-contact step once the grace period has elapsed,
+    including after release. RewardManager applies the negative weight and dt.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env):
+        super().__init__(cfg, env)
+        self._first_contact_step = torch.full(
+            (env.num_envs,), -1, dtype=torch.long, device=env.device
+        )
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self._first_contact_step[ids] = -1
+
+    def __call__(
+        self, env, hand_sensor_cfg: SceneEntityCfg, table_sensor_cfg: SceneEntityCfg,
+        grace_period_s: float = 0.5, contact_threshold: float = 0.1,
+    ) -> torch.Tensor:
+        hand_force = filtered_contact_force_sum(env, [hand_sensor_cfg.name])
+        table_force = filtered_contact_force_sum(env, [table_sensor_cfg.name])
+        steps = env.episode_length_buf
+        first_contact = (self._first_contact_step < 0) & (hand_force > contact_threshold)
+        self._first_contact_step[first_contact] = steps[first_contact]
+        elapsed_s = (steps - self._first_contact_step) * env.step_dt
+        active = (self._first_contact_step >= 0) & (elapsed_s >= grace_period_s)
+        return (active & (table_force > contact_threshold)).float()
 
 
 def reward_hand_table_contact_penalty(
