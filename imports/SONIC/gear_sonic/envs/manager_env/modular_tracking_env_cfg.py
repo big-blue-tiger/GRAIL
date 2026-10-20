@@ -552,6 +552,19 @@ class MySceneCfg(InteractiveSceneCfg):
             debug_vis=False,
         )
 
+        if config.get("teacher_rollout_contacts", False):
+            for side in ("left", "right"):
+                setattr(self, f"rollout_{side}_foot_ground_contact", ContactSensorCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/Robot/{side}_ankle_roll_link",
+                    filter_prim_paths_expr=["/World/ground/.*"],
+                    history_length=0,
+                ))
+            self.rollout_robot_table_contact = ContactSensorCfg(
+                prim_path="{ENV_REGEX_NS}/Table",
+                filter_prim_paths_expr=["{ENV_REGEX_NS}/Robot/.*"],
+                history_length=0,
+            )
+
         # Feet-to-terrain contact sensor: isolates contact forces between feet and
         # the terrain Object so rewards can penalize horizontal forces without
         # contamination from gravity or internal joint forces.

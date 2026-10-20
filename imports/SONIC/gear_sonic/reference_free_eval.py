@@ -7,6 +7,7 @@ from loguru import logger
 from omegaconf import OmegaConf, open_dict
 
 from gear_sonic.utils.reference_free_data import load_scene_inputs
+from gear_sonic.utils.reference_free_plan import CarryPlannerConfig
 
 
 MODULE = "gear_sonic.envs.manager_env.reference_free"
@@ -17,7 +18,19 @@ def prepare_config(config, objects, initial_pose):
     config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
     with open_dict(config):
         manager = config.manager_env
-        init_z_offset = manager.commands.motion.get("init_z_offset", 0.05)
+        privileged_dim = int(config.algo.config.actor.backbone.module_config_dict.privileged_input_dim)
+        if privileged_dim not in (66, 87):
+            raise ValueError(f"Reference-free play supports privileged input dimensions 66/87, got {privileged_dim}")
+        carry_task = privileged_dim == 87
+        privileged = manager.observations.privileged_obs
+        extra_terms = ("target_object_carry_poses_6d", "sparse_target_root_trajectory_command_contact_aware", "drop_button")
+        if any((privileged.get(name) is not None) != carry_task for name in extra_terms):
+            raise ValueError("Checkpoint privileged observations do not match its 66/87-dimensional actor")
+        init_z_offset = float(manager.commands.motion.get("init_z_offset", 0.05))
+        object_init_z_offset = float(manager.commands.motion.get("object_init_z_offset", init_z_offset))
+        planner = OmegaConf.to_container(OmegaConf.create(config.reference_free.get("planner", {})), resolve=True)
+        if carry_task:
+            CarryPlannerConfig(**planner)
         manager.commands = {
             "_target_": "gear_sonic.envs.manager_env.mdp.commands.CommandsCfg",
             "motion": {
@@ -25,6 +38,9 @@ def prepare_config(config, objects, initial_pose):
                 "objects": objects,
                 "initial_pose": initial_pose,
                 "init_z_offset": init_z_offset,
+                "object_init_z_offset": object_init_z_offset if carry_task else 0.0,
+                "carry_task": carry_task,
+                "planner": planner,
                 "success_threshold": config.reference_free.success_threshold,
                 "debug_vis": config.reference_free.debug_vis,
             },
@@ -34,7 +50,7 @@ def prepare_config(config, objects, initial_pose):
                 del manager.observations[name]
         for name in ("proprio_obs", "privileged_obs", "policy_atm"):
             manager.observations[name].enable_corruption = False
-        manager.observations.privileged_obs.target_object_poses_6d.func = f"{MODULE}:target_object_poses_6d"
+        manager.observations.privileged_obs.target_object_poses_6d.func = "gear_sonic.envs.manager_env.mdp:target_object_poses_6d"
         manager.observations.privileged_obs.table_corners_b.params.table_size = objects[0]["table_size"]
         manager.rewards = {"_target_": "builtins.dict"}
         manager.events = {"_target_": "builtins.dict"}
@@ -47,10 +63,11 @@ def prepare_config(config, objects, initial_pose):
                 "time_out": True,
             },
         }
-        if config.reference_free.get("terminate_on_success", True):
+        if carry_task or config.reference_free.get("terminate_on_success", True):
             manager.terminations.goal_reached = {
                 "_target_": "isaaclab.managers.TerminationTermCfg",
                 "func": f"{MODULE}:goal_reached",
+                "params": {"terminate_on_success": bool(config.reference_free.get("terminate_on_success", True))},
             }
         # The inherited success recorder queries final reference frames. Replace
         # it while retaining only the explicitly requested video recorder.
@@ -77,6 +94,10 @@ def prepare_config(config, objects, initial_pose):
         scene.use_student_direct_latent = True
         scene.use_motion_hand_actions = False
         scene.student_use_motion_hand_actions = False
+        if carry_task:
+            scene.teacher_use_motion_hand_actions = False
+            scene.enable_robot_table_contact_sensors = False
+            scene.enable_hand_body_contact_sensors = False
     return config
 
 
@@ -143,13 +164,19 @@ def _play(config, simulation_app):
             env.config.obs.obs_dims[key] = total
             env.config.robot.algo_obs_dim_dict[key] = int(np.prod(value.shape[1:]))
         env.config.robot.actions_dim = 66
+        expected_dim = int(config.algo.config.actor.backbone.module_config_dict.privileged_input_dim)
+        actual_dim = int(np.prod(obs["privileged_obs"].shape[1:]))
+        if actual_dim != expected_dim:
+            raise ValueError(f"Checkpoint expects {expected_dim} privileged inputs, environment produced {actual_dim}")
         policy = custom_instantiate(
             config.algo.config.actor, env_config=env.config, algo_config=config.algo.config,
             module_dim_dict=config.algo.config.get("module_dim", {}), _resolve=False,
         ).to(env.device)
         checkpoint = torch.load(config.checkpoint, map_location=env.device, weights_only=False)
         state_dict = checkpoint.get("actor_model_state_dict", checkpoint.get("policy_state_dict"))
-        policy.load_state_dict(state_dict)
+        if state_dict is None:
+            raise ValueError("Checkpoint has neither actor_model_state_dict nor policy_state_dict")
+        policy.load_state_dict(state_dict, strict=True)
         del checkpoint, state_dict
         policy.eval()
         command = raw_env.command_manager.get_term("motion")

@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# 在 yuguanchao_kimodo 中运行，使用 GPU 1 批量生成 manifest 中的全部动作。
+# 在 yuguanchao_kimodo 中运行，使用 GPU 0 批量生成 manifest 中的全部动作。
 # 用法：bash server_generate_motion.sh [BATCH_SIZE]；默认每批 16 条。
 set -eo pipefail
 batch_size=${1:-${BATCH_SIZE:-32}}
 [[ "$batch_size" =~ ^[1-9][0-9]*$ ]] || { echo 'BATCH_SIZE 必须是正整数' >&2; exit 2; }
 
 cd /workspace/kimodo
-source /workspace/kimodo/deployment/env.sh
+source /workspace/kimodo/deployment/9991/env.sh
 set -u
 # env.sh 设置 GPU 0，必须在 source 之后覆盖。
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TEXT_ENCODER_MODE=local
 export TEXT_ENCODER_DTYPE=float32
 export TEXT_ENCODER_DEVICE=cpu
-shared=/workspace/kimodo/data/wostep/place_walk_1010
+shared=/workspace/kimodo/data/wostep/place_walk_1018
 mkdir -p "$shared/motions"
 
 echo "[2/3] 使用 GPU 1 batch 生成动作，每批 $batch_size 条"

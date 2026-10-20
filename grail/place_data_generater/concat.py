@@ -165,6 +165,40 @@ def resample_qpos(qpos, source_fps, output_fps):
     return np.column_stack([values[:, :3], rotations[:, [3, 0, 1, 2]], values[:, 3:]])
 
 
+def slow_first_turn(qpos, fps, factor):
+    """仅扩展首个转身段 [start,end),保持 FPS;返回的帧索引相对生成段。
+
+    N 帧扩展为 round(N * factor) 帧,用下一帧 end 作为插值端点但不重复加入。
+    位置/关节角线性插值,root 四元数沿最短路径线性插值后归一化。
+    """
+    if not np.isfinite(factor) or factor < 1:
+        raise ValueError("turn_slowdown_factor must be finite and >= 1")
+    info = {"factor": float(factor), "start_frame": None, "end_frame_exclusive": None,
+            "original_frames": 0, "expanded_frames": 0, "added_frames": 0}
+    if factor == 1:
+        return qpos, info
+    rotations = Rotation.from_quat(qpos[:, [4, 5, 6, 3]]).as_matrix()
+    yaw = np.arctan2(rotations[:, 1, 0], rotations[:, 0, 0])
+    _, stages = turn_stage_commands(yaw, fps)
+    if not stages:
+        return qpos, info
+    start, end = stages[0]["start_frame"], stages[0]["end_frame_exclusive"]
+    frames = round((end - start) * factor)
+    samples = np.linspace(start, end, frames, endpoint=False)
+    left = np.floor(samples).astype(int)
+    alpha = (samples - left)[:, None]
+    expanded = (1 - alpha) * qpos[left] + alpha * qpos[left + 1]
+    # q and -q represent the same orientation; align signs before interpolating.
+    qa, qb = qpos[left, 3:7], qpos[left + 1, 3:7].copy()
+    qb[np.sum(qa * qb, axis=1) < 0] *= -1
+    quat = (1 - alpha) * qa + alpha * qb
+    expanded[:, 3:7] = quat / np.linalg.norm(quat, axis=1, keepdims=True)
+    info.update(start_frame=start, end_frame_exclusive=start + frames,
+                original_frames=end - start, expanded_frames=frames,
+                added_frames=frames - (end - start))
+    return np.concatenate([qpos[:start], expanded, qpos[end:]]), info
+
+
 def right_hand_pose(qpos, kinematics, *, quat_order="wxyz"):
     """返回右掌 Z-up 世界位置 (T,3) 和旋转 (T,3,3),包含 base 及所有上游关节。
 
@@ -289,11 +323,12 @@ def crop_source_prefix(motion, last_frame):
 
 
 def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwrite=False,
-           *, kinematics=None, copy_shared_assets=True):
+           *, kinematics=None, copy_shared_assets=True, turn_slowdown_factor=2.0):
     """保留原段至 carry 帧,追加过渡、Kimodo、0.7 s 保持和 0.7 s 开手下落。
 
     写出 robot/objects/meta/报告并复制资产,输入与输出目录必须独立。
     批处理可传入复用的 kinematics,并在首条成功后关闭共享资产重复复制。
+    首个生成转身段默认扩展到两倍帧数,turn_slowdown_factor=1 时保持原速。
     """
     dataset, output = Path(dataset).resolve(), Path(output).resolve()
     if dataset == output or dataset in output.parents or output in dataset.parents:
@@ -330,6 +365,13 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     robot = crop_source_prefix(robot, carry_frame)
     objects = crop_source_prefix(objects, carry_frame)
     n = carry_frame + 1
+    walk_report_path = dataset / "reports" / f"{name}.json"
+    walk_report = json.loads(walk_report_path.read_text())
+    grail_start = walk_report.get("b_start_index")
+    if (type(grail_start) is not int or not 0 <= grail_start < n
+            or walk_report.get("total_frames") != source_frames
+            or walk_report.get("fps") != float(robot["fps"])):
+        raise ValueError(f"{walk_report_path}: invalid source GRAIL boundary/frame count/FPS")
     qpos = np.loadtxt(csv, delimiter=",", ndmin=2)
     if qpos.shape != (record["num_frames"], 36) or not np.isfinite(qpos).all():
         raise ValueError(f"{name}: expected finite ({record['num_frames']},36) Kimodo CSV "
@@ -342,6 +384,7 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     fps = float(robot["fps"])
     # Preserve the source FPS and generated poses after restoring world coordinates.
     world_qpos = resample_qpos(world_qpos, MODEL_FPS, fps)
+    world_qpos, turn_slowdown = slow_first_turn(world_qpos, fps, turn_slowdown_factor)
     carry_values = source_qpos(robot)[carry_frame:carry_frame+1]
     hand, hand_rotations = right_hand_pose(world_qpos, kinematics)
     carry_positions, carry_rotations = right_hand_pose(carry_values, kinematics, quat_order="xyzw")
@@ -363,9 +406,6 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
                                    carry_rotation, carry_frame=carry_frame)
     obj_hold = repeat_last_frame(obj_generated, hold_frames, len(hand)-1)
     # Release during the final 0.7 seconds; preserve the body DOFs and object rotation.
-    generated_start = n + join_frames
-    hold_start = generated_start + len(generated["dof"])
-    final_hold_start = hold_start + len(hold["dof"])
     final_hold_frames = max(1, round(0.7 * fps))
     robot_final_hold = repeat_last_frame(hold, final_hold_frames, len(hold["dof"]) - 1)
     # Release has no contact labels; avoid copying the held object's contact points.
@@ -380,6 +420,18 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     # concat_motion validates every segment's schema, FPS, dtype and frame arrays.
     robot_out = concat_motion([robot, seam, generated, hold, robot_final_hold])
     objects_out = concat_motion([objects, obj_seam, obj_generated, obj_hold, object_final_hold], kind="object")
+    # Derive output boundaries from the final arrays, after turn interpolation.
+    # The added turn frames are already in total_frames: do not add them twice.
+    total_frames = len(robot_out["dof"])
+    final_hold_start = total_frames - len(robot_final_hold["dof"])
+    hold_start = final_hold_start - len(hold["dof"])
+    generated_start = hold_start - len(generated["dof"])
+    if generated_start != n + len(seam["dof"]):
+        raise ValueError(f"{name}: inconsistent concatenated timeline")
+    # Slowdown bounds index the final output, while source-frame provenance does not change.
+    if turn_slowdown["start_frame"] is not None:
+        turn_slowdown["start_frame"] += generated_start
+        turn_slowdown["end_frame_exclusive"] += generated_start
     output_contact = {key.replace("source_", "output_", 1): value
                       for key, value in contact_timing(objects_out).items()}
     # Assets are copied after validation, without modifying the input snapshot.
@@ -399,16 +451,21 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
         raise FileExistsError("Output exists; pass --overwrite")
     meta = copy.deepcopy(joblib.load(assets[0]))
     # Fade out from the retained endpoint to the first generated frame, including the seam.
-    meta.update(total_frames=len(robot_out["dof"]),
+    meta.update(total_frames=total_frames,
+                grail_start_frame=grail_start,
                 residual_fade_out_start_frame=n-1,
                 residual_fade_out_end_frame=generated_start,
                 place_transition_start_frame=n,
                 place_transition_end_frame=generated_start-1,
                 place_generated_start_frame=generated_start,
+                place_turn_slowdown=turn_slowdown,
                 place_hold_start_frame=hold_start,
                 place_final_hold_start_frame=final_hold_start,
                 place_release_start_frame=final_hold_start,
                 place_object_goal_pos_w=objects_out["root_pos"][final_hold_start-1, 0].copy(),
+                # Carry goals stay in the original Z-up world frame; object quats are wxyz.
+                place_object_carry_goal_pos_w=source_objects["root_pos"][carry_frame, 0].copy(),
+                place_object_carry_goal_quat_w=source_objects["root_quat"][carry_frame, 0].copy(),
                 **{f"place_{key}": value for key, value in output_contact.items()},
                 place_source_contact_start_frame=contact["source_contact_start_frame"],
                 place_source_contact_end_frame=contact["source_contact_end_frame"],
@@ -423,8 +480,10 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     meta.update(sparse_meta)
     validate_fields(robot_out, "robot")
     report = {"name": name, "source_frames": source_frames,
+              "grail_start_frame": grail_start,
               "retained_source_frames": n, "trimmed_source_frames": source_frames-n,
               "transition_frames": join_frames,
+              "turn_slowdown": turn_slowdown,
               "generated_frames": len(generated["dof"]), "hold_frames": len(hold["dof"]),
               "final_hold_frames": final_hold_frames,
               "total_frames": len(robot_out["dof"]), "fps": fps,
@@ -486,10 +545,13 @@ def main():
     p.add_argument("--name", required=True)
     p.add_argument("--kimodo-repo", type=Path, default=KIMODO)
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--turn-slowdown-factor", type=float, default=2.0,
+                   help="Expand only the first generated turn by this factor (>=1); 1 disables slowing")
     args = p.parse_args()
     print(json.dumps(append(args.dataset_dir, args.output_dir, args.name,
         args.manifest or args.dataset_dir / "kimodo_place_constraints/manifest.json",
-        args.csv, args.kimodo_repo, args.overwrite), indent=2))
+        args.csv, args.kimodo_repo, args.overwrite,
+        turn_slowdown_factor=args.turn_slowdown_factor), indent=2))
 
 
 if __name__ == "__main__":

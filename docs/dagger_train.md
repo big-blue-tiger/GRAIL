@@ -99,50 +99,19 @@ python gear_sonic/train_agent_trl.py \
   algo.config.num_learning_iterations=10000 
 
 CUDA_VISIBLE_DEVICES=2 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
+  +exp=manager/universal_token/distill/robocasa_carry_table \
   headless=True \
-  num_envs=1024 \
-  experiment_name=joint_micro_step_high_regularization \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_cleaned_succeeded/bps \
-  manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.num_learning_iterations=10000 \
-  algo.config.num_mini_batches=4 \
-  algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000
-
-CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
-  headless=True \
-  num_envs=4096 \
-  experiment_name=03055Termination_walk \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
+  num_envs=9216 \
+  experiment_name=1016robocasa_carry_table \
+  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/object_usd \
+  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/robot \
+  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/objects \
+  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/bps \
   manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
   algo.config.num_learning_iterations=15000 \
   algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
-  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.05
-
-CUDA_VISIBLE_DEVICES=1 python gear_sonic/train_agent_trl.py \
-  +exp=manager/universal_token/distill/robocasa_pickup_table_mlp_decoder_latent_vector_obs_joint_micro_step \
-  headless=True \
-  num_envs=1024 \
-  experiment_name=walk01bccoef00shiftbc \
-  manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-  manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-  manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-  manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
-  manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
-  algo.config.teacher_checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
-  algo.config.num_learning_iterations=10000 \
-  algo.config.num_mini_batches=4 \
-  algo.config.ppo_bc_loss_schedule.adaptive_after_iteration=1000 \
-  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.1
+  algo.config.ppo_bc_loss_schedule.bc_min_coef=0.04
 ```
 
 ## 本机play
@@ -206,8 +175,35 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.recorders.render_envs.video_save_path=/home/tide/robot/GRAIL/outputs/pnp_table_place_concat_video \
   ++manager_env.recorders.render_envs.video_quality=5 \
   ++manager_env.terminations.ee_body_pos.params.threshold=25 \
-  ++manager_env.terminations.object_pos_deviation.params.threshold=25
+  ++manager_env.terminations.object_pos_deviation.params.threshold=25 \
+  ++teacher_rollout_dir=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_rollout
 
+
+
+
+
+
+python gear_sonic/eval_agent_trl.py \
+  --config-name=base \
+  +exp=manager/universal_token/hoi/pnp_table \
+  +callbacks=im_eval \
+  checkpoint=/home/tide/robot/GRAIL/imports/SONIC/models/pnp_table/last.pt \
+  headless=False \
+  num_envs=8 \
+  ++run_once=False \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_shard_rank=0 \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_shard_world_size=1 \
+  ++manager_env.commands.motion.start_from_first_frame=True \
+  ++manager_env.commands.motion.sample_before_contact=False \
+  ++manager_env.config.object_usd_path=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_rollout/object_usd \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_rollout/robot \
+  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_rollout/objects \
+  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_rollout/bps \
+  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/tide/robot/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  ++manager_env.config.gpu_collision_stack_size_exp=27 \
+  ++manager_env.terminations.ee_body_pos.params.threshold=25 \
+  ++manager_env.terminations.object_pos_deviation.params.threshold=25 \
+  ++manager_env.commands.motion.eval_random_start=True
 #服务器play
 python gear_sonic/eval_agent_trl.py \
   --config-name=base \
@@ -234,6 +230,30 @@ python gear_sonic/eval_agent_trl.py \
   ++manager_env.recorders.render_envs.video_quality=5 \
   ++manager_env.terminations.ee_body_pos.params.threshold=25 \
   ++manager_env.terminations.object_pos_deviation.params.threshold=25
+
+# teacher rollout保存数据
+  python gear_sonic/eval_agent_trl.py \
+  --config-name=base \
+  +exp=manager/universal_token/hoi/pnp_table \
+  +callbacks=im_eval \
+  checkpoint=/home/GRAIL/imports/SONIC/models/pnp_table/last.pt \
+  headless=True \
+  num_envs=2304 \
+  ++run_once=True \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_shard_rank=0 \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_shard_world_size=1 \
+  ++manager_env.commands.motion.start_from_first_frame=True \
+  ++manager_env.commands.motion.sample_before_contact=False \
+  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/object_usd \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/robot \
+  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/objects \
+  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/bps \
+  ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
+  ++manager_env.config.gpu_collision_stack_size_exp=30 \
+  ++manager_env.terminations.ee_body_pos.params.threshold=25 \
+  ++manager_env.terminations.object_pos_deviation.params.threshold=25 \
+  ++teacher_rollout_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_rollout
+
 
 ```
 ### Teacher policy 检测整套数据成功率（不保存视频）
@@ -285,18 +305,18 @@ python gear_sonic/eval_agent_trl.py \
 ## 服务器端play
 ```bash
 python gear_sonic/eval_agent_trl.py \
-  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/03055Termination_walk-20260923_172120/last.pt \
+  +checkpoint=/home/GRAIL/imports/SONIC/logs_rl/GRAB_Tracking/1016robocasa_carry_table-20261016_153147/last.pt \
   +headless=True \
   ++num_envs=16 \
   +run_once=True \
   ++manager_env.config.render_results=True \
-  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/03055Termination_walk-4500 \
+  ++manager_env.config.save_rendering_dir=/home/GRAIL/outputs/1016robocasa_carry_table-4000 \
   "~manager_env/recorders=empty" \
   "+manager_env/recorders=render" \
-  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/object_usd \
-  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/robot \
-  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/objects \
-  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat/bps \
+  ++manager_env.config.object_usd_path=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/object_usd \
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/robot \
+  ++manager_env.commands.motion.motion_lib_cfg.object_motion_file=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/objects \
+  ++manager_env.commands.motion.motion_lib_cfg.bps_dir=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_teacher_300/bps \
   ++manager_env.commands.motion.motion_lib_cfg.asset.assetRoot=/home/GRAIL/imports/SONIC/gear_sonic/data/assets/robot_description/mjcf/ \
   ++manager_env.terminations.ee_body_pos.params.threshold=25 \
   ++manager_env.terminations.object_pos_deviation.params.threshold=25
@@ -323,11 +343,9 @@ python gear_sonic/eval_agent_trl.py \
 ```bash
 rsync -aP \
   --no-owner --no-group \
-  --exclude='data/' \
   -e "ssh -p 9991 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
   /home/tide/robot/GRAIL/ \
   ygc@202.120.37.249:/home/ygc/data0/GRAIL/
-
 
 
   rsync -aP \
@@ -335,15 +353,23 @@ rsync -aP \
   --exclude='data/' \
   --exclude='imports/blender/' \
   --exclude='outputs/' \
+  --delete \
   -e "ssh -p 9989 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
   /home/tide/robot/GRAIL/ \
   cuixinru@202.120.37.249:/home/cuixinru/data0/GRAIL/
 
+  rsync -aP \
+  --no-owner --no-group \
+  -e "ssh -p 9980 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
+  /home/tide/robot/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/ \
+  yuguanchao@zz.irmv.top:/home/yuguanchao/data0/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat/
+
+data/hf_dataset/data_update/data/pickup_table_place_concat
 
   rsync -aP \
   --no-owner --no-group \
   --exclude='data/' \
-  --exclude='imports/blender/' \r
+  --exclude='imports/blender/' \
   --exclude='outputs/' \
   -e "ssh -p 9980 -o ServerAliveInterval=60 -o ServerAliveCountMax=10" \
   /home/tide/robot/GRAIL/ \

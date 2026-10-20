@@ -2488,6 +2488,14 @@ class MotionLibBase:
                 if self.has_action:
                     curr_motion.action = to_torch(curr_file["action"]).clone()[start:end]
 
+                if "hand_dof_pos" in curr_file:
+                    hand_dof = to_torch(curr_file["hand_dof_pos"][start:end]).float()
+                    if curr_file["fps"] != self.target_fps:
+                        hand_dof = self.mesh_parsers.interploate_pose(
+                            None, hand_dof[None], curr_file["fps"], self.target_fps
+                        )[1][0]
+                    curr_motion.hand_dof_pos = hand_dof
+
                 # Extract hand DOFs if motion file has more than 29 DOFs
                 hand_dof_count = self.m_cfg.get("hand_dof_count", 0)
                 if hand_dof_count > 0 and "dof" in curr_file:

@@ -116,6 +116,10 @@ manager_env:
 
   commands:
     motion:
+      # Raise both simulated poses only at reset; keep references and goals unchanged.
+      init_z_offset: 0.05
+      object_init_z_offset: ${manager_env.commands.motion.init_z_offset}
+      object_z_offset: 0.0
       motion_lib_num_dof: 29
       hand_default_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
       num_future_frames: 10

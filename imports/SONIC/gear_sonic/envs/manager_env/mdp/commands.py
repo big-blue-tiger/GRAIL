@@ -17,6 +17,7 @@ from gear_sonic.envs.env_utils import joint_utils
 from gear_sonic.isaac_utils import rotations as isaac_utils_rotations
 from gear_sonic.trl.utils import common, order_converter, torch_transform
 from gear_sonic.utils.motion_lib import motion_lib_robot
+from gear_sonic.utils.sparse_command import SparseCommandState
 from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
@@ -100,77 +101,6 @@ class MotionVelocityCommandCfg(CommandTermCfg):
     command_name: str = "motion"
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
     debug_vis: bool = False
-
-
-class SparseCommandState:
-    """Track per-environment physical pickup, release and carry eligibility.
-
-    TrackingCommand advances this state once per simulation step and clears
-    selected environments on reset. Observation reads only apply the resulting
-    contact gate; they never advance the stable-contact counters.
-    """
-
-    def __init__(self, num_envs, device, *, force_threshold=0.1, stable_steps=3):
-        """Allocate zeroed contact counters and phase flags on the environment device.
-
-        Keep one entry per environment. force_threshold is in newtons and
-        stable_steps is the number of consecutive simulation steps required
-        to confirm pickup, physical release or an unintended loss of contact.
-        """
-        self.force_threshold = force_threshold
-        self.stable_steps = stable_steps
-        self.pickup_count = torch.zeros(num_envs, dtype=torch.long, device=device)
-        self.release_count = torch.zeros_like(self.pickup_count)
-        self.lost_contact_count = torch.zeros_like(self.pickup_count)
-        self.picked_up = torch.zeros(num_envs, dtype=torch.bool, device=device)
-        self.released = torch.zeros_like(self.picked_up)
-        self.dropped = torch.zeros_like(self.picked_up)
-        self.carrying = torch.zeros_like(self.picked_up)
-        # The staged goal reward latches arrival before the release request.
-        self.release_goal_reached = torch.zeros_like(self.picked_up)
-
-    def reset(self, env_ids):
-        """Clear pickup, release, drop and goal-arrival history for selected environments.
-
-        Reset all counters and carry flags at episode or motion resampling.
-        Entries outside env_ids retain their state; no observation is sampled.
-        """
-        for value in (self.pickup_count, self.release_count, self.lost_contact_count,
-                      self.picked_up, self.released, self.dropped, self.carrying,
-                      self.release_goal_reached):
-            value[env_ids] = 0
-
-    def update(self, hand_force, table_force, drop_button):
-        """Advance contact state once from the current physics measurements.
-
-        Read hand/table force magnitudes [N] in newtons and drop buttons [N,1].
-        Confirm pickup after stable hand contact without table support. After
-        pickup, distinguish contact loss following a button press from contact
-        loss before release, and latch each event after stable_steps. Carrying
-        requires current hand contact, no release request and no latched release.
-        """
-        contact = hand_force >= self.force_threshold
-        drop = drop_button.reshape(-1) >= 0.5
-        lifted = contact & (table_force < self.force_threshold) & ~drop
-        self.pickup_count = torch.where(lifted, self.pickup_count + 1, 0)
-        self.picked_up |= self.pickup_count >= self.stable_steps
-        releasing = self.picked_up & drop & ~contact
-        self.release_count = torch.where(releasing, self.release_count + 1, 0)
-        self.released |= self.release_count >= self.stable_steps
-        lost = self.picked_up & ~drop & ~contact
-        self.lost_contact_count = torch.where(lost, self.lost_contact_count + 1, 0)
-        self.dropped |= self.lost_contact_count >= self.stable_steps
-        self.carrying = self.picked_up & contact & ~drop & ~self.released
-
-    def command(self, x_yaw, drop_button):
-        """Return contact-gated carry commands without changing phase state.
-
-        Preserve the input [N,2] dx/turn-stage yaw command only while carrying and the [N,1]
-        drop button is below 0.5. Return zero for every other environment,
-        including release frames; pickup and release counters remain unchanged.
-        """
-        enabled = self.carrying & (drop_button.reshape(-1) < 0.5)
-        return torch.where(enabled[:, None], x_yaw, 0.0)
 
 
 class TrackingCommand(CommandTerm):
@@ -3404,9 +3334,7 @@ class TrackingCommand(CommandTerm):
                 self.motion_start_time_steps[env_ids] = sampled_times
 
             if self.is_evaluating:
-                # Evaluation normally starts at frame zero.  Allow callers to
-                # request a deterministic later frame while safely clamping
-                # short motions to their final valid frame.
+                # Evaluation uses a fixed start or a uniform sample over the final 10 seconds.
                 eval_start_frame = max(int(self.cfg.eval_start_frame), 0)
                 motion_num_steps = self.motion_lib.get_motion_num_steps(
                     self.motion_ids[env_ids]
@@ -3417,6 +3345,12 @@ class TrackingCommand(CommandTerm):
                 requested_start_frames = torch.full_like(
                     max_start_frames, eval_start_frame
                 )
+                if self.cfg.eval_random_start:
+                    min_start_frames = (motion_num_steps - round(10 / self._env.step_dt)).clamp_min(0)
+                    requested_start_frames = (
+                        min_start_frames + torch.rand(len(env_ids), device=self.device)
+                        * (max_start_frames - min_start_frames + 1)
+                    ).to(self.motion_start_time_steps.dtype)
                 self.motion_start_time_steps[env_ids] = torch.minimum(
                     requested_start_frames, max_start_frames
                 )
@@ -3566,6 +3500,10 @@ class TrackingCommand(CommandTerm):
             joint_vel[:, self.body_joint_indices] = motion_lib_joint_vel
             joint_pos[:, self.extra_joint_indices] = self.extra_default_positions
             joint_vel[:, self.extra_joint_indices] = self.extra_default_velocities
+            if self.is_evaluating and self.cfg.eval_random_start:
+                joint_pos[:, self.extra_joint_indices] = self.motion_lib.get_hand_dof_pos(
+                    self.motion_ids, self.motion_start_time_steps + self.time_steps
+                )
 
             if not self.is_evaluating:
                 joint_pos[:, self.body_joint_indices] += sample_uniform(
@@ -4832,6 +4770,9 @@ class TrackingCommandCfg(CommandTermCfg):
     # Deterministic start frame used only while is_evaluating=True.  Values
     # beyond a motion's length are clamped to its final valid frame.
     eval_start_frame: int = 0
+
+    # Temporarily sample the final 10 seconds during evaluation, overriding fixed starts.
+    eval_random_start: bool = False
 
     # Sample each motion at most once (no duplicates across environments)
     # Requires num_envs <= num_available_motions, otherwise will error

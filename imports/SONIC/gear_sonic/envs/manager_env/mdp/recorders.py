@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 import cv2
 import imageio
 from isaaclab.managers import manager_term_cfg, recorder_manager
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 from loguru import logger
 import numpy as np
@@ -27,7 +29,70 @@ class RecordersCfg(recorder_manager.RecorderManagerBaseCfg):
     render_envs = None
     running_ref_root_height = None
     trajectory = None
+    teacher_rollout = None
+    object_goal = None
     object_position_success = None
+
+
+class TeacherRolloutRecorderTerm(recorder_manager.RecorderTerm):
+    """Export the first teacher episode independently of rendering/frame skipping."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.exporter = None
+
+    def record_pre_step(self):
+        from gear_sonic.utils.teacher_rollout import TeacherRolloutExporter
+
+        if self.exporter is None:
+            self.exporter = TeacherRolloutExporter(self._env, self.cfg.output_dir)
+        return None, None
+
+    def record_post_physics_decimation_step(self):
+        self.exporter.record_contacts()
+        return None, None
+
+    def record_post_step(self):
+        self.exporter.record()
+        return None, None
+
+    def close_writers(self):
+        if self.exporter is not None:
+            self.exporter.close()
+
+
+@configclass
+class TeacherRolloutRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = TeacherRolloutRecorderTerm
+    output_dir: str = ""
+
+
+class ObjectGoalRecorderTerm(recorder_manager.RecorderTerm):
+    """Draw release and carry goals before GUI or camera rendering, including headless video."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.visualizer = VisualizationMarkers(VisualizationMarkersCfg(
+            prim_path="/Visuals/ObjectGoal",
+            markers={name: sim_utils.SphereCfg(
+                radius=0.05, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+            ) for name, color in (("release", (0.0, 1.0, 0.0)), ("carry", (0.0, 0.0, 1.0)))},
+        ))
+
+    def record_pre_step(self):
+        command = self._env.command_manager.get_term("motion")
+        release_pos, _ = command.get_release_target_pose()
+        carry_pos, _ = command.get_carry_target_pose()
+        self.visualizer.visualize(
+            translations=torch.cat((release_pos, carry_pos)),
+            marker_indices=torch.arange(2, device=release_pos.device).repeat_interleave(len(release_pos)),
+        )
+        return None, None
+
+
+@configclass
+class ObjectGoalRecorderCfg(manager_term_cfg.RecorderTermCfg):
+    class_type = ObjectGoalRecorderTerm
 
 
 class ObjectPositionSuccessRecorder(recorder_manager.RecorderTerm):

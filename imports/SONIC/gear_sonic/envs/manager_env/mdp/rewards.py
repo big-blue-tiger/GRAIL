@@ -844,12 +844,13 @@ def reward_object_final_goal_success(
     phase: str | None = None,
     require_physical_release_after_request: bool = False,
 ) -> torch.Tensor:
-    """Reward goal proximity before release and successful release afterward.
+    """Reward successful release using goal proximity on the preceding step.
 
-    With release checking enabled, remember reaching the goal during the selected
-    phase before the drop request. From the release frame onward, reward requires
-    that arrival history and current confirmed physical release; the object may
-    fall outside the goal radius. Arrival history resets with each environment.
+    With release checking enabled, overwrite goal proximity each control step
+    before the drop request, then freeze the last pre-release value. Reward is
+    zero before the request; afterward it requires that frozen value and current
+    confirmed physical release. The object may fall outside the goal radius.
+    The saved value resets with each environment.
     Without release checking, retain the original per-step distance criterion.
     """
     command = env.command_manager.get_term(command_name)
@@ -858,10 +859,10 @@ def reward_object_final_goal_success(
     if require_physical_release_after_request:
         release = command.is_release_phase()
         state = command.sparse_command_state
-        state.release_goal_reached |= active & ~release & in_goal
-        success = torch.where(
-            release, state.release_goal_reached & command.is_physically_released(), in_goal
+        state.release_goal_reached.copy_(
+            torch.where(release, state.release_goal_reached, active & in_goal)
         )
+        success = release & state.release_goal_reached & command.is_physically_released()
     else:
         success = in_goal
     return (active & success).float()

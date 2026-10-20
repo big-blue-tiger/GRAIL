@@ -486,6 +486,26 @@ def main(override_config: omegaconf.OmegaConf):
             print(f"resume wandb from run: {config.wandb.wandb_id}")  # noqa: T201
 
     with omegaconf.open_dict(config):
+        if config.manager_env.config.get("add_object", False) and config.get("show_object_goal", True):
+            config.manager_env.commands.motion.motion_lib_cfg.load_carry_target_pose = True
+            config.manager_env.recorders.object_goal = {
+                "_target_": "gear_sonic.envs.manager_env.mdp.recorders.ObjectGoalRecorderCfg",
+            }
+
+        teacher_rollout_dir = config.get("teacher_rollout_dir")
+        if teacher_rollout_dir:
+            config.manager_env.config.teacher_rollout_contacts = True
+            config.run_once = True
+            config.manager_env.commands.motion.start_from_first_frame = True
+            config.manager_env.commands.motion.sample_before_contact = False
+            config.manager_env.commands.motion.eval_random_start = False
+            config.manager_env.commands.motion.eval_start_frame = 0
+            config.manager_env.recorders.teacher_rollout = {
+                "_target_": "gear_sonic.envs.manager_env.mdp.recorders.TeacherRolloutRecorderCfg",
+                "output_dir": str(Path(teacher_rollout_dir).resolve()),
+            }
+            logger.info(f"Exporting first teacher episodes to {teacher_rollout_dir}")
+
         for event in config.manager_env.config.get("train_only_events", []):
             if event in config.manager_env.events:
                 config.manager_env.events.pop(event)
@@ -1329,6 +1349,9 @@ def main(override_config: omegaconf.OmegaConf):
 
                 for obs_key in obs_dict.keys():  # noqa: SIM118
                     obs_dict[obs_key] = obs_dict[obs_key].to(device)
+
+    if teacher_rollout_dir:
+        _manager_env(env).recorder_manager._terms["teacher_rollout"].close_writers()
 
     if camera_rgb_writer is not None:
         camera_rgb_writer.close()
