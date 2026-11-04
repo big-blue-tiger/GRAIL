@@ -21,17 +21,17 @@ algo:
       terms:
         ee_body_pos:
           start: 0.2
-          end: 0.3
+          end: 0.4
           end_iteration: 3000
         object_pos_deviation:
           start: 0.2
-          end: 0.3
+          end: 0.4
           end_iteration: 3000
     actor:
       backbone:
         module_config_dict:
-          # Base state(48) + release/carry goals(18 each) + sparse commands(3).
-          privileged_input_dim: 87
+          # Base state(41) + release/carry goals(18 each) + sparse commands(3).
+          privileged_input_dim: 80
 
 manager_env:
   recorders:
@@ -39,6 +39,15 @@ manager_env:
       track_release_success: true
   observations:
     privileged_obs:
+      hand_object_contact_force_magnitude: null
+      # Binary contact presence (0/1), retaining the existing one-dimensional slot.
+      hand_object_contact_count:
+        _target_: isaaclab.managers.ObservationTermCfg
+        func: gear_sonic.envs.manager_env.mdp:get_hand_object_contact_count
+        params:
+          sensor_cfg:
+            _target_: isaaclab.managers.SceneEntityCfg
+            name: object_to_hand_contact_sensor
       # Student-only gates: the generated start frame enters the place phase.
       table_corners_b:
         params:
@@ -80,9 +89,23 @@ manager_env:
       sample_before_contact: false
       sample_from_n_initial_frames: null
       # Match teacher play: apply the shared lift only to simulated reset poses.
-      init_z_offset: 0.05
+      init_z_offset: 0.001
       object_init_z_offset: ${manager_env.commands.motion.init_z_offset}
       object_z_offset: 0.0
+      # Independent robot/object XY noise, only for reset frames before GRAIL start.
+      position_randomization_before_grail_start: true
+      pose_range:
+        x: [-0.07, 0.07]
+        y: [-0.07, 0.07]
+        z: [0.0, 0.0]
+        roll: [0.0, 0.0]
+        pitch: [0.0, 0.0]
+        yaw: [0.0, 0.0]
+      object_position_randomize: true
+      object_position_randomization:
+        x: 0.05
+        y: 0.05
+        z: 0.0
       motion_lib_cfg:
         load_carry_target_pose: true
         load_place_generated_phase: true
@@ -129,6 +152,7 @@ manager_env:
         threshold: 1.0
   rewards:
     grasp_reward:
+      weight: 15.0
       params:
         disable_after_release: true
     object_table_contact_after_grasp_penalty:
@@ -148,6 +172,8 @@ manager_env:
     grasp_finger_direction:
       params:
         use_contact_center: false
+        direction_mode: contact_normal
+        contact_threshold: 0.1
     approach_velocity_penalty:
       params:
         command_name: motion
@@ -157,6 +183,15 @@ manager_env:
       weight: 0.5
     tracking_anchor_ori:
       weight: 2.5
+    feet_heading_excess:
+      _target_: isaaclab.managers.RewardTermCfg
+      func: gear_sonic.envs.manager_env.mdp:feet_heading_excess
+      weight: -2.0
+      params:
+        command_name: motion
+        min_angle: 0.2617993877991494  # 15 deg
+        ref_margin: 0.08726646259971647  # 5 deg
+        std: 0.3490658503988659  # 20 deg
     # Suppress body tracking only in [grail_start_frame, place_generated_start_frame).
     tracking_relative_body_pos_upper:
       _target_: isaaclab.managers.RewardTermCfg
@@ -290,3 +325,7 @@ manager_env:
         force_saturation: 1.0
     micro_step_penalty:
       weight: -20.0
+      params:
+        # command_name: motion_velocity
+        min_step_length: 0.10
+        min_air_time: 0.2

@@ -19,13 +19,13 @@ def prepare_config(config, objects, initial_pose):
     with open_dict(config):
         manager = config.manager_env
         privileged_dim = int(config.algo.config.actor.backbone.module_config_dict.privileged_input_dim)
-        if privileged_dim not in (66, 87):
-            raise ValueError(f"Reference-free play supports privileged input dimensions 66/87, got {privileged_dim}")
-        carry_task = privileged_dim == 87
+        if privileged_dim not in (66, 80, 87):
+            raise ValueError(f"Reference-free play supports privileged input dimensions 66/80/87, got {privileged_dim}")
+        carry_task = privileged_dim in (80, 87)
         privileged = manager.observations.privileged_obs
         extra_terms = ("target_object_carry_poses_6d", "sparse_target_root_trajectory_command_contact_aware", "drop_button")
         if any((privileged.get(name) is not None) != carry_task for name in extra_terms):
-            raise ValueError("Checkpoint privileged observations do not match its 66/87-dimensional actor")
+            raise ValueError("Checkpoint privileged observations do not match its 66/80/87-dimensional actor")
         init_z_offset = float(manager.commands.motion.get("init_z_offset", 0.05))
         object_init_z_offset = float(manager.commands.motion.get("object_init_z_offset", init_z_offset))
         planner = OmegaConf.to_container(OmegaConf.create(config.reference_free.get("planner", {})), resolve=True)

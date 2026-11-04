@@ -33,7 +33,8 @@ tracking 终止条件。场景目录只需配对的 `object_usd/`、`bps/`、`me
   最短有符号角差 `atan2(sin(final_yaw-initial_yaw), cos(final_yaw-initial_yaw))`，
   正值左转、负值右转，不再按环境或 episode 强制交替；绝对角差不超过 0.2 rad 时不转向。
 - 按固定持物偏移生成短弧线和直线，再由同一路径计算 release 目标和指令。
-  转向角速度为 1.3 rad/s，转向时前进 0.15 m/s，直行速度为 0.35 m/s。
+  转向角速度为 1.0 rad/s，转向时航向速度由 -0.15 m/s 线性增加到 0.4 m/s，
+  即先小幅后退再前进；直行速度为 0.4 m/s。
 
 首次确认物理拾起后等待 1 秒，开始播放预先生成的 **25 Hz** 序列：
 
@@ -42,7 +43,7 @@ tracking 终止条件。场景目录只需配对的 `object_usd/`、`bps/`、`me
 | 等待拾起、稳定 | dx、dyaw、drop 为零 |
 | 弧线转向 | dx 从路径提取，dyaw 始终为该段总转角 |
 | 直线搬运 | dx 从路径提取，dyaw 为零 |
-| 保持 0.72 秒 | dx、dyaw、drop 为零 |
+| 保持 1.2 秒 | dx、dyaw、drop 为零 |
 | 松手至 episode 结束 | dx、dyaw 为零，drop 为 1 |
 
 dx 是前瞻 12 帧的航向系位移，单位为米，沿用 0.02 m 死区和 0.15 m 上限；
@@ -52,8 +53,16 @@ dyaw 单位为弧度。仿真按时间零阶保持读取，时间轴不随位置
 
 参数集中在 `gear_sonic/config/base_eval.yaml` 的 `reference_free.planner` 下，
 例如 `reference_free.planner.pickup_settle_s=1.5`、
-`reference_free.planner.walk_speed=0.3`。采样范围来自对
-`pickup_table_teacher_300` 全部 300 条样本的离线统计，无运行时依赖。
+`reference_free.planner.walk_speed=0.3`。`turn_start_speed` 是转身起始的有符号速度，
+`turn_forward_speed` 是转身结束时的速度；中间线性插值。
+速度曲线根据重新生成标签的 `pickup_table_place_concat_slow_turn_teacher_rollout`
+和 `pickup_table_slowturn_300` 校准，无运行时数据依赖。
+
+离线比较以 generated-start 对齐，使用相同 carry 起点、carry 到 release 的水平距离，
+并以目标位移方向近似最终航向；短序列补零，不拉伸时间轴。
+在 slowturn_300 的 300 条样本上，dx 平均绝对误差由 0.0445 m 降为 0.0296 m，
+dyaw 由 0.287 rad 降为 0.226 rad；主转身时长中位数由 1.84 s 调整为 2.40 s，
+数据中为 2.46 s。这是简单运动模型的离线拟合，不代表仿真成功率。
 
 ## 模型与结果
 
@@ -85,10 +94,9 @@ drop 1，共 87 维；动作仍为 64 维 latent + 2 维手部动作。两组目
 在仓库根目录运行：
 
 ```bash
-python -m unittest discover -s tests -p test_reference_free.py
-python tests/check_reference_free_runtime.py
+python -m unittest discover -s tests -p test_reference_free_plan.py
 ```
 
-第一项对照训练生成器验证几何、标签、时钟、接触门控和结果锁存；第二项使用
-最小场景替身检查新旧模式各 8 场景的 reset、补偿及终止记录，不执行真实物理仿真。
+对照训练端 `generate_sparse_commands` 检查左右转和直行的标签一致性、
+后退/前进曲线、目标几何及 32 个采样计划，不执行真实物理仿真。
 完整 8 环境视频与物理效果仍需在安装了 Isaac Lab 的环境中运行上面的 play 命令验证。

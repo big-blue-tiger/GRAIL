@@ -24,6 +24,15 @@ from grail.place_data_generater.g1_kinematics import (
 
 
 COMMAND_FIELDS = {"policy_command_x_yaw", "policy_command_xy_yaw", "policy_command_drop_button"}
+MOTION_META_FIELDS = {
+    "table_pos", "table_quat", "table_size", "total_frames",
+    "transition_start_frame", "transition_end_frame", "grail_start_frame",
+    "residual_fade_out_start_frame", "residual_fade_out_end_frame",
+    "place_generated_start_frame", "place_carry_source_frame",
+    "place_release_start_frame", "place_output_contact_start_frame", "place_turn_direction",
+    "place_object_goal_pos_w", "place_object_goal_quat_w",
+    "place_object_carry_goal_pos_w", "place_object_carry_goal_quat_w",
+}
 YAW_TURN_THRESHOLD_RAD = 0.2
 YAW_JITTER_RAD = 0.02
 YAW_PAUSE_S = 0.2
@@ -66,13 +75,12 @@ def turn_stage_commands(yaw, fps):
         total = float(yaw[end] - yaw[start])
         if abs(total) > YAW_TURN_THRESHOLD_RAD:
             commands[start:end] = np.clip(total, -YAW_LIMIT_RAD, YAW_LIMIT_RAD)
-            stages.append({"start_frame": start, "end_frame_exclusive": end,
-                           "total_yaw_rad": total})
+            stages.append((start, end))
         i += 1
     return commands, stages
 
 
-def generate_sparse_commands(robot, objects, meta, name, *, lookahead_s=0.5):
+def generate_sparse_commands(robot, objects, meta, name, *, release_start_frame, lookahead_s=0.5):
     """Generate carry displacements and release buttons on the final timeline.
 
     Read robot positions [T,3] and xyzw root quaternions [T,4]. Require annotated
@@ -82,8 +90,9 @@ def generate_sparse_commands(robot, objects, meta, name, *, lookahead_s=0.5):
     signed total of each turn stage above 0.2 rad, limited to +/-1.5*pi.
     Preserve the previous XY deadzone/length limit before selecting dx.
 
-    Also return generation parameters, the object's position and wxyz attitude
-    at b - 1, and nonzero-command counts. Inputs are not mutated, commands are
+    The release boundary is passed explicitly and also saved for teacher export.
+    Also return the object's position and wxyz attitude at b - 1.
+    Inputs are not mutated, commands are
     not divided by time, and invalid data raise ValueError with the motion name.
     """
     try:
@@ -91,7 +100,7 @@ def generate_sparse_commands(robot, objects, meta, name, *, lookahead_s=0.5):
         quat = np.asarray(robot["root_rot"])
         fps = float(robot["fps"])
         a = meta["place_generated_start_frame"]
-        b = meta["place_release_start_frame"]
+        b = release_start_frame
         total = len(pos)
         if (any(isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, np.integer))
                 for v in (a, b)) or not 0 <= a < b < total):
@@ -124,34 +133,16 @@ def generate_sparse_commands(robot, objects, meta, name, *, lookahead_s=0.5):
     length = np.linalg.norm(xy, axis=1)
     xy[length < 0.02] = 0
     xy *= np.minimum(1, 0.15 / np.maximum(length, 1e-12))[:, None]
-    dyaw, stages = turn_stage_commands(yaw[a:b], fps)
-    for stage in stages:
-        stage["start_frame"] += a
-        stage["end_frame_exclusive"] += a
+    dyaw, _ = turn_stage_commands(yaw[a:b], fps)
     command = np.zeros((total, 2), dtype=np.float32)
     command[t] = np.column_stack((xy[:, 0], dyaw))
     drop = np.zeros((total, 1), dtype=np.float32)
     drop[b:] = 1
-    translation = command[:, 0] != 0
-    turning = command[:, 1] != 0
     additions = {
         "place_object_goal_pos_w": obj_pos[b - 1, 0].copy(),
         "place_object_goal_quat_w": obj_quat[b - 1, 0].copy(),
-        "sparse_command_parameters": {
-            "lookahead_s": lookahead_s, "horizon_frames": horizon,
-            "xy_deadzone_m": 0.02, "xy_limit_m": 0.15,
-            "command_channels": ["dx", "dyaw"], "yaw_mode": "turn_stage_total",
-            "yaw_turn_threshold_rad": YAW_TURN_THRESHOLD_RAD,
-            "yaw_jitter_rad": YAW_JITTER_RAD, "yaw_pause_s": YAW_PAUSE_S,
-            "yaw_limit_rad": float(YAW_LIMIT_RAD),
-            "root_quaternion_order": "xyzw", "goal_frame": b - 1,
-        },
     }
-    stats = {"nonzero_translation_frames": int(translation.sum()),
-             "nonzero_yaw_frames": int(turning.sum()),
-             "combined_command_frames": int((translation & turning).sum()),
-             "release_frames": total - b, "turn_stages": stages}
-    return {"policy_command_x_yaw": command, "policy_command_drop_button": drop}, additions, stats
+    return {"policy_command_x_yaw": command, "policy_command_drop_button": drop}, additions
 
 
 def resample_qpos(qpos, source_fps, output_fps):
@@ -166,23 +157,21 @@ def resample_qpos(qpos, source_fps, output_fps):
 
 
 def slow_first_turn(qpos, fps, factor):
-    """仅扩展首个转身段 [start,end),保持 FPS;返回的帧索引相对生成段。
+    """仅扩展首个转身段 [start,end),保持 FPS。
 
     N 帧扩展为 round(N * factor) 帧,用下一帧 end 作为插值端点但不重复加入。
     位置/关节角线性插值,root 四元数沿最短路径线性插值后归一化。
     """
     if not np.isfinite(factor) or factor < 1:
         raise ValueError("turn_slowdown_factor must be finite and >= 1")
-    info = {"factor": float(factor), "start_frame": None, "end_frame_exclusive": None,
-            "original_frames": 0, "expanded_frames": 0, "added_frames": 0}
     if factor == 1:
-        return qpos, info
+        return qpos
     rotations = Rotation.from_quat(qpos[:, [4, 5, 6, 3]]).as_matrix()
     yaw = np.arctan2(rotations[:, 1, 0], rotations[:, 0, 0])
     _, stages = turn_stage_commands(yaw, fps)
     if not stages:
-        return qpos, info
-    start, end = stages[0]["start_frame"], stages[0]["end_frame_exclusive"]
+        return qpos
+    start, end = stages[0]
     frames = round((end - start) * factor)
     samples = np.linspace(start, end, frames, endpoint=False)
     left = np.floor(samples).astype(int)
@@ -193,10 +182,7 @@ def slow_first_turn(qpos, fps, factor):
     qb[np.sum(qa * qb, axis=1) < 0] *= -1
     quat = (1 - alpha) * qa + alpha * qb
     expanded[:, 3:7] = quat / np.linalg.norm(quat, axis=1, keepdims=True)
-    info.update(start_frame=start, end_frame_exclusive=start + frames,
-                original_frames=end - start, expanded_frames=frames,
-                added_frames=frames - (end - start))
-    return np.concatenate([qpos[:start], expanded, qpos[end:]]), info
+    return np.concatenate([qpos[:start], expanded, qpos[end:]])
 
 
 def right_hand_pose(qpos, kinematics, *, quat_order="wxyz"):
@@ -326,7 +312,8 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
            *, kinematics=None, copy_shared_assets=True, turn_slowdown_factor=2.0):
     """保留原段至 carry 帧,追加过渡、Kimodo、0.7 s 保持和 0.7 s 开手下落。
 
-    写出 robot/objects/meta/报告并复制资产,输入与输出目录必须独立。
+    写出 robot/objects/meta 和 teacher 所需报告并复制资产,返回 robot 文件路径。
+    输入与输出目录必须独立。
     批处理可传入复用的 kinematics,并在首条成功后关闭共享资产重复复制。
     首个生成转身段默认扩展到两倍帧数,turn_slowdown_factor=1 时保持原速。
     """
@@ -353,7 +340,6 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
         raise ValueError("Source changed since constraints were generated")
     if robot["fps"] != objects["fps"] or source_frames != record["source_frames"]:
         raise ValueError("Source frame count or FPS mismatch")
-    contact = contact_timing(objects)
     carry_frame = record["carry_source_frame"]
     if type(carry_frame) is not int or not 0 <= carry_frame < source_frames:
         raise ValueError(f"Invalid carry_source_frame: {carry_frame}")
@@ -384,12 +370,11 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     fps = float(robot["fps"])
     # Preserve the source FPS and generated poses after restoring world coordinates.
     world_qpos = resample_qpos(world_qpos, MODEL_FPS, fps)
-    world_qpos, turn_slowdown = slow_first_turn(world_qpos, fps, turn_slowdown_factor)
+    world_qpos = slow_first_turn(world_qpos, fps, turn_slowdown_factor)
     carry_values = source_qpos(robot)[carry_frame:carry_frame+1]
     hand, hand_rotations = right_hand_pose(world_qpos, kinematics)
     carry_positions, carry_rotations = right_hand_pose(carry_values, kinematics, quat_order="xyzw")
     carry_hand, carry_rotation = carry_positions[0], carry_rotations[0]
-    hand_join_gap = float(np.linalg.norm(hand[0] - carry_hand))
     # Join from the retained carry frame, which also defines the start target.
     generated = robot_segment(world_qpos, robot)
     join_frames = max(1, round(0.1 * fps))
@@ -428,12 +413,6 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     generated_start = hold_start - len(generated["dof"])
     if generated_start != n + len(seam["dof"]):
         raise ValueError(f"{name}: inconsistent concatenated timeline")
-    # Slowdown bounds index the final output, while source-frame provenance does not change.
-    if turn_slowdown["start_frame"] is not None:
-        turn_slowdown["start_frame"] += generated_start
-        turn_slowdown["end_frame_exclusive"] += generated_start
-    output_contact = {key.replace("source_", "output_", 1): value
-                      for key, value in contact_timing(objects_out).items()}
     # Assets are copied after validation, without modifying the input snapshot.
     usd = [dataset / "object_usd" / f"{name}{ext}" for ext in (".usd", ".usda")
            if (dataset / "object_usd" / f"{name}{ext}").is_file()]
@@ -449,72 +428,26 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     outputs = [output / d / f"{name}.pkl" for d in ("robot", "objects", "meta")]
     if not overwrite and any(p.exists() for p in outputs):
         raise FileExistsError("Output exists; pass --overwrite")
-    meta = copy.deepcopy(joblib.load(assets[0]))
+    meta = {key: copy.deepcopy(value) for key, value in joblib.load(assets[0]).items()
+            if key in MOTION_META_FIELDS}
     # Fade out from the retained endpoint to the first generated frame, including the seam.
     meta.update(total_frames=total_frames,
                 grail_start_frame=grail_start,
                 residual_fade_out_start_frame=n-1,
                 residual_fade_out_end_frame=generated_start,
-                place_transition_start_frame=n,
-                place_transition_end_frame=generated_start-1,
                 place_generated_start_frame=generated_start,
-                place_turn_slowdown=turn_slowdown,
-                place_hold_start_frame=hold_start,
-                place_final_hold_start_frame=final_hold_start,
                 place_release_start_frame=final_hold_start,
-                place_object_goal_pos_w=objects_out["root_pos"][final_hold_start-1, 0].copy(),
+                place_output_contact_start_frame=contact_timing(objects_out)["source_contact_start_frame"],
                 # Carry goals stay in the original Z-up world frame; object quats are wxyz.
                 place_object_carry_goal_pos_w=source_objects["root_pos"][carry_frame, 0].copy(),
                 place_object_carry_goal_quat_w=source_objects["root_quat"][carry_frame, 0].copy(),
-                **{f"place_{key}": value for key, value in output_contact.items()},
-                place_source_contact_start_frame=contact["source_contact_start_frame"],
-                place_source_contact_end_frame=contact["source_contact_end_frame"],
-                place_source_contact_duration_s=contact["source_contact_duration_s"],
-                place_source_frames=source_frames,
-                place_retained_source_frames=n,
-                place_trimmed_source_frames=source_frames-n,
-                place_carry_source_frame=record["carry_source_frame"],
-                place_lower_source_frame=record["lower_source_frame"])
-    labels, sparse_meta, sparse_stats = generate_sparse_commands(robot_out, objects_out, meta, name)
+                place_carry_source_frame=record["carry_source_frame"])
+    labels, sparse_meta = generate_sparse_commands(
+        robot_out, objects_out, meta, name, release_start_frame=final_hold_start
+    )
     robot_out.update(labels)
     meta.update(sparse_meta)
     validate_fields(robot_out, "robot")
-    report = {"name": name, "source_frames": source_frames,
-              "grail_start_frame": grail_start,
-              "retained_source_frames": n, "trimmed_source_frames": source_frames-n,
-              "transition_frames": join_frames,
-              "turn_slowdown": turn_slowdown,
-              "generated_frames": len(generated["dof"]), "hold_frames": len(hold["dof"]),
-              "final_hold_frames": final_hold_frames,
-              "total_frames": len(robot_out["dof"]), "fps": fps,
-              "residual_fade_out_start_frame": meta["residual_fade_out_start_frame"],
-              "residual_fade_out_end_frame": meta["residual_fade_out_end_frame"],
-              "target_distance_m": record["distance_m"],
-              **contact,
-              **output_contact,
-              "release_start_frame": final_hold_start,
-              "carry_source_frame": record["carry_source_frame"],
-              "carry_pose_lookback_s": record["carry_pose_lookback_s"],
-              "lower_source_frame": record["lower_source_frame"],
-              "lower_pose_lookback_s": record["lower_pose_lookback_s"],
-              "join_hand_gap_m": hand_join_gap,
-              "motion_key": str(motion_key), "kinematics_version": KINEMATICS_VERSION,
-              "root_join_gap_m": float(np.linalg.norm(world_qpos[0, :3]-carry_values[0, :3])),
-              "quaternion_orders": {"source_robot": "xyzw", "kimodo_csv": "wxyz", "object": "wxyz"},
-              "actual_root_distance_m": float(np.linalg.norm(
-                  world_qpos[-1, :2] - carry_values[0, :2])),
-              "actual_hand_lower_m": float(carry_hand[2] - hand[-1, 2]),
-              "source_robot_sha256": record["source_robot_sha256"],
-              "kimodo_csv_sha256": file_hash(csv),
-              "object_orientation_policy": "right palm world rotation with retained carry-frame relative orientation",
-              "object_orientation_reference": "right_hand_roll_skel (fixed child of right_wrist_yaw_skel)",
-              "object_translation_policy": "right palm rigid transform with retained carry-frame position offset; final 0.7 s free fall from rest along world -Z (g=9.81 m/s^2)",
-              "contact_points_coordinate_frame": "object_local",
-              "contact_points_policy": "carry-frame right-hand contact points through transition, generated motion and hold; no appended left-hand or release contacts",
-              "right_hand_hold_action": 1}
-    report["grasp_orientation_policy"] = "generated palm rotation; no local IK correction"
-    report["sparse_command"] = sparse_stats
-    report["right_hand_opening_policy"] = "final 0.7 s: open action and zero right finger joint positions"
     for path in outputs:
         path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({motion_key: robot_out}, outputs[0])
@@ -528,15 +461,20 @@ def append(dataset, output, name, manifest_path, csv, kimodo_repo=KIMODO, overwr
     if copy_shared_assets and textures.is_dir():
         shutil.copytree(textures, output / "object_usd" / "textures", dirs_exist_ok=True)
     from grail.datatool.batch_render_replay_clip import validate_motion_input
-    report["validation"] = validate_motion_input(str(output), name)
+    report = {
+        "name": name, "total_frames": total_frames, "fps": fps,
+        "grail_start_frame": grail_start,
+        "output_contact_start_frame": meta["place_output_contact_start_frame"],
+        "validation": validate_motion_input(str(output), name),
+    }
     report_path = output / "reports" / f"{name}.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + "\n")
-    return report
+    return outputs[0]
 
 
 def main():
-    """执行本地拼接并打印 JSON 报告。"""
+    """执行本地拼接并打印输出 robot 文件路径。"""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset-dir", type=Path, default=DATA / "pickup_table_walk_concat")
     p.add_argument("--output-dir", type=Path, default=DATA / "pickup_table_place_concat")
@@ -548,10 +486,10 @@ def main():
     p.add_argument("--turn-slowdown-factor", type=float, default=2.0,
                    help="Expand only the first generated turn by this factor (>=1); 1 disables slowing")
     args = p.parse_args()
-    print(json.dumps(append(args.dataset_dir, args.output_dir, args.name,
+    print(append(args.dataset_dir, args.output_dir, args.name,
         args.manifest or args.dataset_dir / "kimodo_place_constraints/manifest.json",
         args.csv, args.kimodo_repo, args.overwrite,
-        turn_slowdown_factor=args.turn_slowdown_factor), indent=2))
+        turn_slowdown_factor=args.turn_slowdown_factor))
 
 
 if __name__ == "__main__":

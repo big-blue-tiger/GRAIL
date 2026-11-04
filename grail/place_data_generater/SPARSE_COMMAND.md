@@ -1,7 +1,9 @@
 <!-- Sparse 接入说明：运行说明文档，无代码导入；可删。逐文件用途、引用树与删除影响见 SPARSE_COMMAND_FILES.md。 -->
 
-离线 sparse command 使用 `place_generated_start_frame=a`、
-`place_release_start_frame=b`，要求 `0 <= a < b < T`。标签 `policy_command_x_yaw` 为 float32 [T,2]，内容是 dx（米）和 dyaw（弧度）。
+离线 sparse command 使用 meta 的 `place_generated_start_frame=a` 和生成函数参数
+`release_start_frame=b`，要求 `0 <= a < b < T`。释放边界同时写入 meta 的
+`place_release_start_frame` 供原 teacher 导出器读取；运行时通过
+`policy_command_drop_button` 表达。标签 `policy_command_x_yaw` 为 float32 [T,2]，内容是 dx（米）和 dyaw（弧度）。
 仅 dx 前瞻 0.5 秒，截断在 `b-1`。dyaw 在同向转向段内为固定的总转角；
 累计超过 0.2 rad 才确认转向段，段外为零，总角度限幅 ±1.5π。
 相隔不超过 0.2 秒且偏转不超过 0.02 rad 的同向片段合并，以容忍短暂停顿和抖动。机器人四元数为 xyzw，
@@ -21,11 +23,12 @@ bash grail/place_data_generater/server_concat_motion.sh
 通过 `TURN_SLOWDOWN_FACTOR=3 bash grail/place_data_generater/server_concat_motion.sh`
 可改为三倍帧数，设置为 `1` 则保持原速；倍率必须是大于等于 1 的有限数。
 直接调用 `concat.py` 时可传 `--turn-slowdown-factor`，调用 `append()` 时传
-`turn_slowdown_factor`。报告的 `turn_slowdown` 和 meta 的 `place_turn_slowdown`
-记录倍率、扩展前后帧数及最终时间线中的 `[start_frame,end_frame_exclusive)` 区间。
+`turn_slowdown_factor`。减速仍作用于实际轨迹，meta 不再保存倍率及帧数诊断。
 
 拼接完成后调用 `concat.py` 中的 `generate_sparse_commands` 统一生成标签。重新拼接时先去掉
-源机器人中的派生标签，再按最终时间线生成，写入机器人、meta 和报告。
+源机器人中的派生标签，再按最终时间线生成，写入机器人和 meta。拼接输出 teacher 所需的
+`reports/<motion>.json`，包含帧数、FPS、GRAIL/接触起点和原配对轨迹校验结果；
+`append()` 返回输出 robot 文件路径。meta 恢复释放帧、接触起点并保留输入的转向标注。
 
 已有拼接数据可以单独重算标签，无需重新生成动作。在仓库根目录运行：
 
@@ -35,10 +38,11 @@ python -m grail.place_data_generater.regenerate_sparse_commands \
   --output-dir data/hf_dataset/data_update/data/pickup_table_place_concat_sparse
 ```
 
-输出目录必须不存在。脚本先复制完整数据集，再更新副本的 robot、meta 和 reports；
+输出目录必须不存在。脚本复制数据集及已有报告，再更新副本的 robot 和 meta；
 原数据保持不变。复制优先使用 reflink，不支持时普通复制，完整副本约需 30 GB。
 旧的三列 `policy_command_xy_yaw` 会被替换为重新计算的两列 `policy_command_x_yaw`，
-同时重算 `policy_command_drop_button` 和 sparse command 元信息。机器人与物体轨迹、
+同时重算 `policy_command_drop_button`，不再计算或写出 sparse command 统计。meta 保留训练、推理和
+原 teacher 导出所需的 18 个字段，释放帧直接读取 `place_release_start_frame`，不推断缺失字段。机器人与物体轨迹、
 接触点、FPS、BPS、USD 和视频保持原样。后续评估把数据路径统一切换至输出目录。
 
 直接更新原目录时改用 `--in-place`：
@@ -49,8 +53,8 @@ python -m grail.place_data_generater.regenerate_sparse_commands \
   --in-place
 ```
 
-这只更新原目录中的 robot 派生标签、meta 的 sparse command 元信息及释放目标、
-reports 的 sparse command 统计，不复制数据集。
+这只更新原目录中的 robot 派生标签、精简 meta 并更新释放目标，不复制数据集。
+已有报告文件不再读取或更新，也不会自动删除。
 
 目标实验是 `robocasa_carry_table`。
 学生 privileged 输入为 87 维：原有状态 48 维、释放目标 18 维、搬运目标 18 维、

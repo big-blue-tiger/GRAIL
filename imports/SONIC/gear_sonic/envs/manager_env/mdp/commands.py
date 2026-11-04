@@ -1858,6 +1858,26 @@ class TrackingCommand(CommandTerm):
         """
         return self.motion_lib.get_object_bps(self.motion_ids)
 
+    def _position_randomization_mask(self, env_ids: Sequence[int]) -> torch.Tensor:
+        """Allow reset position noise only before the selected motion's GRAIL start.
+
+        Use the final sampled start frame, including first-frame curriculum
+        overrides. The boundary frame itself may already contain a grasp.
+        """
+        if self.is_evaluating:
+            return torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+        if not self.cfg.position_randomization_before_grail_start:
+            return torch.ones(len(env_ids), dtype=torch.bool, device=self.device)
+        if not hasattr(self.motion_lib, "_grail_start_steps"):
+            raise ValueError(
+                "position_randomization_before_grail_start requires "
+                "motion_lib_cfg.load_grail_tracking_phase=True"
+            )
+        return (
+            self.motion_start_time_steps[env_ids]
+            < self.motion_lib._grail_start_steps[self.motion_ids[env_ids]]
+        )
+
     def _get_object_pos_with_offset(self, env_ids: torch.Tensor) -> torch.Tensor:
         """Get object position with randomization offset applied.
 
@@ -1872,7 +1892,9 @@ class TrackingCommand(CommandTerm):
         """
         obj_pos = self.object_root_pos[env_ids, 0].clone()
 
-        if self.cfg.object_position_randomize:
+        # Clear offsets even when a new reset is ineligible or noise is disabled.
+        self._object_position_offset[env_ids] = 0.0
+        if self.cfg.object_position_randomize and not self.is_evaluating:
             # Resample offset for these environments
             rand_cfg = self.cfg.object_position_randomization or {}
             x_range = rand_cfg.get("x", 0.0)
@@ -1889,6 +1911,9 @@ class TrackingCommand(CommandTerm):
             self._object_position_offset[env_ids, 2] = (
                 torch.rand(len(env_ids), device=self.device) * 2 - 1
             ) * z_range
+            self._object_position_offset[env_ids] *= self._position_randomization_mask(
+                env_ids
+            )[:, None]
 
             # Apply offset
             obj_pos = obj_pos + self._object_position_offset[env_ids]
@@ -3468,6 +3493,7 @@ class TrackingCommand(CommandTerm):
             rand_samples = sample_uniform(
                 ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
             )
+            rand_samples[:, :3] *= self._position_randomization_mask(env_ids)[:, None]
             root_pos[env_ids] += rand_samples[:, 0:3]
             orientations_delta = quat_from_euler_xyz(
                 rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
@@ -4799,6 +4825,12 @@ class TrackingCommandCfg(CommandTermCfg):
     # Randomization range for each axis: {"x": 0.05, "y": 0.05, "z": 0.0}
     # Values are half-range, so 0.05 means uniform random in [-0.05, 0.05]
     object_position_randomization: dict[str, float] = None
+
+    # Gate robot pose_range translations and object position noise by the final
+    # reset frame: start_step < _grail_start_steps[motion_id] (strictly before grasp).
+    # Requires motion_lib_cfg.load_grail_tracking_phase=True; other tasks keep
+    # their existing position randomization when this is False.
+    position_randomization_before_grail_start: bool = False
 
     # Table position offset: [x, y, z] added to table position from meta file
     # Useful for adjusting table position relative to the robot

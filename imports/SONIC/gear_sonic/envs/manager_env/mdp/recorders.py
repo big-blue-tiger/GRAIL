@@ -35,7 +35,7 @@ class RecordersCfg(recorder_manager.RecorderManagerBaseCfg):
 
 
 class TeacherRolloutRecorderTerm(recorder_manager.RecorderTerm):
-    """Export the first teacher episode independently of rendering/frame skipping."""
+    """Export first teacher episodes only on timeout, independently of rendering."""
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)

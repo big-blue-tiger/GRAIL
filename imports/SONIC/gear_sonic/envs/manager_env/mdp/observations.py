@@ -184,6 +184,7 @@ class StudentPrivilegedCfg(ObsGroup):
     object_ori_b_6d = None
     hand_object_transform_6d = None
     hand_object_contact_force_magnitude = None
+    hand_object_contact_count = None
     target_object_poses_6d = None
     target_object_carry_poses_6d = None
     sparse_target_root_trajectory_command_contact_aware = None
@@ -3149,6 +3150,14 @@ def get_hand_object_contact_force_magnitude(
             f"Expected {expected_links} configured contact links, got {link_forces.shape[1]}"
         )
     return torch.linalg.vector_norm(link_forces, dim=-1)
+
+
+def get_hand_object_contact_count(
+    env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg, expected_links: int = 8, threshold: float = 0.01,
+) -> torch.Tensor:
+    """Return 1 if any hand link contacts the object above threshold (N), else 0."""
+    forces = get_hand_object_contact_force_magnitude(env, sensor_cfg, expected_links)
+    return (forces > threshold).any(dim=-1, keepdim=True).to(forces.dtype)
 
 
 def grab_contact_flag(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:

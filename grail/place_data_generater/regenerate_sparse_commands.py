@@ -2,13 +2,14 @@
 """Regenerate sparse commands in a paired dataset or a separate copy."""
 
 import argparse
-import json
 from pathlib import Path
 import subprocess
 
 import joblib
 
-from grail.place_data_generater.concat import COMMAND_FIELDS, generate_sparse_commands
+from grail.place_data_generater.concat import (
+    COMMAND_FIELDS, MOTION_META_FIELDS, generate_sparse_commands,
+)
 from grail.walk_data_tool.concat_walk_motion import load_single
 
 
@@ -22,7 +23,8 @@ def regenerate(dataset, output=None, *, lookahead_s=0.5, in_place=False):
         raise ValueError(f"No robot motions in {dataset}")
 
     if not in_place:
-        # Require a fresh destination. Reflinks share disk blocks, not writable files.
+        # Require a fresh destination and retain the reports needed by teacher export.
+        # Reflinks share disk blocks, not writable files.
         output.mkdir(parents=True, exist_ok=False)
         subprocess.run(
             ["cp", "-a", "--reflink=auto", str(dataset) + "/.", str(output)], check=True
@@ -34,20 +36,17 @@ def regenerate(dataset, output=None, *, lookahead_s=0.5, in_place=False):
         if key != object_key:
             raise ValueError(f"{name}: robot/object motion keys differ")
         meta = joblib.load(dataset / "meta" / path.name)
-        labels, additions, stats = generate_sparse_commands(
-            robot, objects, meta, name, lookahead_s=lookahead_s
+        labels, additions = generate_sparse_commands(
+            robot, objects, meta, name,
+            release_start_frame=meta["place_release_start_frame"], lookahead_s=lookahead_s
         )
         robot = {field: value for field, value in robot.items() if field not in COMMAND_FIELDS}
         robot.update(labels)
+        meta = {field: value for field, value in meta.items() if field in MOTION_META_FIELDS}
         meta.update(additions)
         joblib.dump({key: robot}, output / "robot" / path.name)
         joblib.dump(meta, output / "meta" / path.name)
 
-        report_path = output / "reports" / f"{name}.json"
-        report = json.loads(report_path.read_text()) if report_path.exists() else {"name": name}
-        report["sparse_command"] = stats
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         if index % 100 == 0 or index == len(paths):
             print(f"Regenerated {index}/{len(paths)} motions", flush=True)
     return len(paths)

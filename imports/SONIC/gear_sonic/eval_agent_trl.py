@@ -293,6 +293,21 @@ def _apply_run_once_motion_cap(config):
         if existing_cap is None
         else min(int(existing_cap), requested_cap)
     )
+    if config.get("motion_start_index") is not None:
+        start = int(config.motion_start_index)
+        if start < 0:
+            raise ValueError("motion_start_index must be non-negative")
+        keys = sorted(
+            path.stem for path in Path(motion_lib_cfg.motion_file).glob("*.pkl")
+            if path.name != "metadata.pkl"
+        )[start:start + effective_cap]
+        if not keys:
+            raise ValueError(f"No motions at motion_start_index={start}")
+        # Filter both motion loading and USD scene construction before either starts.
+        with omegaconf.open_dict(config):
+            config.num_envs = effective_cap = len(keys)
+            config.manager_env.commands.motion.filter_motion_keys = keys
+            motion_lib_cfg.filter_motion_keys = keys
     with omegaconf.open_dict(motion_lib_cfg):
         motion_lib_cfg.max_unique_motions = effective_cap
     return effective_cap

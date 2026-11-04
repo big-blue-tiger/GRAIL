@@ -1,4 +1,4 @@
-"""Small, reference-independent carry plans calibrated on teacher_300.
+"""Small, reference-independent carry plans calibrated on teacher rollouts.
 
 Only NumPy is required. The virtual root path is discarded after extracting
 25 Hz sparse commands and the two fixed object goals.
@@ -15,11 +15,12 @@ class CarryPlannerConfig:
     lower_range: tuple = (0.05, 0.14)
     distance_range: tuple = (2.5, 3.2)
     sector_degrees: float = 75.0
-    angular_speed: float = 1.3
-    turn_forward_speed: float = 0.15
-    walk_speed: float = 0.35
+    angular_speed: float = 1.0
+    turn_start_speed: float = -0.15  # Signed speed at the start of the turn.
+    turn_forward_speed: float = 0.4  # Ramp endpoint; also matches walk_speed.
+    walk_speed: float = 0.4
     pickup_settle_s: float = 1.0
-    hold_s: float = 0.72
+    hold_s: float = 1.2
 
     def __post_init__(self):
         for name in ("lift_range", "lower_range", "distance_range"):
@@ -34,6 +35,8 @@ class CarryPlannerConfig:
             value = getattr(self, name)
             if not np.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
+        if not np.isfinite(self.turn_start_speed):
+            raise ValueError("turn_start_speed must be finite")
         if not np.isfinite(self.sector_degrees) or not 0 < self.sector_degrees < 90:
             raise ValueError("sector_degrees must be between 0 and 90")
 
@@ -96,8 +99,13 @@ def _root_path(initial_yaw, angle, length, config):
     if nturn:
         omega = angle / (nturn / PLAN_FPS)
         turning_yaw = initial_yaw + omega * np.minimum(times, nturn / PLAN_FPS)
-        positions[:, 0] = config.turn_forward_speed / omega * (np.sin(turning_yaw) - np.sin(initial_yaw))
-        positions[:, 1] = config.turn_forward_speed / omega * (np.cos(initial_yaw) - np.cos(turning_yaw))
+        # Rollouts step back first, then accelerate forward during the turn.
+        progress = (np.arange(nturn) + 0.5) / nturn
+        speed = config.turn_start_speed + (config.turn_forward_speed - config.turn_start_speed) * progress
+        heading = initial_yaw + angle * progress
+        velocity = speed[:, None] * np.column_stack((np.cos(heading), np.sin(heading)))
+        positions[1:nturn + 1] = np.cumsum(velocity / PLAN_FPS, axis=0)
+        positions[nturn + 1:] = positions[nturn]
         yaw[:nturn] = turning_yaw[:nturn]
     progress = np.clip((np.arange(len(times)) - nturn) / nwalk, 0, 1)
     positions += progress[:, None] * length * rotation_2d(initial_yaw + angle)[:, 0]

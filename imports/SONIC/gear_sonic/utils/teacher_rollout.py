@@ -55,11 +55,11 @@ class RolloutReport:
         self.foot_contacts = feet.copy()
         self.table_collision |= table & active
 
-    def result(self, env_id, reference_direction):
+    def result(self, env_id, reference_yaw_change):
         left, right = self.foot_contact_counts[env_id]
         return {
             "turn_direction": _turn_direction(self.yaw_change[env_id]),
-            "reference_turn_direction": _turn_direction(reference_direction),
+            "reference_turn_direction": _turn_direction(reference_yaw_change),
             "yaw_change_rad": float(self.yaw_change[env_id]),
             "release_goal_pos": self.release_goal[env_id].tolist(),
             "min_release_goal_distance_m": float(self.min_goal_distance[env_id]),
@@ -72,7 +72,7 @@ class RolloutReport:
 
 
 class TeacherRolloutExporter:
-    """Keep the first episode per environment, including its pre-reset final state."""
+    """Export first episodes that reach timeout, including their pre-reset final state."""
 
     def __init__(self, env, output_dir):
         self.env = env
@@ -82,6 +82,7 @@ class TeacherRolloutExporter:
         self.source_dir = Path(self.motion_cfg["motion_file"]).parent
         self.frames = [[] for _ in range(env.num_envs)]
         self.saved = set()
+        self.finished = set()
         self.motion_keys = [
             str(self.command.motion_lib.curr_motion_keys[motion_id])
             for motion_id in self.command.motion_ids.tolist()
@@ -93,7 +94,8 @@ class TeacherRolloutExporter:
         initial = [robot.root_pos_w - origins, robot.root_quat_w[:, [1, 2, 3, 0]],
                    env.scene["object"].data.root_pos_w - origins, release_goal - origins]
         self.metrics = RolloutReport(*(value.detach().cpu().numpy().copy() for value in initial))
-        self.rollout_reports = {}
+        report_path = self.output_dir / "rollout_report.json"
+        self.rollout_reports = json.loads(report_path.read_text()) if report_path.is_file() else {}
         for folder in ("robot", "objects", "meta", "bps", "object_usd", "reports"):
             (self.output_dir / folder).mkdir(parents=True, exist_ok=True)
 
@@ -107,7 +109,7 @@ class TeacherRolloutExporter:
             sensor.update(dt=0.0, force_recompute=True)
             force = sensor.data.force_matrix_w.norm(dim=-1).sum(dim=(1, 2))
             contacts.append((force > 1.0).detach().cpu().numpy())
-        active = np.array([i not in self.saved for i in range(self.env.num_envs)])
+        active = np.array([i not in self.finished for i in range(self.env.num_envs)])
         self.metrics.update_contacts(np.stack(contacts[:2], axis=-1), contacts[2], active)
 
     def record(self):
@@ -126,14 +128,17 @@ class TeacherRolloutExporter:
             "hand_actions": self.env._last_meta_action[:, -2:],
         }
         state = {key: value.detach().cpu().numpy().copy() for key, value in state.items()}
-        active = np.array([i not in self.saved for i in range(self.env.num_envs)])
+        active = np.array([i not in self.finished for i in range(self.env.num_envs)])
         self.metrics.update_motion(state, active)
         for env_id in range(self.env.num_envs):
-            if env_id in self.saved:
+            if env_id in self.finished:
                 continue
             self.frames[env_id].append({key: value[env_id] for key, value in state.items()})
             if self.env.reset_buf[env_id]:
-                self.save(env_id)
+                if self.env.termination_manager.time_outs[env_id]:
+                    self.save(env_id)
+                self.finished.add(env_id)
+                self.frames[env_id] = []
 
     def save(self, env_id):
         if env_id in self.saved or not self.frames[env_id]:
@@ -143,6 +148,11 @@ class TeacherRolloutExporter:
         object_payload = joblib.load(Path(self.motion_cfg["object_motion_file"]) / f"{key}.pkl")
         robot_key, source_robot = next(iter(robot_payload.items()))
         object_key, source_object = next(iter(object_payload.items()))
+        # Sparse yaw repeats each stage's signed total angle at every stage frame.
+        # Count each stage once, using the full source even if the rollout ends early.
+        yaw_commands = source_robot["policy_command_x_yaw"][:, 1]
+        stage_starts = np.r_[True, yaw_commands[1:] != yaw_commands[:-1]]
+        reference_yaw_change = float(np.sum(yaw_commands[stage_starts], dtype=np.float64))
         fps = float(source_robot["fps"])
         frames = self.frames[env_id]
         # A source frame spans two 50 Hz policy steps for this 25 Hz dataset.
@@ -222,7 +232,7 @@ class TeacherRolloutExporter:
             total_frames=count, fps=fps,
             usd_path=str(self.output_dir / "object_usd" / f"{key}.usd"),
         )
-        report["rollout"] = self.metrics.result(env_id, meta["place_turn_direction"])
+        report["rollout"] = self.metrics.result(env_id, reference_yaw_change)
         (self.output_dir / "reports" / f"{key}.json").write_text(json.dumps(report, indent=2) + "\n")
         self.rollout_reports[key] = report["rollout"]
         (self.output_dir / "rollout_report.json").write_text(json.dumps(self.rollout_reports, indent=2) + "\n")
@@ -244,5 +254,5 @@ class TeacherRolloutExporter:
         logger.info(f"Saved teacher rollout: {key} ({count} frames at {fps:g} FPS)")
 
     def close(self):
-        for env_id in range(self.env.num_envs):
-            self.save(env_id)
+        # Timeout episodes are saved in record(); never export unfinished episodes here.
+        self.frames = [[] for _ in range(self.env.num_envs)]

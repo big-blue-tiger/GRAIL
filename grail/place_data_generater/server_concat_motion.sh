@@ -6,7 +6,7 @@ cd /home/GRAIL
 dataset=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_walk_concat
 output=/home/GRAIL/data/hf_dataset/data_update/data/pickup_table_place_concat_slow_turn
 shared=/home/kimodo/data/wostep/place_walk_1018
-turn_slowdown_factor=${TURN_SLOWDOWN_FACTOR:-2} # 首个转身段的帧数倍率;1 保持原速。
+turn_slowdown_factor=${TURN_SLOWDOWN_FACTOR:-1.2} # 首个转身段的帧数倍率;1 保持原速。
 
 /isaac-sim/python.sh - "$dataset" "$output" "$shared" "$turn_slowdown_factor" <<'PY'
 import json
@@ -36,7 +36,7 @@ for index, record in enumerate(records, 1):
     start = perf_counter()
     print(f"Concat [{index}/{len(records)}]: {name}", flush=True)
     try:
-        report = append(
+        motion_path = append(
             dataset, output, name, manifest, csv,
             kimodo_repo=Path("/home/kimodo"), overwrite=True,
             kinematics=kinematics, copy_shared_assets=succeeded == 0,
@@ -65,7 +65,7 @@ for index, record in enumerate(records, 1):
               f"removed {removed} output files", flush=True)
         continue
     succeeded += 1
-    print(json.dumps(report, indent=2), flush=True)
+    print(f"Wrote: {motion_path}", flush=True)
     print(f"Done [{index}/{len(records)}]: {name} ({perf_counter() - start:.2f}s)", flush=True)
 print(f"Concat complete: {succeeded}/{len(records)} motions succeeded; "
       f"skipped {len(skipped)} ({perf_counter() - batch_start:.2f}s)", flush=True)

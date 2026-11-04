@@ -18,7 +18,7 @@
 # Uses one IsaacSim session per render worker via
 # grail/visualization/batch_render_replay.py.
 #
-# Usage: ./visualize.sh <motion_lib_path> [max_videos] [cam_offset] [quat_convention] [runtime] [parallel_jobs]
+# Usage: ./visualize.sh <motion_lib_path> [max_videos] [cam_offset] [quat_convention] [runtime] [parallel_jobs] [sparse_command_output_dir]
 # Example:
 #   ./visualize.sh data/release/dataset/pickup_table
 #   ./visualize.sh data/release/dataset/pickup_table 0          # render all motions
@@ -43,6 +43,8 @@
 #                    it when present, otherwise uses python from PATH.
 #   parallel_jobs    Concurrent IsaacSim render workers (default=1). Workers
 #                    are distributed round-robin over visible GPUs.
+#   sparse_command_output_dir  Optional directory for sparse-command videos.
+#                    Each worker annotates a replay before rendering the next.
 #
 # Hand DOFs: the renderer drives the gripper from the per-motion (T, 14)
 # hand_dof_pos array when present in the robot pkl (data-export pipeline
@@ -58,6 +60,7 @@ CAM_OFFSET="${3:-1.5,-1.5,1.0}"
 QUAT_CONVENTION="${4:-${QUAT_CONVENTION:-xyzw}}"
 RUNTIME="${5:-auto}"
 PARALLEL_JOBS="${6:-1}"
+SPARSE_COMMAND_OUTPUT_DIR="${7:-}"
 
 case "${QUAT_CONVENTION}" in
     auto|wxyz|xyzw) ;;
@@ -175,6 +178,13 @@ for ((worker_index = 0; worker_index < PARALLEL_JOBS; worker_index++)); do
         --worker_index "${worker_index}"
         --headless
     )
+
+    if [ -n "${SPARSE_COMMAND_OUTPUT_DIR}" ]; then
+        render_cmd+=(
+            --sparse_command_robot_dir "${MOTION_LIB}/robot"
+            --sparse_command_output_dir "${SPARSE_COMMAND_OUTPUT_DIR}"
+        )
+    fi
 
     if [ "${#RENDER_GPUS[@]}" -gt 0 ]; then
         gpu="${RENDER_GPUS[$((worker_index % ${#RENDER_GPUS[@]}))]}"

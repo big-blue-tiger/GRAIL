@@ -176,6 +176,7 @@ def render_all(
     camera_target=(0.0, 0.0, 0.8),
     headless=True,
     start_frame_skip=0,
+    on_video_rendered=None,
 ):
     """Render all trajectories with a single IsaacSim session."""
     import imageio
@@ -683,6 +684,14 @@ def render_all(
             except Exception:
                 pass
             _heartbeat(f"motion_{idx}_{motion_key}_failed")
+        else:
+            # The writer is closed, so ffmpeg can safely read the full replay.
+            # Let annotation errors propagate without deleting the valid replay;
+            # a retry can add its footer without rendering it again.
+            if on_video_rendered is not None:
+                _heartbeat(f"motion_{idx}_{motion_key}_annotating")
+                on_video_rendered(motion_key, Path(output_path))
+                _heartbeat(f"motion_{idx}_{motion_key}_annotated")
 
     elapsed = time.time() - start_time
     print(f"\n{'='*60}")
@@ -741,6 +750,14 @@ def main():
         "--skip_existing", action="store_true", help="Skip trajectories with existing output videos"
     )
     parser.add_argument(
+        "--sparse_command_robot_dir", type=Path,
+        help="Robot pkls containing sparse commands; requires --sparse_command_output_dir",
+    )
+    parser.add_argument(
+        "--sparse_command_output_dir", type=Path,
+        help="Annotate each completed replay into this directory before rendering the next",
+    )
+    parser.add_argument(
         "--dry_run", action="store_true", help="Print render plan without executing"
     )
     parser.add_argument(
@@ -762,6 +779,26 @@ def main():
         parser.error("--num_workers must be at least 1")
     if not 0 <= args.worker_index < args.num_workers:
         parser.error("--worker_index must be in [0, --num_workers)")
+    if (args.sparse_command_robot_dir is None) != (args.sparse_command_output_dir is None):
+        parser.error("--sparse_command_robot_dir and --sparse_command_output_dir must be used together")
+    on_video_rendered = None
+    if args.sparse_command_output_dir is not None:
+        if args.start_frame_skip != 0:
+            parser.error("Sparse-command annotation requires --start_frame_skip 0")
+        if args.sparse_command_output_dir.resolve() == Path(args.output_dir).resolve():
+            parser.error("Source and sparse-command output directories must differ")
+        from grail.visualization.batch_sparse_command_vis import (
+            annotate_video, load_commands, load_scene_context,
+        )
+
+        def on_video_rendered(motion_key, source):
+            destination = args.sparse_command_output_dir.resolve() / f"{motion_key}.mp4"
+            print(f"Annotating {motion_key}", flush=True)
+            robot_path = args.sparse_command_robot_dir / f"{motion_key}.pkl"
+            commands = load_commands(robot_path)
+            context = load_scene_context(robot_path, commands[0], len(commands[1]))
+            annotate_video(source, destination, commands, context)
+            print(f"Ready: {destination}", flush=True)
 
     plan, stats, n_total, n_success = build_render_plan(
         args.shard_dir,
@@ -806,6 +843,7 @@ def main():
         camera_target=tuple(args.camera_target),
         headless=args.headless,
         start_frame_skip=args.start_frame_skip,
+        on_video_rendered=on_video_rendered,
     )
 
 

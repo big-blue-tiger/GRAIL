@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
@@ -71,6 +72,7 @@ class RewardsCfg:
     tracking_vr_5point_local = None
     motion_5point_local_pos = None
     feet_acc = None
+    feet_heading_excess = None
     # HOI manipulation rewards
     hand_fingers_object_distance = None
     grasp_finger_direction = None
@@ -479,6 +481,37 @@ def tracking_body_ori_error(
         command.body_quat_w[:, tracked], command.robot_body_quat_w[:, tracked]
     )
     return torch.exp(-angular_err.square().mean(dim=-1) / (std * std))
+
+
+def feet_heading_excess(
+    env: ManagerBasedRLEnv, command_name: str,
+    min_angle: float = math.pi / 12, ref_margin: float = math.pi / 36, std: float = math.pi / 9,
+) -> torch.Tensor:
+    """Squared excess foot yaw relative to pelvis; return a cost for a negative weight.
+
+    Angles are radians (defaults: 15/5/20 degrees). Reference and simulated
+    forward axes are projected onto world XY independently. Applies to both
+    feet throughout the episode, without contact or GRAIL-phase gating.
+    """
+    if min_angle < 0 or ref_margin < 0 or std <= 0:
+        raise ValueError("Expected nonnegative angle allowances and positive std")
+    command: TrackingCommand = env.command_manager.get_term(command_name)
+    ids = [command.cfg.body_names.index(name) for name in (
+        "pelvis", "left_ankle_roll_link", "right_ankle_roll_link",
+    )]
+
+    def angles(quat):
+        forward = torch.zeros_like(quat[..., :3])
+        forward[..., 0] = 1.0
+        forward = quat_apply(quat, forward)
+        yaw = torch.atan2(forward[..., 1], forward[..., 0])
+        relative = yaw[:, 1:] - yaw[:, :1]
+        return torch.atan2(relative.sin(), relative.cos()).abs()
+
+    actual = angles(command.robot_body_quat_w[:, ids])
+    reference = angles(command.body_quat_w[:, ids])
+    allowed = (reference + ref_margin).clamp_min(min_angle)
+    return ((actual - allowed).clamp_min(0.0) / std).square().mean(dim=-1)
 
 
 def _gate_tracking_during_grail(command, reward, gate_during_grail):
@@ -1114,13 +1147,15 @@ def reward_grasp_finger_direction(
     index_offset: tuple[float, float, float] | None = None,
     middle_offset: tuple[float, float, float] | None = None,
     use_contact_center: bool = False,
+    direction_mode: str = "geometry",
+    contact_threshold: float = 0.1,
 ) -> torch.Tensor:
     """Compute reward for fingers opposing around the object for a pinch grasp.
 
-    Encourage the thumb and index/middle fingers to be on opposite sides of the
-    object by computing the negative dot product of the object-to-thumb and
-    object-to-index/middle directions. When fingers oppose, the dot product is
-    negative and the reward is positive.
+    Geometry mode compares object-to-thumb and object-to-index/middle directions.
+    Contact-normal mode compares the summed normal forces on the object from
+    thumb links 1/2 and combined index/middle links 0/1, rewarding opposing forces only when
+    both groups are in contact. Link/offset/contact-center options are geometric.
 
     Only applied when the in_contact label is active for the given hand.
 
@@ -1139,6 +1174,8 @@ def reward_grasp_finger_direction(
             (mean of contact points on the object surface) instead of the object
             center of mass. Falls back to object CoM per-env when contact center
             is unavailable or zero.
+        direction_mode: "geometry" (legacy) or "contact_normal" (dex thumb vs. index/middle).
+        contact_threshold: Minimum force (N) for each group in contact-normal mode.
 
     Returns:
         Reward tensor of shape (num_envs,). Positive when fingers oppose.
@@ -1157,6 +1194,28 @@ def reward_grasp_finger_direction(
             should_contact = (current_time >= per_env_first_contact).float()
         else:
             should_contact = torch.ones(env.num_envs, device=env.device)
+
+    if direction_mode == "contact_normal":
+        side = "left" if hand == "left_hand" else "right"
+        sensor_name = (
+            "object_to_left_hand_contact_sensor" if side == "left" else "object_to_hand_contact_sensor"
+        )
+        sensor: ContactSensor = env.scene[sensor_name]
+        filter_names = [path.rsplit("/", 1)[-1] for path in sensor.cfg.filter_prim_paths_expr]
+        thumb_ids = [filter_names.index(f"{side}_hand_thumb_{i}_link") for i in (1, 2)]
+        middle_ids = [filter_names.index(f"{side}_hand_middle_{i}_link") for i in (0, 1)]
+        index_ids = [filter_names.index(f"{side}_hand_index_{i}_link") for i in (0, 1)]
+        # Each entry already sums the normal forces from all colliders on a link.
+        forces = sensor.data.force_matrix_w[:, 0]
+        thumb_force = forces[:, thumb_ids].sum(dim=1)
+        finger_force = forces[:, middle_ids + index_ids].sum(dim=1)
+        both_contact = (thumb_force.norm(dim=-1) > contact_threshold) & (
+            finger_force.norm(dim=-1) > contact_threshold
+        )
+        cosine = torch.nn.functional.cosine_similarity(thumb_force, finger_force, dim=-1, eps=1e-6)
+        return (-cosine).clamp(0.0, 1.0) * both_contact * should_contact
+    if direction_mode != "geometry":
+        raise ValueError(f"Unknown grasp finger direction mode: {direction_mode!r}")
 
     robot = env.scene["robot"]
     obj = env.scene["object"]
